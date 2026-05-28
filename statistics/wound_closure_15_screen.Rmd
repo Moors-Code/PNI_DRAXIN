@@ -1,0 +1,189 @@
+```{r}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+```
+
+```{r}
+# ----------------------------
+# input / output paths
+# ----------------------------
+input_file <- "input_files/wound_closure_all_human.csv"
+output_dir <- "output/wound_closure"
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+```
+
+```{r}
+# ----------------------------
+# read and format data
+# ----------------------------
+df <- read.csv(input_file)
+
+df$Recombinant <- as.factor(df$Recombinant)
+df$Experiment <- as.factor(df$Experiment)
+
+# optional: set CTRL as reference level if present
+if ("CTRL" %in% levels(df$Recombinant)) {
+  df$Recombinant <- relevel(df$Recombinant, ref = "CTRL")
+}
+
+# save cleaned data copy
+write.csv(df, file.path(output_dir, "wound_closure_all_human_cleaned.csv"), row.names = FALSE)
+```
+
+```{r}
+# ----------------------------
+# helper function to save text output
+# ----------------------------
+save_text_output <- function(object, file) {
+  capture.output(object, file = file)
+}
+
+# ----------------------------
+# model 1: raw cell front velocity
+# ----------------------------
+model_velocity <- lmer(Cell_front_velocity ~ Recombinant + (1 | Experiment), data = df)
+
+velocity_summary <- summary(model_velocity)
+velocity_anova <- anova(model_velocity)
+emm_velocity <- emmeans(model_velocity, ~ Recombinant)
+
+velocity_contrast_unadjusted <- as.data.frame(
+  contrast(emm_velocity, method = "trt.vs.ctrl", ref = "CTRL")
+)
+
+velocity_contrast_bh <- as.data.frame(
+  contrast(emm_velocity, method = "trt.vs.ctrl", ref = "CTRL", adjust = "BH")
+)
+
+# save model outputs
+save_text_output(velocity_summary, file.path(output_dir, "model_velocity_summary.txt"))
+save_text_output(velocity_anova, file.path(output_dir, "model_velocity_anova.txt"))
+
+write.csv(velocity_contrast_unadjusted,
+          file.path(output_dir, "model_velocity_contrasts_vs_CTRL_unadjusted.csv"),
+          row.names = FALSE)
+
+write.csv(velocity_contrast_bh,
+          file.path(output_dir, "model_velocity_contrasts_vs_CTRL_BH.csv"),
+          row.names = FALSE)
+```
+
+```{r}
+# ----------------------------
+# model 2: control-normalized percent
+# ----------------------------
+model_ctrl_percent <- lmer(CTRL_PERCENT ~ Recombinant + (1 | Experiment), data = df)
+
+ctrl_percent_summary <- summary(model_ctrl_percent)
+ctrl_percent_anova <- anova(model_ctrl_percent)
+emm_ctrl_percent <- emmeans(model_ctrl_percent, ~ Recombinant)
+
+ctrl_percent_contrast_bh <- as.data.frame(
+  contrast(emm_ctrl_percent, method = "trt.vs.ctrl", ref = "CTRL", adjust = "BH")
+)
+
+# save model outputs
+save_text_output(ctrl_percent_summary, file.path(output_dir, "model_ctrl_percent_summary.txt"))
+save_text_output(ctrl_percent_anova, file.path(output_dir, "model_ctrl_percent_anova.txt"))
+
+write.csv(ctrl_percent_contrast_bh,
+          file.path(output_dir, "model_ctrl_percent_contrasts_vs_CTRL_BH.csv"),
+          row.names = FALSE)
+```
+
+```{r}
+# ----------------------------
+# optional summary table for plotting/reporting
+# ----------------------------
+summary_table <- df %>%
+  group_by(Recombinant) %>%
+  summarise(
+    n = n(),
+    n_experiments = n_distinct(Experiment),
+    mean_cell_front_velocity = mean(Cell_front_velocity, na.rm = TRUE),
+    sd_cell_front_velocity = sd(Cell_front_velocity, na.rm = TRUE),
+    mean_ctrl_percent = mean(CTRL_PERCENT, na.rm = TRUE),
+    sd_ctrl_percent = sd(CTRL_PERCENT, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write.csv(summary_table,
+          file.path(output_dir, "summary_by_recombinant.csv"),
+          row.names = FALSE)
+
+# ----------------------------
+# plot 1: raw cell front velocity
+# ----------------------------
+p_velocity <- ggplot(df, aes(x = Recombinant, y = Cell_front_velocity)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.6) +
+  theme_classic() +
+  labs(
+    title = "Cell front velocity by recombinant",
+    x = "Recombinant",
+    y = "Cell front velocity"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(file.path(output_dir, "cell_front_velocity_boxplot.pdf"),
+       plot = p_velocity, width = 10, height = 6)
+ggsave(file.path(output_dir, "cell_front_velocity_boxplot.png"),
+       plot = p_velocity, width = 10, height = 6, dpi = 300)
+
+# ----------------------------
+# plot 2: CTRL_PERCENT
+# ----------------------------
+p_ctrl_percent <- ggplot(df, aes(x = Recombinant, y = CTRL_PERCENT)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.6) +
+  theme_classic() +
+  labs(
+    title = "CTRL-normalized wound closure by recombinant",
+    x = "Recombinant",
+    y = "CTRL_PERCENT"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(file.path(output_dir, "ctrl_percent_boxplot.pdf"),
+       plot = p_ctrl_percent, width = 10, height = 6)
+ggsave(file.path(output_dir, "ctrl_percent_boxplot.png"),
+       plot = p_ctrl_percent, width = 10, height = 6, dpi = 300)
+
+# ----------------------------
+# plot 3: DRAXIN vs CTRL by experiment
+# ----------------------------
+df_draxin <- df %>%
+  filter(Recombinant %in% c("CTRL", "DRAXIN"))
+
+p_draxin_ctrl <- ggplot(df_draxin,
+                        aes(x = Recombinant, y = CTRL_PERCENT, color = Experiment)) +
+  geom_point(position = position_jitter(width = 0.1), size = 2, alpha = 0.8) +
+  theme_classic() +
+  labs(
+    title = "DRAXIN vs CTRL across experiments",
+    x = "Recombinant",
+    y = "CTRL_PERCENT"
+  )
+
+ggsave(file.path(output_dir, "draxin_vs_ctrl_by_experiment.pdf"),
+       plot = p_draxin_ctrl, width = 6, height = 5)
+ggsave(file.path(output_dir, "draxin_vs_ctrl_by_experiment.png"),
+       plot = p_draxin_ctrl, width = 6, height = 5, dpi = 300)
+```
+
+```{r}
+# ----------------------------
+# optional: print key results to console
+# ----------------------------
+print(velocity_anova)
+print(velocity_contrast_bh)
+
+print(ctrl_percent_anova)
+print(ctrl_percent_contrast_bh)
+```
+

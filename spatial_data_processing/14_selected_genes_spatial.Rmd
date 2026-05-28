@@ -1,0 +1,358 @@
+
+
+```{r, warning=FALSE}}
+#=================================
+#1. Load libraries and input data
+#=================================
+# This section loads required packages, helper functions, colour mappings,
+# and the integrated spatial object with accompanying annotation data.
+# Output: no figure; workspace and input objects for downstream DRAXIN analyses.
+
+library(patchwork)
+library(SpatialExperiment)
+library(scuttle)
+library(batchelor)
+library(scran)
+library(scater)
+library(ggspavis)
+library(dplyr)
+library(ggrepel)
+library(reshape2)
+library(ggplot2)
+library(tidyr)
+library(readxl)
+library(pheatmap)
+library(UCell)
+
+theme_set(theme_minimal(base_size = 14))
+source("../scripts/general_functions.R")
+
+minmaxscale <- function(x, ...) {
+  (x - min(x, ...)) / (max(x, ...) - min(x, ...))
+}
+
+get_gene_vec <- function(se, gene, assay_priority = c("logcounts", "counts")) {
+  rn <- rownames(se)
+  hit <- which(rn == gene)
+  if (length(hit) == 0) hit <- which(toupper(rn) == toupper(gene))
+  if (length(hit) == 0) stop("Gene not found in rownames(se): ", gene)
+
+  for (assay_name in assay_priority) {
+    if (assay_name %in% assayNames(se)) {
+      return(as.numeric(assay(se, assay_name)[hit[1], ]))
+    }
+  }
+  stop("None of the requested assays found: ", paste(assay_priority, collapse = ", "))
+}
+
+score_signature_mat <- function(genes, mat) {
+  idx <- match(toupper(unique(genes)), toupper(rownames(mat)))
+  idx <- idx[!is.na(idx)]
+  if (length(idx) == 0) return(rep(NA_real_, ncol(mat)))
+  colMeans(mat[idx, , drop = FALSE], na.rm = TRUE)
+}
+
+c25 <- c(
+  "dodgerblue2", "#E31A1C", "green4", "#6A3D9A", "#FF7F00",
+  "black", "gold1", "skyblue2", "#FB9A99", "palegreen2",
+  "#CAB2D6", "#FDBF6F", "gray70", "khaki2", "maroon",
+  "orchid1", "deeppink1", "blue1", "steelblue4", "darkturquoise",
+  "green1", "yellow4", "yellow3", "darkorange4", "brown"
+)
+
+color_maping <- c(
+  "Acinar" = "gold1",
+  "B_cells" = "maroon",
+  "Lymphocyte(CD4)" = "green4",
+  "Lymphocytes" = "green4",
+  "Myeloid(Macrophages)" = "#6A3D9A",
+  "Endothelial" = "#FF7F00",
+  "Endocrine" = "yellow4",
+  "Stellate" = "khaki2",
+  "CAF" = "skyblue2",
+  "Adipocytes" = "steelblue4",
+  "Lymphocyte(NK)" = "green2",
+  "Lymphocyte(CD8)" = "palegreen2",
+  "Myeloid" = "#CAB2D6",
+  "Schwann" = "#FDBF6F",
+  "Myeloid(C1q_macrophages)" = "#CAB2D6",
+  "Nerve" = "#FDBF6F",
+  "Muscle" = "orchid1",
+  "Ductal_malignant" = "gray70",
+  "Ductal_normal" = "black",
+  "B_cells_(Plasma cells)" = "brown1"
+)
+
+spe <- readRDS("../data/SPE/Integrated_NMF.rds")
+colData(spe) <- DataFrame(read.csv("../data/coldata/DE_SPE_annotaion.csv"))
+colnames(spe) <- spe$barcode
+
+bg <- data.frame(colData(spe)[, c("array_col", "array_row", "tumor", "sample_id")])
+W_df <- readRDS("../data/Deconvolution/RCTD_weights.Rds")
+
+# Extract NMF component matrix for selected spatial signal visualisations
+comp <- as.matrix(t(reducedDims(spe)[["compk30"]]))
+spe$adipocytes <- comp["Adipocytes", ]
+
+```
+
+```{r}
+#=================================
+#3. Define nerve-only objects and metadata
+#=================================
+# This section subsets the spatial object to nerve spots and builds a unified
+# metadata table used in downstream DRAXIN quantification and category-based analyses.
+# Output: no figure; nerve-only objects and metadata tables.
+
+spe_nerve <- spe[, colData(spe)$is.nerve == TRUE]
+
+nerve_meta_df <- data.frame(
+  barcode    = as.character(spe_nerve$barcode),
+  patient_id = as.factor(colData(spe_nerve)$patient_id),
+  NerveID    = as.character(colData(spe_nerve)$NerveID),
+  Invaded    = as.character(colData(spe_nerve)$Invaded),
+  type_raw   = as.character(colData(spe_nerve)$type),
+  stringsAsFactors = FALSE
+)
+
+nerve_meta_df$types_grouped <- ifelse(nerve_meta_df$type_raw == "noPNI", "Adjacent", "Diseased")
+nerve_meta_df$nerve_category <- ifelse(
+  nerve_meta_df$Invaded == "NonInvaded",
+  paste0("NonInvaded_", nerve_meta_df$types_grouped),
+  nerve_meta_df$Invaded
+)
+
+nerve_meta_df <- nerve_meta_df[!is.na(nerve_meta_df$nerve_category), ]
+nerve_meta_df$nerve_category <- factor(
+  nerve_meta_df$nerve_category,
+  levels = c("NonInvaded_Adjacent", "NonInvaded_Diseased", "Invaded")
+)
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(ggnewscale)
+library(cowplot)
+
+genes_to_plot <- c("BTC", "FGF5", "IL11")
+
+sample_order <- c(
+  "6249bl23_noPNI",
+  "6249bl18_noPNIandhighPNI"
+)
+
+label_map <- c(
+  "6249bl23_noPNI"   = "P1-Adjacent",
+  "6249bl18_noPNIandhighPNI" = "P1-Diseased"
+)
+
+# Subset to P1 adjacent + diseased
+spe_sub <- spe[, as.character(colData(spe)$sample_id) %in% sample_order]
+spe_nerve_sub <- spe_nerve[, as.character(colData(spe_nerve)$sample_id) %in% sample_order]
+
+colData(spe_sub)$sample_id <- factor(
+  as.character(colData(spe_sub)$sample_id),
+  levels = sample_order
+)
+
+colData(spe_nerve_sub)$sample_id <- factor(
+  as.character(colData(spe_nerve_sub)$sample_id),
+  levels = sample_order
+)
+
+#---------------------------------
+# Build nerve hulls ONCE
+#---------------------------------
+make_nerve_hulls <- function(dat) {
+  dat %>%
+    group_by(sample_id, NerveID, Invaded) %>%
+    filter(n() >= 3) %>%
+    slice(chull(x, y)) %>%
+    ungroup() %>%
+    mutate(group_id = interaction(sample_id, NerveID, drop = TRUE))
+}
+
+hulls_df <- as.data.frame(colData(spe_nerve_sub)) %>%
+  transmute(
+    x = as.numeric(array_col),
+    y = -as.numeric(array_row),
+    sample_id = factor(as.character(sample_id), levels = sample_order),
+    NerveID = as.character(NerveID),
+    Invaded = as.character(Invaded)
+  ) %>%
+  filter(is.finite(x), is.finite(y), !is.na(sample_id), !is.na(NerveID), !is.na(Invaded)) %>%
+  make_nerve_hulls()
+
+hulls_inv <- hulls_df %>% filter(Invaded == "Invaded")
+hulls_non <- hulls_df %>% filter(Invaded == "NonInvaded")
+
+#---------------------------------
+# Expression helper
+#---------------------------------
+get_plot_expr <- function(se, gene, use_assay = c("logcounts", "counts")) {
+  use_assay <- match.arg(use_assay)
+
+  vals <- get_gene_vec(se, gene, assay_priority = c(use_assay))
+
+  if (use_assay == "counts") {
+    vals <- log2(vals + 1)
+  }
+
+  as.numeric(vals)
+}
+
+#---------------------------------
+# Plot function
+# each gene gets its own max
+#---------------------------------
+plot_gene_spatial <- function(se_obj, gene, hulls_inv, hulls_non,
+                              sample_order, label_map,
+                              use_assay = "logcounts") {
+
+  expr_vec <- get_plot_expr(se_obj, gene, use_assay = use_assay)
+
+  plot_df <- as.data.frame(colData(se_obj)) %>%
+    transmute(
+      x = as.numeric(array_col),
+      y = -as.numeric(array_row),
+      sample_id = factor(as.character(sample_id), levels = sample_order),
+      expr = expr_vec
+    ) %>%
+    filter(is.finite(x), is.finite(y), !is.na(sample_id), is.finite(expr))
+
+  # gene-specific max from only this gene
+  expr_max <- max(plot_df$expr, na.rm = TRUE)
+
+  message(gene, " max expression = ", round(expr_max, 3))
+
+  ggplot(plot_df, aes(x = x, y = y)) +
+    geom_point(aes(color = expr), size = 0.1, pch = 19) +
+    scale_color_viridis_c(
+      option = "A",
+      limits = c(0, expr_max),
+      oob = scales::squish,
+      name = paste0(gene, "\nlog2 expr"),
+      guide = guide_colorbar(order = 1)
+    ) +
+    ggnewscale::new_scale_color() +
+    geom_polygon(
+      data = hulls_non,
+      inherit.aes = FALSE,
+      aes(x = x, y = y, group = group_id),
+      fill = NA,
+      linewidth = 0.2,
+      color = "white",
+      show.legend = FALSE
+    ) +
+    geom_polygon(
+      data = hulls_inv,
+      inherit.aes = FALSE,
+      aes(x = x, y = y, group = group_id),
+      fill = NA,
+      linewidth = 0.2,
+      color = "white",
+      show.legend = FALSE
+    ) +
+    geom_polygon(
+      data = hulls_non,
+      inherit.aes = FALSE,
+      aes(x = x, y = y, group = group_id, color = "Non-invaded"),
+      fill = NA,
+      linewidth = 0.2,
+      show.legend = FALSE
+    ) +
+    geom_polygon(
+      data = hulls_inv,
+      inherit.aes = FALSE,
+      aes(x = x, y = y, group = group_id, color = "Invaded"),
+      fill = NA,
+      linewidth = 0.2,
+      show.legend = FALSE
+    ) +
+    scale_color_manual(
+      name = "Nerve outline",
+      values = c(
+        "Non-invaded" = "skyblue2",
+        "Invaded" = "khaki2"
+      ),
+      breaks = c("Invaded", "Non-invaded")
+    ) +
+    facet_wrap(~sample_id, labeller = as_labeller(label_map)) +
+    coord_equal() +
+    theme_void() +
+    labs(title = gene) +
+    theme(
+      plot.title = element_text(size = 12, face = "bold", hjust = 0),
+      strip.text = element_text(size = 10, face = "bold"),
+      strip.background = element_blank(),
+      legend.position = "right"
+    )
+}
+
+#---------------------------------
+# Make the 3 gene plots
+#---------------------------------
+plot_list <- lapply(
+  genes_to_plot,
+  function(g) plot_gene_spatial(
+    se_obj = spe_sub,
+    gene = g,
+    hulls_inv = hulls_inv,
+    hulls_non = hulls_non,
+    sample_order = sample_order,
+    label_map = label_map,
+    use_assay = "logcounts"
+  )
+)
+
+#---------------------------------
+# Build ONE separate hull legend
+#---------------------------------
+legend_df <- data.frame(
+  x = c(1, 1),
+  y = c(1, 2),
+  group = c("Non-invaded", "Invaded")
+)
+
+hull_legend_plot <- ggplot(legend_df, aes(x = x, y = y, color = group)) +
+  geom_path(aes(group = group), linewidth = 1.2) +
+  scale_color_manual(
+    name = "Nerve outline",
+    values = c(
+      "Non-invaded" = "skyblue2",
+      "Invaded" = "khaki2"
+    ),
+    breaks = c("Invaded", "Non-invaded")
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 10, face = "bold"),
+    legend.text = element_text(size = 9)
+  )
+
+hull_legend <- cowplot::get_legend(hull_legend_plot)
+
+#---------------------------------
+# Combine plots + separate hull legend column
+#---------------------------------
+plots_combined <- wrap_plots(plotlist = plot_list, ncol = 1)
+
+p_p1_three_genes <- plots_combined | patchwork::wrap_elements(hull_legend)
+
+p_p1_three_genes <- p_p1_three_genes +
+  plot_layout(widths = c(1, 0.16)) +
+  plot_annotation(title = "Patient 1 spatial expression with NI and Invaded nerve hulls")
+
+p_p1_three_genes
+```
+
+
+```{r}
+
+ggsave("../figures/p_p1_three_genes.pdf", p_p1_three_genes, width = 8.5, height = 12)
+ggsave("../figures/p_p1_three_genes.png", p_p1_three_genes, width = 8.5, height = 12, dpi = 600)
+```

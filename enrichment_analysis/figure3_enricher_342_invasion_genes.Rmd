@@ -1,0 +1,481 @@
+#========================================================
+# ORA analysis for invaded-nerve signature gene list
+#========================================================
+#
+# Purpose:
+#   Perform over-representation analysis (ORA) on a selected invaded-nerve
+#   gene list using a defined DE background universe.
+#
+# Key features:
+#   - Uses a proper background gene universe
+#   - Saves ALL tested terms, not only significant ones
+#   - Saves significant terms separately
+#   - Extracts nerve-related terms by keyword search for manual inspection
+#   - Uses robust gene-symbol to ENTREZ mapping with manual corrections
+#
+# Expected input files:
+#   - FullDE_List.csv                : background universe, must contain column "Gene"
+#   - All_genes_up_invaded_LR.csv    : selected signature, must contain column "Gene"
+#
+#========================================================
+
+```{r}
+#========================================================
+# 1. Load packages
+#========================================================
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(tibble)
+  library(stringr)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(ReactomePA)
+  library(DOSE)
+  library(msigdbr)
+  library(enrichplot)
+  library(ggplot2)
+  library(openxlsx)
+  library(tidyr)
+})
+```
+
+```{r}
+#========================================================
+# 2. Parameters
+#========================================================
+
+seed_value <- 1234
+set.seed(seed_value)
+
+#----- Paths -----
+project_dir <- "~/NAS/Aleksandra/Computational/R programming/paper_projects/GSEA"
+input_dir   <- file.path(project_dir, "input lists")
+output_dir  <- file.path(project_dir, "figure3_ORA_invaded_nerve")
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(output_dir, "csv"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(output_dir, "pdf"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(output_dir, "rds"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(output_dir, "qc"),  recursive = TRUE, showWarnings = FALSE)
+
+background_file <- file.path(input_dir, "FullDE_List.csv")
+signature_file  <- file.path(input_dir, "TableS5_invasion_associated_342_genes.csv")
+
+#----- Enrichment settings -----
+min_gs_size   <- 10
+max_gs_size   <- 800
+adjust_method <- "BH"
+
+# IMPORTANT:
+# set cutoffs to 1 so you can inspect all tested terms,
+# then filter significant terms afterwards
+p_cutoff_full <- 1
+q_cutoff_full <- 1
+
+# significance threshold for exported filtered tables
+sig_padj_cutoff <- 0.05
+
+#----- Keywords for nerve-related inspection -----
+nerve_keywords <- c(
+  "nerve", "neural", "neuron", "neuron projection", "axon", "axonal",
+  "schwann", "glia", "glial", "myelin", "synap", "neuro",
+  "regeneration", "regenerative", "injury", "repair", "guidance",
+  "neurotrans", "glutam", "peripheral nervous system", "ensheath"
+)
+```
+
+```{r}
+#========================================================
+# 3. Helper functions
+#========================================================
+
+#--------------------------------------------------------
+# 3.1 Check required columns
+#--------------------------------------------------------
+check_required_columns <- function(df, required_cols = "Gene") {
+  missing_cols <- setdiff(required_cols, colnames(df))
+  if (length(missing_cols) > 0) {
+    stop("Missing required columns: ", paste(missing_cols, collapse = ", "))
+  }
+}
+
+#--------------------------------------------------------
+# 3.2 Map SYMBOL -> ENTREZ with manual corrections
+#--------------------------------------------------------
+map_symbols_to_entrez <- function(symbols) {
+  symbols <- unique(as.character(symbols))
+  symbols <- symbols[!is.na(symbols) & symbols != ""]
+
+  mapped <- AnnotationDbi::mapIds(
+    org.Hs.eg.db,
+    keys      = symbols,
+    column    = "ENTREZID",
+    keytype   = "SYMBOL",
+    multiVals = "first"
+  )
+
+  mapped_df <- tibble(
+    Gene = names(mapped),
+    ENTREZID = as.character(mapped)
+  )
+
+  # Manual corrections for symbols not resolved automatically
+  manual_map <- c(
+    ST5     = "6764",
+    TIAF1   = "399687",
+    SPATA5  = "166378",
+    C3orf14 = "57415",
+    ENDNRB  = "1910"
+  )
+
+  idx <- mapped_df$Gene %in% names(manual_map) & is.na(mapped_df$ENTREZID)
+  mapped_df$ENTREZID[idx] <- manual_map[mapped_df$Gene[idx]]
+
+  mapped_df %>%
+    distinct(Gene, .keep_all = TRUE)
+}
+
+#--------------------------------------------------------
+# 3.3 Save enrichment tables
+#--------------------------------------------------------
+save_enrichment_outputs <- function(res_obj, analysis_name, output_dir, show_n = 20) {
+
+  csv_dir <- file.path(output_dir, "csv")
+  pdf_dir <- file.path(output_dir, "pdf")
+  rds_dir <- file.path(output_dir, "rds")
+
+  saveRDS(res_obj, file = file.path(rds_dir, paste0(analysis_name, ".rds")))
+
+  res_df <- as.data.frame(res_obj@result)
+
+  if (nrow(res_df) == 0) {
+    readr::write_csv(res_df, file.path(csv_dir, paste0(analysis_name, "_all_terms.csv")))
+    return(invisible(res_df))
+  }
+
+  # Save all terms
+  readr::write_csv(res_df, file.path(csv_dir, paste0(analysis_name, "_all_terms.csv")))
+
+  # Save significant terms
+  sig_df <- res_df %>%
+    filter(!is.na(p.adjust) & p.adjust < sig_padj_cutoff)
+
+  readr::write_csv(sig_df, file.path(csv_dir, paste0(analysis_name, "_significant_terms.csv")))
+  
+  # Save nerve-related keyword matches
+  keyword_pattern <- paste(nerve_keywords, collapse = "|")
+  nerve_df <- res_df %>%
+    filter(str_detect(tolower(Description), keyword_pattern) |
+           str_detect(tolower(ID), keyword_pattern))
+
+  readr::write_csv(nerve_df, file.path(csv_dir, paste0(analysis_name, "_nerve_keyword_terms.csv")))
+
+  # Plot only significant terms if they exist; otherwise plot top terms by p.adjust
+  pdf(file.path(pdf_dir, paste0(analysis_name, "_dotplot.pdf")), width = 10, height = 8, useDingbats = FALSE)
+  if (nrow(sig_df) > 0) {
+    print(dotplot(res_obj, showCategory = show_n) + ggtitle(analysis_name))
+  } else {
+    top_df <- res_df %>%
+      arrange(p.adjust, pvalue) %>%
+      slice_head(n = min(show_n, nrow(.)))
+
+    if (nrow(top_df) > 0) {
+      # rebuild temporary object with top rows for plotting
+      tmp_obj <- res_obj
+      tmp_obj@result <- top_df
+      print(dotplot(tmp_obj, showCategory = min(show_n, nrow(top_df))) + ggtitle(paste0(analysis_name, " (top terms, none significant)")))
+    } else {
+      plot.new()
+      title(main = paste("No terms returned:", analysis_name))
+    }
+  }
+  dev.off()
+
+  invisible(res_df)
+}
+
+#--------------------------------------------------------
+# 3.4 Generic ORA runner for TERM2GENE
+#--------------------------------------------------------
+run_ora_term2gene <- function(gene, universe, term2gene, analysis_name, readable = TRUE) {
+  ora_obj <- enricher(
+    gene          = gene,
+    universe      = universe,
+    TERM2GENE     = term2gene,
+    pvalueCutoff  = p_cutoff_full,
+    qvalueCutoff  = q_cutoff_full,
+    pAdjustMethod = adjust_method,
+    minGSSize     = min_gs_size,
+    maxGSSize     = max_gs_size
+  )
+
+  if (!is.null(ora_obj) && readable) {
+    ora_obj <- setReadable(ora_obj, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+  }
+
+  save_enrichment_outputs(ora_obj, analysis_name, output_dir)
+  return(ora_obj)
+}
+
+#--------------------------------------------------------
+# 3.5 GO/Reactome wrappers
+#--------------------------------------------------------
+run_ora_go <- function(gene, universe, ont, analysis_name) {
+  ora_obj <- enrichGO(
+    gene          = gene,
+    universe      = universe,
+    OrgDb         = org.Hs.eg.db,
+    keyType       = "ENTREZID",
+    ont           = ont,
+    pvalueCutoff  = p_cutoff_full,
+    qvalueCutoff  = q_cutoff_full,
+    pAdjustMethod = adjust_method,
+    minGSSize     = min_gs_size,
+    maxGSSize     = max_gs_size,
+    readable      = TRUE
+  )
+
+  save_enrichment_outputs(ora_obj, analysis_name, output_dir)
+  return(ora_obj)
+}
+
+run_ora_reactome <- function(gene, universe, analysis_name) {
+  ora_obj <- enrichPathway(
+    gene          = gene,
+    universe      = universe,
+    organism      = "human",
+    pvalueCutoff  = p_cutoff_full,
+    qvalueCutoff  = q_cutoff_full,
+    pAdjustMethod = adjust_method,
+    minGSSize     = min_gs_size,
+    maxGSSize     = max_gs_size,
+    readable      = TRUE
+  )
+
+  save_enrichment_outputs(ora_obj, analysis_name, output_dir)
+  return(ora_obj)
+}
+
+run_ora_do <- function(gene, universe, analysis_name) {
+  ora_obj <- enrichDO(
+    gene          = gene,
+    universe      = universe,
+    ont           = "DO",
+    pvalueCutoff  = p_cutoff_full,
+    qvalueCutoff  = q_cutoff_full,
+    pAdjustMethod = adjust_method,
+    minGSSize     = min_gs_size,
+    maxGSSize     = max_gs_size,
+    readable      = TRUE
+  )
+
+  save_enrichment_outputs(ora_obj, analysis_name, output_dir)
+  return(ora_obj)
+}
+
+```
+
+```{r}
+#========================================================
+# 4. Read input data
+#========================================================
+
+background <- readr::read_csv(background_file, show_col_types = FALSE)
+signature  <- readr::read_csv(signature_file, show_col_types = FALSE)
+
+check_required_columns(background, "Gene")
+check_required_columns(signature,  "Gene")
+
+cat("Background genes:", nrow(background), "\n")
+cat("Signature genes:", nrow(signature), "\n")
+```
+
+```{r}
+#========================================================
+# 5. Map genes to ENTREZ IDs
+#========================================================
+
+background_map <- map_symbols_to_entrez(background$Gene)
+signature_map  <- map_symbols_to_entrez(signature$Gene)
+
+# Keep only mapped genes
+background_map_filt <- background_map %>% filter(!is.na(ENTREZID))
+signature_map_filt  <- signature_map %>% filter(!is.na(ENTREZID))
+
+# Restrict signature to genes present in the background universe
+signature_map_filt <- signature_map_filt %>%
+  filter(ENTREZID %in% background_map_filt$ENTREZID)
+
+# Character vectors required by clusterProfiler
+gene_list <- as.character(signature_map_filt$ENTREZID)
+universe  <- as.character(background_map_filt$ENTREZID)
+
+cat("Mapped background genes:", length(universe), "\n")
+cat("Mapped signature genes:", length(gene_list), "\n")
+
+# Save mapping tables
+readr::write_csv(background_map,      file.path(output_dir, "qc", "background_symbol_to_entrez.csv"))
+readr::write_csv(signature_map,       file.path(output_dir, "qc", "signature_symbol_to_entrez.csv"))
+readr::write_csv(background_map_filt, file.path(output_dir, "qc", "background_mapped_used.csv"))
+readr::write_csv(signature_map_filt,  file.path(output_dir, "qc", "signature_mapped_used.csv"))
+```
+
+```{r}
+#========================================================
+# 6. Run GO and pathway ORA
+#========================================================
+
+ora_go_bp <- run_ora_go(gene_list, universe, ont = "BP", analysis_name = "ora_go_bp")
+ora_go_cc <- run_ora_go(gene_list, universe, ont = "CC", analysis_name = "ora_go_cc")
+ora_go_mf <- run_ora_go(gene_list, universe, ont = "MF", analysis_name = "ora_go_mf")
+
+ora_reactome <- run_ora_reactome(gene_list, universe, analysis_name = "ora_reactome")
+ora_do       <- run_ora_do(gene_list, universe, analysis_name = "ora_disease_ontology")
+```
+
+```{r}
+#========================================================
+# 7. Run MSigDB ORA across collections
+#========================================================
+
+run_msigdb_ora <- function(collection_name) {
+  term2gene <- msigdbr(
+    species = "Homo sapiens",
+    category = collection_name
+  ) %>%
+    dplyr::select(gs_name, entrez_gene) %>%
+    dplyr::distinct()
+
+  run_ora_term2gene(
+    gene = gene_list,
+    universe = universe,
+    term2gene = term2gene,
+    analysis_name = paste0("ora_msigdb_", collection_name),
+    readable = TRUE
+  )
+}
+
+ora_msigdb_h  <- run_msigdb_ora("H")
+ora_msigdb_c1 <- run_msigdb_ora("C1")
+ora_msigdb_c2 <- run_msigdb_ora("C2")
+ora_msigdb_c3 <- run_msigdb_ora("C3")
+ora_msigdb_c4 <- run_msigdb_ora("C4")
+ora_msigdb_c5 <- run_msigdb_ora("C5")
+ora_msigdb_c6 <- run_msigdb_ora("C6")
+ora_msigdb_c7 <- run_msigdb_ora("C7")
+ora_msigdb_c8 <- run_msigdb_ora("C8")
+```
+
+```{r}
+#========================================================
+# 8. Combine nerve-keyword results across analyses
+#========================================================
+
+csv_dir <- file.path(output_dir, "csv")
+
+nerve_files <- list.files(
+  csv_dir,
+  pattern = "_nerve_keyword_terms\\.csv$",
+  full.names = TRUE
+)
+
+nerve_summary <- lapply(nerve_files, function(f) {
+  df <- readr::read_csv(f, show_col_types = FALSE)
+  if (nrow(df) == 0) return(NULL)
+  df$analysis <- basename(f) %>% str_remove("_nerve_keyword_terms\\.csv$")
+  df
+}) %>%
+  bind_rows()
+
+readr::write_csv(
+  nerve_summary,
+  file.path(csv_dir, "combined_nerve_keyword_terms_across_analyses.csv")
+)
+
+cat("Combined nerve-keyword table saved.\n")
+```
+
+```{r}
+#========================================================
+# 9. Combine suggestive terms across analyses - top 15 form each
+#========================================================
+
+csv_dir <- file.path(output_dir, "csv")
+
+all_term_files <- list.files(
+  csv_dir,
+  pattern = "_all_terms\\.csv$",
+  full.names = TRUE
+)
+
+suggestive_summary <- lapply(all_term_files, function(f) {
+  df <- readr::read_csv(f, show_col_types = FALSE)
+
+  if (nrow(df) == 0) return(NULL)
+
+  df %>%
+    filter(!is.na(pvalue) & pvalue < 0.05) %>%
+    filter(is.na(p.adjust) | p.adjust >= sig_padj_cutoff) %>%
+    arrange(pvalue) %>%   # ensure ranking within each file
+    slice_head(n = 15) %>%  # <-- restrict to top 15 per comparison
+    mutate(analysis = basename(f) %>% str_remove("_all_terms\\.csv$"))
+}) %>%
+  bind_rows() %>%
+  arrange(pvalue)
+
+readr::write_csv(
+  suggestive_summary,
+  file.path(csv_dir, "combined_suggestive_terms_rawp_lt_0.05_top15_per_analysis.csv")
+)
+
+cat("Combined suggestive-term table (top 15 per analysis) saved.\n")
+```
+
+```{r}
+#========================================================
+# 10. Combine suggestive terms across analyses (global top 100)
+#========================================================
+
+csv_dir <- file.path(output_dir, "csv")
+
+all_term_files <- list.files(
+  csv_dir,
+  pattern = "_all_terms\\.csv$",
+  full.names = TRUE
+)
+
+suggestive_summary <- lapply(all_term_files, function(f) {
+  df <- readr::read_csv(f, show_col_types = FALSE)
+
+  if (nrow(df) == 0) return(NULL)
+
+  df %>%
+    filter(!is.na(pvalue) & pvalue < 0.05) %>%
+    filter(is.na(p.adjust) | p.adjust >= sig_padj_cutoff) %>%
+    mutate(analysis = basename(f) %>% str_remove("_all_terms\\.csv$"))
+}) %>%
+  bind_rows() %>%
+  arrange(pvalue) %>%        # global ranking across all comparisons
+  slice_head(n = 100)        # <-- top 100 overall
+
+readr::write_csv(
+  suggestive_summary,
+  file.path(csv_dir, "combined_suggestive_terms_top100_global.csv")
+)
+
+cat("Combined suggestive-term table (top 100 global) saved.\n")
+```
+
+
+```{r}
+#========================================================
+# 10. Save session info
+#========================================================
+
+writeLines(
+  capture.output(sessionInfo()),
+  con = file.path(output_dir, "qc", "sessionInfo.txt")
+)
+```
+

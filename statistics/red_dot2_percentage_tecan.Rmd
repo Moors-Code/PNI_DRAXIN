@@ -1,0 +1,328 @@
+
+```{r}
+# =======================
+# PACKAGES
+# =======================
+library(readr)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(broom)
+```
+
+```{r}
+# =======================
+# INPUT / OUTPUT
+# =======================
+file <- "input_files/Red_dot.csv"
+out_dir <- "output/red_dot_necrosis_24h"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# =======================
+# READ DATA
+# Required columns:
+#   Draxin
+#   Percentage
+#   Experiment
+#   Hours   (or Hour / Hr)
+# =======================
+df_raw <- read_csv(file, show_col_types = FALSE)
+
+# Allow either Hr, Hour, or Hours
+if ("Hr" %in% names(df_raw) && !("Hours" %in% names(df_raw))) {
+  df_raw <- df_raw %>% rename(Hours = Hr)
+}
+if ("Hour" %in% names(df_raw) && !("Hours" %in% names(df_raw))) {
+  df_raw <- df_raw %>% rename(Hours = Hour)
+}
+
+required_cols <- c("Draxin", "Percentage", "Experiment", "Hours")
+missing_cols <- setdiff(required_cols, names(df_raw))
+
+if (length(missing_cols) > 0) {
+  stop(
+    paste("Missing required columns:", paste(missing_cols, collapse = ", "))
+  )
+}
+
+# =======================
+# CLEAN DATA
+# =======================
+draxin_order <- c("0", "0.6", "1.1", "2.2", "4.4", "8.8", "17.5", "35", "70", "140")
+
+df <- df_raw %>%
+  mutate(
+    Experiment = factor(Experiment),
+    Draxin = str_trim(as.character(Draxin)),
+    Hours = as.numeric(Hours),
+    Percentage = as.numeric(Percentage)
+  ) %>%
+  filter(
+    !is.na(Experiment),
+    !is.na(Draxin),
+    !is.na(Hours),
+    !is.na(Percentage)
+  )
+
+draxin_order_present <- draxin_order[draxin_order %in% unique(df$Draxin)]
+if (length(draxin_order_present) == 0) {
+  draxin_order_present <- sort(unique(df$Draxin))
+}
+
+df <- df %>%
+  mutate(
+    Draxin = factor(Draxin, levels = draxin_order_present)
+  )
+
+if (!("0" %in% levels(df$Draxin))) {
+  stop("Control level '0' was not found in Draxin column.")
+}
+```
+
+```{r}
+# =======================
+# BASIC QC
+# =======================
+qc_table <- data.frame(
+  metric = c(
+    "n_rows",
+    "n_experiments",
+    "experiments",
+    "n_draxin_levels",
+    "draxin_levels",
+    "hours"
+  ),
+  value = c(
+    nrow(df),
+    dplyr::n_distinct(df$Experiment),
+    paste(levels(df$Experiment), collapse = ", "),
+    dplyr::n_distinct(df$Draxin),
+    paste(levels(df$Draxin), collapse = ", "),
+    paste(sort(unique(df$Hours)), collapse = ", ")
+  )
+)
+
+write.csv(
+  qc_table,
+  file.path(out_dir, "qc_summary.csv"),
+  row.names = FALSE
+)
+
+dup_check <- df %>%
+  count(Experiment, Draxin, Hours) %>%
+  filter(n > 1)
+
+write.csv(
+  dup_check,
+  file.path(out_dir, "duplicate_entries_check.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+# =======================
+# FULL RAW TIME COURSE SUMMARY
+# =======================
+df_time_plot <- df %>%
+  group_by(Draxin, Hours) %>%
+  summarise(
+    n = n(),
+    mean_percentage = mean(Percentage, na.rm = TRUE),
+    sd_percentage = sd(Percentage, na.rm = TRUE),
+    sem_percentage = sd_percentage / sqrt(n),
+    .groups = "drop"
+  )
+
+write.csv(
+  df_time_plot,
+  file.path(out_dir, "timecourse_raw_summary.csv"),
+  row.names = FALSE
+)
+
+# =======================
+# PLOT: FULL RAW TIME COURSE
+# =======================
+p_time <- ggplot(df_time_plot, aes(x = Hours, y = mean_percentage, color = Draxin, group = Draxin)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_errorbar(
+    aes(ymin = mean_percentage - sem_percentage,
+        ymax = mean_percentage + sem_percentage),
+    width = 3
+  ) +
+  labs(
+    title = "Necrotic cells over time",
+    x = "Time (h)",
+    y = "% red_dot positive cells",
+    color = "Draxin (nM)"
+  ) +
+  theme_classic(base_size = 13)
+
+ggsave(
+  filename = file.path(out_dir, "red_dot_timecourse_raw_mean_sem.png"),
+  plot = p_time,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(out_dir, "red_dot_timecourse_raw_mean_sem.pdf"),
+  plot = p_time,
+  width = 8,
+  height = 5
+)
+```
+
+```{r}
+# =======================
+# 24 H DATASET
+# =======================
+df_24 <- df %>%
+  filter(Hours == 24)
+
+write.csv(
+  df_24,
+  file.path(out_dir, "red_dot_24h_raw_values.csv"),
+  row.names = FALSE
+)
+
+df_24_summary <- df_24 %>%
+  group_by(Draxin) %>%
+  summarise(
+    n = n(),
+    mean_percentage = mean(Percentage, na.rm = TRUE),
+    sd_percentage = sd(Percentage, na.rm = TRUE),
+    sem_percentage = sd_percentage / sqrt(n),
+    .groups = "drop"
+  )
+
+write.csv(
+  df_24_summary,
+  file.path(out_dir, "red_dot_24h_summary.csv"),
+  row.names = FALSE
+)
+
+# =======================
+# PLOT: 24 H RAW VALUES
+# all points + mean ± SEM
+# =======================
+p_24 <- ggplot(df_24, aes(x = Draxin, y = Percentage)) +
+  geom_jitter(width = 0.12, height = 0, size = 2.2, alpha = 0.8) +
+  geom_point(
+    data = df_24_summary,
+    aes(x = Draxin, y = mean_percentage),
+    inherit.aes = FALSE,
+    size = 3
+  ) +
+  geom_errorbar(
+    data = df_24_summary,
+    aes(
+      x = Draxin,
+      ymin = mean_percentage - sem_percentage,
+      ymax = mean_percentage + sem_percentage
+    ),
+    inherit.aes = FALSE,
+    width = 0.2
+  ) +
+  labs(
+    title = "Necrotic cells at 24 h",
+    x = "Draxin (nM)",
+    y = "% red_dot positive cells"
+  ) +
+  theme_classic(base_size = 13)
+
+ggsave(
+  filename = file.path(out_dir, "red_dot_24h_raw_points_mean_sem.png"),
+  plot = p_24,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(out_dir, "red_dot_24h_raw_points_mean_sem.pdf"),
+  plot = p_24,
+  width = 8,
+  height = 5
+)
+```
+
+```{r}
+# =======================
+# 24 H STATS
+# mixed model if >= 2 experiments,
+# otherwise linear model
+# =======================
+if (nrow(df_24) >= 3 && dplyr::n_distinct(df_24$Draxin) >= 2) {
+  
+  if (dplyr::n_distinct(df_24$Experiment) >= 2) {
+    m_24 <- lmer(Percentage ~ Draxin + (1 | Experiment), data = df_24)
+    model_type <- "lmer"
+  } else {
+    m_24 <- lm(Percentage ~ Draxin, data = df_24)
+    model_type <- "lm"
+  }
+  
+  write.csv(
+    data.frame(model_used = model_type),
+    file.path(out_dir, "red_dot_24h_model_type.csv"),
+    row.names = FALSE
+  )
+  
+  anova_24 <- anova(m_24)
+  emm_24 <- emmeans(m_24, ~ Draxin)
+  
+  posthoc_24 <- contrast(
+    emm_24,
+    method = "trt.vs.ctrl",
+    ref = which(levels(df_24$Draxin) == "0"),
+    adjust = "dunnett"
+  )
+  
+  write.csv(
+    as.data.frame(anova_24),
+    file.path(out_dir, "red_dot_24h_anova.csv"),
+    row.names = TRUE
+  )
+  
+  write.csv(
+    as.data.frame(emm_24),
+    file.path(out_dir, "red_dot_24h_emmeans.csv"),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    as.data.frame(posthoc_24),
+    file.path(out_dir, "red_dot_24h_vs_ctrl_dunnett.csv"),
+    row.names = FALSE
+  )
+  
+  # add significance labels
+  sig_24 <- as.data.frame(posthoc_24) %>%
+    mutate(
+      contrast = as.character(contrast),
+      Draxin_test = str_trim(str_remove(contrast, "\\s*-\\s*0$")),
+      p_label = case_when(
+        p.value < 0.001 ~ "***",
+        p.value < 0.01  ~ "**",
+        p.value < 0.05  ~ "*",
+        TRUE ~ "ns"
+      )
+    )
+  
+  write.csv(
+    sig_24,
+    file.path(out_dir, "red_dot_24h_significance_labels.csv"),
+    row.names = FALSE
+  )
+  
+} else {
+  message("Skipping 24 h stats: not enough data.")
+}
+
+cat("Done.\n")
+```

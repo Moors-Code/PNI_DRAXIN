@@ -1,0 +1,956 @@
+
+#This script investigates DRAXIN expression in pancreatic tumour-associated nerves using spatial transcriptomic data. It first visualises DRAXIN across all tissue sections, then focuses on nerve-associated spots to compare DRAXIN levels across three nerve states: non-invaded adjacent nerves, non-invaded diseased nerves, and invaded nerves. The script quantifies DRAXIN both at the nerve level and the spot level, and then examines whether DRAXIN-high tumour-associated nerves are associated with specific Schwann cell transcriptional programs.
+
+#Output Figures:
+
+#Spatial DRAXIN expression across tissues – Faceted spatial plot showing DRAXIN signal across all samples.
+#Spatial DRAXIN with nerve outlines – Spatial DRAXIN map with nerve borders coloured by invasion status.
+#Saved as: ../figures/Draxin_signal.png
+#Spatial Adipocyte signal with nerve outlines by invasion status- Figure S4A vs 2026_March
+#Nerve-level DRAXIN expression – Violin/boxplot showing mean DRAXIN per nerve across adjacent, diseased, and invaded nerves.
+#Spot-level DRAXIN expression – Violin/boxplot showing DRAXIN expression per spot across nerve categories.
+#Saved as: DRAXIN_logcounts_violing_spot.pdf
+#Schwann programs vs DRAXIN levels – Heatmap of Schwann signature enrichment across DRAXIN-low, normal, and high tumour-associated nerves.
+#Saved as: ../figures/heatmap_Schwann_by_DRAXIN_tumour_associated_nerves.pdf
+#Schwann programs across nerve categories – Heatmap of Schwann signature enrichment across adjacent, diseased, and invaded nerves.
+#Saved as: ../figures/heatmap_Schwann_cat3vs2.pdf
+
+
+```{r, warning=FALSE}}
+#=================================
+#1. Load libraries and input data
+#=================================
+# This section loads required packages, helper functions, colour mappings,
+# and the integrated spatial object with accompanying annotation data.
+# Output: no figure; workspace and input objects for downstream DRAXIN analyses.
+
+library(patchwork)
+library(SpatialExperiment)
+library(scuttle)
+library(batchelor)
+library(scran)
+library(scater)
+library(ggspavis)
+library(dplyr)
+library(ggrepel)
+library(reshape2)
+library(ggplot2)
+library(tidyr)
+library(readxl)
+library(pheatmap)
+library(UCell)
+
+theme_set(theme_minimal(base_size = 14))
+source("../scripts/general_functions.R")
+
+minmaxscale <- function(x, ...) {
+  (x - min(x, ...)) / (max(x, ...) - min(x, ...))
+}
+
+get_gene_vec <- function(se, gene, assay_priority = c("logcounts", "counts")) {
+  rn <- rownames(se)
+  hit <- which(rn == gene)
+  if (length(hit) == 0) hit <- which(toupper(rn) == toupper(gene))
+  if (length(hit) == 0) stop("Gene not found in rownames(se): ", gene)
+
+  for (assay_name in assay_priority) {
+    if (assay_name %in% assayNames(se)) {
+      return(as.numeric(assay(se, assay_name)[hit[1], ]))
+    }
+  }
+  stop("None of the requested assays found: ", paste(assay_priority, collapse = ", "))
+}
+
+score_signature_mat <- function(genes, mat) {
+  idx <- match(toupper(unique(genes)), toupper(rownames(mat)))
+  idx <- idx[!is.na(idx)]
+  if (length(idx) == 0) return(rep(NA_real_, ncol(mat)))
+  colMeans(mat[idx, , drop = FALSE], na.rm = TRUE)
+}
+
+c25 <- c(
+  "dodgerblue2", "#E31A1C", "green4", "#6A3D9A", "#FF7F00",
+  "black", "gold1", "skyblue2", "#FB9A99", "palegreen2",
+  "#CAB2D6", "#FDBF6F", "gray70", "khaki2", "maroon",
+  "orchid1", "deeppink1", "blue1", "steelblue4", "darkturquoise",
+  "green1", "yellow4", "yellow3", "darkorange4", "brown"
+)
+
+color_maping <- c(
+  "Acinar" = "gold1",
+  "B_cells" = "maroon",
+  "Lymphocyte(CD4)" = "green4",
+  "Lymphocytes" = "green4",
+  "Myeloid(Macrophages)" = "#6A3D9A",
+  "Endothelial" = "#FF7F00",
+  "Endocrine" = "yellow4",
+  "Stellate" = "khaki2",
+  "CAF" = "skyblue2",
+  "Adipocytes" = "steelblue4",
+  "Lymphocyte(NK)" = "green2",
+  "Lymphocyte(CD8)" = "palegreen2",
+  "Myeloid" = "#CAB2D6",
+  "Schwann" = "#FDBF6F",
+  "Myeloid(C1q_macrophages)" = "#CAB2D6",
+  "Nerve" = "#FDBF6F",
+  "Muscle" = "orchid1",
+  "Ductal_malignant" = "gray70",
+  "Ductal_normal" = "black",
+  "B_cells_(Plasma cells)" = "brown1"
+)
+
+spe <- readRDS("../data/SPE/Integrated_NMF.rds")
+colData(spe) <- DataFrame(read.csv("../data/coldata/DE_SPE_annotaion.csv"))
+colnames(spe) <- spe$barcode
+
+bg <- data.frame(colData(spe)[, c("array_col", "array_row", "tumor", "sample_id")])
+W_df <- readRDS("../data/Deconvolution/RCTD_weights.Rds")
+
+# Extract NMF component matrix for selected spatial signal visualisations
+comp <- as.matrix(t(reducedDims(spe)[["compk30"]]))
+spe$adipocytes <- comp["Adipocytes", ]
+
+```
+
+```{r}
+#=================================
+#2. Visualise DRAXIN expression across all tissue sections
+#=================================
+# This section plots the spatial distribution of DRAXIN across all samples.
+# Output: faceted spatial DRAXIN expression plot across all tissue blocks.
+
+ggcells(spe, aes(x = array_col, y = -array_row, color = DRAXIN)) +
+  geom_point(size = 0.7, pch = 19) +
+  facet_wrap(~sample_label) +
+  scale_color_viridis_c(option = "A") +
+  theme_void() +
+  labs(color = "DRAXIN")
+
+```
+
+
+```{r}
+#=================================
+#3. Define nerve-only objects and metadata
+#=================================
+# This section subsets the spatial object to nerve spots and builds a unified
+# metadata table used in downstream DRAXIN quantification and category-based analyses.
+# Output: no figure; nerve-only objects and metadata tables.
+
+spe_nerve <- spe[, colData(spe)$is.nerve == TRUE]
+
+nerve_meta_df <- data.frame(
+  barcode    = as.character(spe_nerve$barcode),
+  patient_id = as.factor(colData(spe_nerve)$patient_id),
+  NerveID    = as.character(colData(spe_nerve)$NerveID),
+  Invaded    = as.character(colData(spe_nerve)$Invaded),
+  type_raw   = as.character(colData(spe_nerve)$type),
+  stringsAsFactors = FALSE
+)
+
+nerve_meta_df$types_grouped <- ifelse(nerve_meta_df$type_raw == "noPNI", "Adjacent", "Diseased")
+nerve_meta_df$nerve_category <- ifelse(
+  nerve_meta_df$Invaded == "NonInvaded",
+  paste0("NonInvaded_", nerve_meta_df$types_grouped),
+  nerve_meta_df$Invaded
+)
+
+nerve_meta_df <- nerve_meta_df[!is.na(nerve_meta_df$nerve_category), ]
+nerve_meta_df$nerve_category <- factor(
+  nerve_meta_df$nerve_category,
+  levels = c("NonInvaded_Adjacent", "NonInvaded_Diseased", "Invaded")
+)
+
+```
+
+```{r}
+#=================================
+#4. Plot DRAXIN across tissue blocks with nerve outlines
+#=================================
+# This section visualises spatial DRAXIN expression across all samples and
+# overlays nerve hulls coloured by invasion status.
+# Output: spatial DRAXIN plot with invaded and non-invaded nerve outlines.
+
+sample_order <- c(
+  "54703bl38_noPNI",
+  "6249bl23_noPNI",
+  "70865bl5_noPNI",
+  "54703bl28_highPNI",
+  "6249bl18_noPNIandhighPNI",
+  "70865bl15_highPNI"
+)
+
+label_map <- c(
+  "54703bl38_noPNI" = "P1-Adjacent",
+  "6249bl23_noPNI" = "P2-Adjacent",
+  "70865bl5_noPNI" = "P3-Adjacent",
+  "54703bl28_highPNI" = "P1-Diseased",
+  "6249bl18_noPNIandhighPNI" = "P2-Diseased",
+  "70865bl15_highPNI" = "P3-Diseased"
+)
+
+colData(spe)$sample_id <- factor(as.character(colData(spe)$sample_id), levels = sample_order)
+colData(spe_nerve)$sample_id <- factor(as.character(colData(spe_nerve)$sample_id), levels = sample_order)
+
+p_draxin_spatial <- ggcells(
+  spe,
+  aes(x = array_col, y = -array_row, color = DRAXIN)
+) +
+  geom_point(size = 0.7, pch = 19) +
+  facet_wrap(~sample_id, labeller = as_labeller(label_map)) +
+  scale_color_viridis_c(option = "A") +
+  theme_void() +
+  labs(color = "DRAXIN") +
+  theme(
+    legend.position = "right",
+    strip.text = element_text(size = 10, face = "bold"),
+    strip.background = element_blank()
+  )
+
+make_nerve_hulls <- function(dat) {
+  dat %>%
+    group_by(sample_id, NerveID, Invaded) %>%
+    filter(n() >= 3) %>%
+    slice(chull(x, y)) %>%
+    ungroup() %>%
+    mutate(group_id = interaction(sample_id, NerveID, drop = TRUE))
+}
+
+nerve_all <- as.data.frame(colData(spe_nerve)) %>%
+  transmute(
+    x = as.numeric(array_col),
+    y = -as.numeric(array_row),
+    sample_id = factor(as.character(sample_id), levels = sample_order),
+    NerveID = as.character(NerveID),
+    Invaded = as.character(Invaded)
+  ) %>%
+  filter(is.finite(x), is.finite(y), !is.na(sample_id), !is.na(NerveID), !is.na(Invaded))
+
+hulls_all <- make_nerve_hulls(nerve_all)
+hulls_inv <- hulls_all %>% filter(Invaded == "Invaded")
+hulls_non <- hulls_all %>% filter(Invaded == "NonInvaded")
+
+p_draxin_spatial_hulls <- p_draxin_spatial +
+  geom_polygon(
+    data = hulls_non,
+    inherit.aes = FALSE,
+    aes(x = x, y = y, group = group_id),
+    fill = NA, linewidth = 0, color = "white"
+  ) +
+  geom_polygon(
+    data = hulls_inv,
+    inherit.aes = FALSE,
+    aes(x = x, y = y, group = group_id),
+    fill = NA, linewidth = 0, color = "white"
+  ) +
+  geom_polygon(
+    data = hulls_non,
+    inherit.aes = FALSE,
+    aes(x = x, y = y, group = group_id, linetype = "Non-invaded"),
+    fill = NA, linewidth = 0.4, color = "skyblue2"
+  ) +
+  geom_polygon(
+    data = hulls_inv,
+    inherit.aes = FALSE,
+    aes(x = x, y = y, group = group_id, linetype = "Invaded"),
+    fill = NA, linewidth = 0.4, color = "khaki2"
+  ) +
+  scale_linetype_manual(
+    name = "Nerve border",
+    values = c("Invaded" = "solid", "Non-invaded" = "solid")
+  ) +
+  guides(linetype = guide_legend(override.aes = list(linewidth = 1.2)))
+
+p_draxin_spatial_hulls
+```
+```{r}
+#=================================
+#5. Save DRAXIN spatial plot with nerve outlines
+#=================================
+# This section exports the spatial DRAXIN plot with nerve hull overlays.
+# Output: ../figures/Draxin_signal.png
+
+ggsave("../figures/Draxin_signal.png", p_draxin_spatial_hulls,
+       width = 12, height = 7, dpi = 600, bg = "white")
+```
+
+
+```{r}
+#=================================
+#4b. Plot DRAXIN across selected tissue blocks with nerve outlines
+#=================================
+# This section visualises spatial DRAXIN expression across the selected samples
+# and overlays nerve hulls coloured by invasion status.
+# Output: spatial DRAXIN plot with invaded and non-invaded nerve outlines.
+
+sample_order <- c(
+  "54703bl38_noPNI",
+  "54703bl28_highPNI"
+)
+
+label_map <- c(
+  "54703bl38_noPNI" = "P1-Adjacent",
+  "54703bl28_highPNI" = "P1-Diseased"
+)
+
+# Keep only the two samples of interest
+spe_sub <- spe[, as.character(colData(spe)$sample_id) %in% sample_order]
+spe_nerve_sub <- spe_nerve[, as.character(colData(spe_nerve)$sample_id) %in% sample_order]
+
+colData(spe_sub)$sample_id <- factor(
+  as.character(colData(spe_sub)$sample_id),
+  levels = sample_order
+)
+
+colData(spe_nerve_sub)$sample_id <- factor(
+  as.character(colData(spe_nerve_sub)$sample_id),
+  levels = sample_order
+)
+
+p_draxin_spatial <- ggcells(
+  spe_sub,
+  aes(x = array_col, y = -array_row, color = DRAXIN)
+) +
+  geom_point(size = 0.9, pch = 19) +
+  facet_wrap(~sample_id, labeller = as_labeller(label_map)) +
+  scale_color_viridis_c(option = "A") +
+  theme_void() +
+  labs(color = "DRAXIN") +
+  theme(
+    legend.position = "right",
+    strip.text = element_text(size = 10, face = "bold"),
+    strip.background = element_blank()
+  )
+
+make_nerve_hulls <- function(dat) {
+  dat %>%
+    group_by(sample_id, NerveID, Invaded) %>%
+    filter(n() >= 3) %>%
+    slice(chull(x, y)) %>%
+    ungroup() %>%
+    mutate(group_id = interaction(sample_id, NerveID, drop = TRUE))
+}
+
+nerve_all <- as.data.frame(colData(spe_nerve_sub)) %>%
+  transmute(
+    x = as.numeric(array_col),
+    y = -as.numeric(array_row),
+    sample_id = factor(as.character(sample_id), levels = sample_order),
+    NerveID = as.character(NerveID),
+    Invaded = as.character(Invaded)
+  ) %>%
+  filter(is.finite(x), is.finite(y), !is.na(sample_id), !is.na(NerveID), !is.na(Invaded))
+
+hulls_all <- make_nerve_hulls(nerve_all)
+hulls_inv <- hulls_all %>% filter(Invaded == "Invaded")
+hulls_non <- hulls_all %>% filter(Invaded == "NonInvaded")
+
+p_draxin_spatial_hulls2 <- p_draxin_spatial +
+  geom_polygon(
+    data = hulls_non,
+    inherit.aes = FALSE,
+    aes(x = x, y = y, group = group_id),
+    fill = NA, linewidth = 0, color = "white"
+  ) +
+  geom_polygon(
+    data = hulls_inv,
+    inherit.aes = FALSE,
+    aes(x = x, y = y, group = group_id),
+    fill = NA, linewidth = 0, color = "white"
+  ) +
+  geom_polygon(
+    data = hulls_non,
+    inherit.aes = FALSE,
+    aes(x = x, y = y, group = group_id, linetype = "Non-invaded"),
+    fill = NA, linewidth = 0.6, color = "skyblue2"
+  ) +
+  geom_polygon(
+    data = hulls_inv,
+    inherit.aes = FALSE,
+    aes(x = x, y = y, group = group_id, linetype = "Invaded"),
+    fill = NA, linewidth = 0.6, color = "khaki2"
+  ) +
+  scale_linetype_manual(
+    name = "Nerve border",
+    values = c("Invaded" = "solid", "Non-invaded" = "solid")
+  ) +
+  guides(linetype = guide_legend(override.aes = list(linewidth = 1.2)))
+
+p_draxin_spatial_hulls2
+```
+
+```{r}
+#=================================
+#5b. Save DRAXIN spatial plot with nerve outlines
+#=================================
+# This section exports the spatial DRAXIN plot with nerve hull overlays.
+# Output: ../figures/Draxin_signal.png
+
+ggsave("../figures/Draxin_signal_patient1.png", p_draxin_spatial_hulls2,
+       width = 6, height = 4, dpi = 600, bg = "white")
+```
+
+```{r}
+#=================================
+#6. Plot adipocyte-associated signal across tissue blocks with nerve outlines
+#=================================
+# This section visualises the adipocyte-associated NMF signal across all samples
+# and overlays nerve hulls coloured by invasion status. The signal is clipped
+# for display to improve contrast while preserving the overall spatial pattern.
+# Output: spatial adipocyte signal plot with invaded and non-invaded nerve outlines.
+
+adipo_df <- as.data.frame(colData(spe)) %>%
+  transmute(
+    x = as.numeric(array_col),
+    y = -as.numeric(array_row),
+    adipocytes = as.numeric(adipocytes),
+    sample_id = factor(as.character(sample_id), levels = sample_order)
+  ) %>%
+  filter(is.finite(x), is.finite(y), is.finite(adipocytes), !is.na(sample_id))
+
+clip_q <- c(0.01, 0.99)
+q_adipo <- quantile(adipo_df$adipocytes, probs = clip_q, na.rm = TRUE)
+
+adipo_df <- adipo_df %>%
+  mutate(adipo_plot = pmin(pmax(adipocytes, q_adipo[1]), q_adipo[2]))
+
+p_adipo_spatial_hulls <- ggplot() +
+  geom_point(
+    data = adipo_df,
+    aes(x = x, y = y, fill = adipo_plot),
+    pch = 21,
+    size = 0.9,
+    color = "transparent",
+    stroke = 0,
+    alpha = 1
+  ) +
+  geom_polygon(
+    data = hulls_non,
+    aes(x = x, y = y, group = group_id),
+    fill = NA, linewidth = 0, color = "white"
+  ) +
+  geom_polygon(
+    data = hulls_inv,
+    aes(x = x, y = y, group = group_id),
+    fill = NA, linewidth = 0, color = "white"
+  ) +
+  geom_polygon(
+    data = hulls_non,
+    aes(x = x, y = y, group = group_id, linetype = "Non-invaded"),
+    fill = NA, linewidth = 0.2, color = "skyblue2"
+  ) +
+  geom_polygon(
+    data = hulls_inv,
+    aes(x = x, y = y, group = group_id, linetype = "Invaded"),
+    fill = NA, linewidth = 0.2, color = "khaki2"
+  ) +
+  facet_wrap(~sample_id, labeller = as_labeller(label_map)) +
+  scale_fill_viridis_c(
+    option = "A",
+    name = "Adipocyte signal",
+    limits = c(q_adipo[1], q_adipo[2]),
+    oob = scales::squish
+  ) +
+  scale_linetype_manual(
+    name = "Nerve border",
+    values = c("Invaded" = "solid", "Non-invaded" = "solid")
+  ) +
+  guides(linetype = guide_legend(override.aes = list(linewidth = 1.2))) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    strip.text = element_text(size = 10, face = "bold"),
+    strip.background = element_blank()
+  )
+
+p_adipo_spatial_hulls
+```
+```{r}
+#=================================
+#7. Save adipocyte-associated spatial plot with nerve outlines
+#=================================
+# This section exports the adipocyte-associated spatial plot with nerve hull overlays.
+# Output: ../figures/adipocyte_signal.png
+
+ggsave("../figures/adipocyte_signal.png", p_adipo_spatial_hulls,
+       width = 12, height = 7, dpi = 600, bg = "white")
+```
+
+```{r}
+#=================================
+#8. Quantify DRAXIN at the nerve level
+#=================================
+# This section computes mean DRAXIN expression per nerve and compares it
+# across adjacent non-invaded, diseased non-invaded, and invaded nerves.
+# Output: nerve-level DRAXIN violin/boxplot with patient-coloured points and NerveID labels.
+
+draxin_all <- SummarizedExperiment::assay(spe, "logcounts")["DRAXIN", ]
+
+draxin_df <- data.frame(
+  barcode = as.character(spe$barcode),
+  DRAXIN = draxin_all,
+  stringsAsFactors = FALSE
+)
+
+spot_df <- nerve_meta_df %>%
+  left_join(draxin_df, by = "barcode") %>%
+  filter(!is.na(DRAXIN), !is.na(NerveID), NerveID != "")
+
+nerve_level_df <- spot_df %>%
+  group_by(patient_id, NerveID, nerve_category) %>%
+  summarise(
+    DRAXIN = mean(DRAXIN, na.rm = TRUE),
+    n_spots = n(),
+    .groups = "drop"
+  )
+
+label_df <- nerve_level_df %>%
+  select(NerveID, nerve_category) %>%
+  distinct()
+
+pos_nerve <- position_jitter(width = 0.18, height = 0, seed = 1)
+
+y_min <- min(nerve_level_df$DRAXIN, na.rm = TRUE)
+y_max <- max(nerve_level_df$DRAXIN, na.rm = TRUE)
+label_y <- y_min - 0.10 * (y_max - y_min)
+
+p_draxin_violin_nerve <- ggplot(nerve_level_df, aes(x = nerve_category, y = DRAXIN)) +
+  geom_violin(
+    fill = "grey80", color = NA,
+    trim = TRUE, scale = "width", alpha = 0.9
+  ) +
+  geom_boxplot(
+    width = 0.18, outlier.shape = NA,
+    fill = "grey80", color = "grey30", alpha = 0.8
+  ) +
+  geom_point(
+    aes(color = patient_id),
+    position = pos_nerve,
+    size = 0.9, alpha = 0.75
+  ) +
+  geom_text(
+    data = label_df,
+    aes(x = nerve_category, y = label_y, label = NerveID),
+    position = position_jitter(width = 0.18, height = 0, seed = 1),
+    inherit.aes = FALSE,
+    size = 2.4,
+    color = "black"
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    plot.margin = margin(10, 10, 35, 10),
+    legend.position = "right"
+  ) +
+  labs(
+    x = NULL,
+    y = "DRAXIN (nerve-mean expression)",
+    color = "Patient"
+  )
+
+p_draxin_violin_nerve
+```
+```{r}
+#=================================
+#8. Quantify DRAXIN at the nerve level
+#=================================
+# This section computes mean DRAXIN expression per nerve and compares it
+# across adjacent non-invaded, diseased non-invaded, and invaded nerves.
+# Output: nerve-level DRAXIN violin/boxplot with patient-coloured points and NerveID labels.
+
+base_size <- 11
+panel_aspect <- 0.5
+
+
+
+draxin_all <- SummarizedExperiment::assay(spe, "logcounts")["DRAXIN", ]
+
+draxin_df <- data.frame(
+  barcode = as.character(spe$barcode),
+  DRAXIN = draxin_all,
+  stringsAsFactors = FALSE
+)
+
+spot_df <- nerve_meta_df %>%
+  left_join(draxin_df, by = "barcode") %>%
+  filter(!is.na(DRAXIN), !is.na(NerveID), NerveID != "")
+
+nerve_level_df <- spot_df %>%
+  group_by(patient_id, NerveID, nerve_category) %>%
+  summarise(
+    DRAXIN = mean(DRAXIN, na.rm = TRUE),
+    n_spots = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    patient_id = factor(patient_id, levels = c("54703", "6249", "70865")),
+    nerve_category = factor(
+      nerve_category,
+      levels = c("NonInvaded_Adjacent", "NonInvaded_Diseased", "Invaded")
+    )
+  )
+
+# For label placement: put each NerveID just below its corresponding point
+
+p_draxin_nerve <- ggplot(
+  nerve_level_df,
+  aes(x = nerve_category, y = DRAXIN)
+) +
+  geom_violin(
+    fill = "grey85",
+    color = NA,
+    alpha = 0.6,
+    trim = FALSE
+  ) +
+  geom_boxplot(
+    width = 0.25,
+    outlier.shape = NA,
+    fill = "white",
+    color = "grey30",
+    linewidth = 0.4
+  ) +
+  geom_jitter(
+    aes(color = patient_id),
+    width = 0.10,
+    size = 0.9,
+    alpha = 0.95
+  ) +
+  theme_classic(base_size = base_size) +
+  theme(
+    aspect.ratio = panel_aspect,
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.4)
+  ) +
+  ylab("Mean DRAXIN expression per nerve") +
+  xlab("Nerve category") +
+  labs(color = "Patient ID")
+
+p_draxin_nerve
+
+```
+
+```{r}
+#=================================
+#10. Save nerve-level DRAXIN violin plot
+#=================================
+# This section exports the nerve-level DRAXIN plot.
+
+cat("Saving figure...\n")
+ggsave(
+  filename = "../figures/DRAXIN_logcounts_violing_nerve_level.pdf",
+  plot = p_draxin_nerve,
+  width = 4,
+  height = 4,
+  units = "in",
+  dpi = 600
+)
+cat("Saving figure...\n")
+```
+
+
+
+```{r}
+#=================================
+#9. Quantify DRAXIN at the spot level
+#=================================
+# This section compares spot-level DRAXIN expression across the three nerve
+# categories to visualise within-nerve and within-patient variability.
+# Output: spot-level DRAXIN violin/boxplot.
+
+spot_df$patient_id <- factor(spot_df$patient_id, levels = c("54703", "6249", "70865"))
+
+p_draxin_violin_spot <- ggplot(spot_df, aes(x = nerve_category, y = DRAXIN)) +
+  geom_violin(
+    fill = "grey80",
+    color = NA,
+    trim = TRUE,
+    scale = "width",
+    alpha = 0.9
+  ) +
+  geom_boxplot(
+    width = 0.18,
+    outlier.shape = NA,
+    fill = "grey80",
+    color = "grey30",
+    alpha = 0.8
+  ) +
+  geom_point(
+    aes(color = patient_id),
+    position = position_jitter(width = 0.18, height = 0, seed = 1),
+    size = 0.7,
+    alpha = 0.6
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    legend.position = "right"
+  ) +
+  labs(
+    x = NULL,
+    y = "DRAXIN expression (logcounts; spot-level)",
+    color = "Patient"
+  )
+
+p_draxin_violin_spot
+```
+
+
+```{r}
+#=================================
+#10. Save spot-level DRAXIN violin plot
+#=================================
+# This section exports the spot-level DRAXIN plot.
+# Output: DRAXIN_logcounts_violing_spot.pdf
+
+cat("Saving figure...\n")
+ggsave(
+  filename = "DRAXIN_logcounts_violing_spot.pdf",
+  plot = p_draxin_violin_spot,
+  width = 4,
+  height = 3,
+  units = "in",
+  dpi = 600
+)
+cat("Saving figure...\n")
+```
+
+
+```{r}
+#=================================
+#11. Load major cell type and Schwann cell signatures
+#=================================
+# This section imports differential-expression-derived cell state signatures
+# used for downstream Schwann enrichment analyses.
+# Output: no figure; signature lists for later scoring.
+
+SupTab_major <- read_xlsx("../data/coldata/SupTable2.xlsx", sheet = "S2A. major", skip = 1) %>%
+  filter(p_val_adj <= 0.05, avg_log2FC >= 1)
+
+Major_signatures <- split(SupTab_major$gene, f = SupTab_major$cluster)
+Major_signatures <- Major_signatures[!names(Major_signatures) %in% "Platelet"]
+
+remove <- c("Schwann", "Ductal")
+Major_signatures2 <- Major_signatures[!names(Major_signatures) %in% remove]
+
+SupTab_Schwann <- read_xlsx("../data/coldata/SupTable2.xlsx", sheet = "S2H. Schwann", skip = 1) %>%
+  filter(p_val_adj <= 0.05, avg_log2FC >= 1)
+
+Schwann_signatures <- split(SupTab_Schwann$gene, f = SupTab_Schwann$cluster)
+```
+
+
+```{r}
+#=================================
+#12. Define tumour-associated nerve subset
+#=================================
+# This section classifies nerves by category and retains tumour-associated
+# nerves only, defined here as diseased non-invaded and invaded nerves.
+# Output: no figure; tumour-associated nerve object for pseudobulk analysis.
+
+spe_nerve$types <- ifelse(spe_nerve$type == "noPNI", "Adjacent", "Diseased")
+
+colData(spe_nerve)$nerve_types <- ifelse(
+  spe_nerve$Invaded == "NonInvaded",
+  paste0("NonInvaded_", spe_nerve$types),
+  as.character(spe_nerve$Invaded)
+)
+
+spe_nerve <- spe_nerve[, !is.na(colData(spe_nerve)$nerve_types)]
+
+ta_nerve_spe <- spe_nerve[, colData(spe_nerve)$nerve_types %in% c("Invaded", "NonInvaded_Diseased")]
+
+colData(ta_nerve_spe)$nerve_types <- factor(
+  colData(ta_nerve_spe)$nerve_types,
+  levels = c("NonInvaded_Diseased", "Invaded")
+)
+
+table(colData(ta_nerve_spe)$nerve_types)
+```
+
+```{r}
+#=================================
+#13. Build pseudobulk profiles for tumour-associated nerves
+#=================================
+# This section aggregates spot-level counts into one pseudobulk column per nerve
+# and attaches matching nerve-level metadata.
+# Output: pseudobulk tumour-associated nerve object.
+
+ids <- DataFrame(id = ta_nerve_spe$NerveID)
+sb_ta <- aggregateAcrossCells(ta_nerve_spe, ids)
+
+colnames(sb_ta) <- colData(sb_ta)$id
+sb_ta <- sb_ta[, sb_ta$ncells > 1]
+
+sb_ta <- computeLibraryFactors(sb_ta)
+sb_ta <- logNormCounts(sb_ta)
+
+ta_meta <- as.data.frame(colData(ta_nerve_spe)) %>%
+  dplyr::select(NerveID, sample_id, patient_id, nerve_types) %>%
+  distinct()
+
+ta_meta <- ta_meta[!duplicated(ta_meta$NerveID), ]
+rownames(ta_meta) <- ta_meta$NerveID
+ta_meta <- ta_meta[colnames(sb_ta), , drop = FALSE]
+
+colData(sb_ta)$sample_id <- ta_meta$sample_id
+colData(sb_ta)$patient_id <- ta_meta$patient_id
+colData(sb_ta)$nerve_types <- ta_meta$nerve_types
+```
+
+```{r}
+#=================================
+#14. Stratify tumour-associated nerves by DRAXIN expression
+#=================================
+# This section groups tumour-associated nerves into Low, Normal, and High DRAXIN
+# classes based on pseudobulk DRAXIN expression.
+# Output: no figure; DRAXIN group labels stored in pseudobulk metadata.
+
+draxin_expression <- logcounts(sb_ta)["DRAXIN", ]
+
+mu_drx <- mean(draxin_expression, na.rm = TRUE)
+sd_drx <- sd(draxin_expression, na.rm = TRUE)
+
+drx_group <- ifelse(
+  draxin_expression < (mu_drx - sd_drx), "Low",
+  ifelse(draxin_expression > (mu_drx + sd_drx), "High", "Normal")
+)
+
+drx_group <- factor(drx_group, levels = c("Low", "Normal", "High"))
+colData(sb_ta)$DRAXIN_lev <- drx_group
+
+table(colData(sb_ta)$DRAXIN_lev)
+table(colData(sb_ta)$DRAXIN_lev, colData(sb_ta)$nerve_types)
+```
+
+
+```{r}
+#=================================
+#15. Score Schwann signatures in tumour-associated nerves
+#=================================
+# This section calculates one score per Schwann signature and pseudobulk nerve.
+# Output: signature score matrix for tumour-associated nerves.
+
+X_ta <- logcounts(sb_ta)
+
+S_ta <- sapply(Schwann_signatures, function(gs) {
+  score_signature_mat(gs, X_ta)
+})
+
+S_ta <- as.matrix(S_ta)
+rownames(S_ta) <- colnames(sb_ta)
+colnames(S_ta) <- names(Schwann_signatures)
+```
+
+```{r}
+#=================================
+#16. Compute Schwann signature enrichment across DRAXIN groups
+#=================================
+# This section converts Schwann signature scores into z-enrichment values across
+# Low, Normal, and High DRAXIN tumour-associated nerve groups.
+# Output: enrichment z-score matrix for heatmap plotting.
+
+enrichZ_group <- function(v, grp) {
+  mu_grp <- tapply(v, grp, mean, na.rm = TRUE)
+  mu_all <- mean(v, na.rm = TRUE)
+  sd_all <- sd(v, na.rm = TRUE)
+  (mu_grp - mu_all) / sd_all
+}
+
+z_mat_ta <- sapply(colnames(S_ta), function(sig) {
+  enrichZ_group(S_ta[, sig], colData(sb_ta)$DRAXIN_lev)
+})
+
+z_mat_ta <- t(z_mat_ta)
+z_mat_ta <- z_mat_ta[, c("Low", "Normal", "High"), drop = FALSE]
+```
+
+```{r}
+#=================================
+#17. Plot heatmap of Schwann programs across DRAXIN groups
+#=================================
+# This section visualises Schwann signature enrichment across tumour-associated
+# nerves stratified by DRAXIN level.
+# Output: ../figures/heatmap_Schwann_by_DRAXIN_tumour_associated_nerves.pdf
+
+SC_DRAXIN <- pheatmap(
+  z_mat_ta,
+  color = colorRampPalette(c(c25[1], "white", c25[2]))(100),
+  border_color = NA,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  angle_col = 0,
+  filename = "../figures/heatmap_Schwann_by_DRAXIN_tumour_associated_nerves.pdf",
+  width = 4,
+  height = 8
+)
+
+SC_DRAXIN
+```
+
+
+```{r}
+#=================================
+#18. Score Schwann signatures across all nerve categories
+#=================================
+# This section scores Schwann signatures across all nerve spots and computes
+# category-level enrichment for adjacent non-invaded, diseased non-invaded,
+# and invaded nerves.
+# Output: enrichment matrix across the three nerve categories.
+
+X_all <- if ("logcounts" %in% assayNames(spe_nerve)) {
+  assay(spe_nerve, "logcounts")
+} else {
+  assay(spe_nerve, "counts")
+}
+
+bcs <- as.character(colData(spe_nerve)$barcode)
+keep <- intersect(bcs, nerve_meta_df$barcode)
+
+X_all <- X_all[, match(keep, bcs), drop = FALSE]
+meta_all <- nerve_meta_df[match(keep, nerve_meta_df$barcode), ]
+
+S_all <- sapply(Schwann_signatures, function(gs) {
+  score_signature_mat(gs, X_all)
+})
+
+rownames(S_all) <- meta_all$barcode
+
+enrichZ_category <- function(v) {
+  mu_in <- tapply(v, meta_all$nerve_category, mean, na.rm = TRUE)
+  mu_all <- mean(v, na.rm = TRUE)
+  sd_all <- sd(v, na.rm = TRUE)
+  (mu_in - mu_all) / sd_all
+}
+
+z_mat_all <- sapply(colnames(S_all), function(sig) enrichZ_category(S_all[, sig]))
+z_mat_all <- t(z_mat_all) |> t()
+
+rownames(z_mat_all) <- dplyr::recode(
+  rownames(z_mat_all),
+  "NonInvaded_Adjacent" = "NonInvaded\nAdjacent",
+  "NonInvaded_Diseased" = "NonInvaded\nDiseased"
+)
+```
+
+```{r}
+#=================================
+#19. Plot heatmap of Schwann program enrichment across nerve categories
+#=================================
+# This section visualises Schwann signature enrichment across the three major
+# nerve categories.
+# Output: ../figures/heatmap_Schwann_cat3vs2.pdf
+
+pheatmap(
+  z_mat_all,
+  color = colorRampPalette(c(c25[1], "white", c25[2]))(100),
+  border_color = NA,
+  angle_col = 45,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  filename = "../figures/heatmap_Schwann_cat3vs2.pdf",
+  width = 10,
+  height = 4
+)
+```

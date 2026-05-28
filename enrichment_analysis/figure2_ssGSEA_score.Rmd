@@ -1,0 +1,655 @@
+#========================================
+# Pathway activity profiling across nerve categories
+#========================================
+#
+# This script compares pathway-level transcriptional activity across three nerve
+# categories: NonInvaded_Adjacent, NonInvaded_Diseased, and Invaded nerves.
+#
+# Main goal:
+# To identify whether invaded nerves show distinct inflammatory or stromal
+# pathway activity compared with non-invaded nerves from adjacent or diseased tissue.
+
+
+```{r}
+#========================================
+# 2. Install required CRAN and Bioconductor packages
+#========================================
+# Install the plotting, data manipulation, spatial transcriptomics, and gene-set
+# analysis packages needed for the workflow.
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(ggplot2)
+  library(GSVA)
+  library(matrixStats)
+  library(msigdbr)
+  library(Matrix)
+  library(SpatialExperiment)
+  library(readr)
+  library(purrr)
+  library(tibble)
+})
+
+c25 <- c(
+  "dodgerblue2", "#E31A1C", # red
+"green4",
+"#6A3D9A", # purple
+"#FF7F00", # orange
+"black", "gold1",
+"skyblue2", "#FB9A99", # lt pink
+"palegreen2",
+"#CAB2D6", # lt purple
+"#FDBF6F", # lt orange
+"gray70", "khaki2",
+"maroon", "orchid1", "deeppink1", "blue1", "steelblue4",
+"darkturquoise", "green1", "yellow4", "yellow3",
+"darkorange4", "brown"
+)
+```
+
+```{r}
+spe <- readRDS("/media/Konstantina/12_Olas_project/Publication_files/data/SPE/Integrated_NMF.rds")
+colData(spe) <- DataFrame(read.csv("/media/Konstantina/12_Olas_project/Publication_files/data/coldata/DE_SPE_annotaion.csv"))
+colnames(spe) <- spe$barcode
+```
+
+```{r}
+
+#========================================
+# 4. Subset nerve spots and define the three nerve categories
+#========================================
+# Restrict the dataset to nerve spots and assign each nerve to Adjacent,
+# Diseased, or Invaded categories for downstream comparisons.
+
+nerve_spe <- spe[, colData(spe)$is.nerve == TRUE]
+
+nerve_spe$types <- nerve_spe$type
+colData(nerve_spe)$types[!colData(nerve_spe)$types == "noPNI"] <- "Diseased"
+colData(nerve_spe)$types[colData(nerve_spe)$types == "noPNI"] <- "Adjacent"
+
+colData(nerve_spe)$nerve_types <- nerve_spe$Invaded
+colData(nerve_spe)$nerve_types <- ifelse(
+  colData(nerve_spe)$Invaded == "NonInvaded",
+  paste0(colData(nerve_spe)$Invaded, "_", colData(nerve_spe)$types),
+  as.character(colData(nerve_spe)$nerve_types)
+)
+
+nerve_spe <- nerve_spe[, !is.na(colData(nerve_spe)$nerve_types)]
+
+# enforce nerve type order
+nerve_type_order <- c("NonInvaded_Adjacent", "NonInvaded_Diseased", "Invaded")
+```
+
+```{r}
+#========================================
+# 5. Prepare expression and metadata objects for scoring
+#========================================
+# Extract the log-normalized expression matrix and organize metadata such as
+# nerve type and patient ID for pathway analysis.
+
+meta <- as.data.frame(colData(nerve_spe))
+meta$nerve_types <- factor(as.character(meta$nerve_types), levels = nerve_type_order)
+
+# patient order (EDIT)
+patient_order <- c("54703", "6249", "70865")
+meta$patient_id <- factor(as.character(meta$patient_id), levels = patient_order)
+
+# expression (genes x spots)
+assay_name <- "logcounts"
+expr <- assay(nerve_spe, assay_name)
+expr <- as.matrix(expr)  # ok for nerve subset; keep as matrix for GSVA
+
+# ensure rownames are gene SYMBOLs (required for msigdbr sets)
+stopifnot(!is.null(rownames(expr)))
+```
+
+```{r} 
+#========================================
+# 6. Define helper functions for MSigDB gene-set retrieval
+#========================================
+# Create utility functions to retrieve exact or pattern-matched MSigDB gene sets
+# and support flexible pathway selection.
+
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# Pull an EXACT msigdbr gene set by gs_name (FIXED)
+msig_exact <- function(gs_name_in, species = "Homo sapiens") {
+  tb <- msigdbr(species = species) %>% dplyr::filter(.data$gs_name == gs_name_in)
+  if (nrow(tb) == 0) stop("msigdbr: exact gs_name not found: ", gs_name_in)
+  unique(tb$gene_symbol)
+}
+
+# Pull by PATTERN; if no match, show suggestions
+msig_pick <- function(pattern,
+                      species = "Homo sapiens",
+                      collection = NULL,
+                      subcollection = NULL,
+                      max_show = 30) {
+
+  tb <- msigdbr(species = species)
+
+  if (!is.null(collection))    tb <- tb %>% dplyr::filter(.data$gs_collection == collection)
+  if (!is.null(subcollection)) tb <- tb %>% dplyr::filter(.data$gs_subcollection == subcollection)
+
+  # case-insensitive by lowercasing both sides (no ignore_case needed)
+  pat <- tolower(pattern)
+
+  hits <- tb %>%
+    dplyr::distinct(.data$gs_name, .data$gs_description) %>%
+    dplyr::mutate(desc = as.character(.data$gs_description)) %>%
+    dplyr::filter(
+      stringr::str_detect(tolower(.data$gs_name), pat) |
+      stringr::str_detect(tolower(.data$desc %||% ""), pat)
+    )
+
+  if (nrow(hits) == 0) {
+    message("No match for: ", pattern, "\nHere are some nearby candidates (try a broader keyword):")
+
+    # also case-insensitive without ignore_case
+    print(
+      tb %>%
+        dplyr::distinct(.data$gs_name, .data$gs_description) %>%
+        dplyr::mutate(desc = as.character(.data$gs_description)) %>%
+        dplyr::filter(
+          stringr::str_detect(tolower(.data$gs_name), "antigen|present|mhc|dendrit|process") |
+          stringr::str_detect(tolower(.data$desc %||% ""), "antigen|present|mhc|dendrit|process")
+        ) %>%
+        dplyr::slice_head(n = max_show)
+    )
+
+    stop("No msigdbr match for pattern: '", pattern,
+         "' (collection=", collection, " subcollection=", subcollection, ")")
+  }
+
+  if (nrow(hits) > 1) {
+    message("Multiple matches for pattern '", pattern, "'. Candidates:")
+    print(hits %>% dplyr::slice_head(n = max_show))
+    stop("Pick ONE exact gs_name from the printed candidates and use msig_exact(gs_name).")
+  }
+
+  gs <- hits$gs_name[1]
+  unique(tb$gene_symbol[tb$gs_name == gs])
+}
+```
+
+```{r}
+#========================================
+# 7. Define helper functions for searching enrichment result files
+#========================================
+# Provide tools to scan external CSV enrichment outputs for pathway keywords and
+# help identify candidate biological programs to include.
+
+
+`%||%` <- function(a, b) if (!is.null(a)) a else b  # <-- needed for msig_go_id()
+
+# ---- helper: safe CSV read ----
+read_csv_safe <- function(f) {
+  tryCatch(
+    readr::read_csv(f, show_col_types = FALSE, progress = FALSE),
+    error = function(e) NULL
+  )
+}
+
+# ---- main search function ----
+search_terms_in_csv_folder <- function(
+  folder,
+  queries,
+  recursive = TRUE,
+  ignore_case = TRUE,
+  cols_prefer = c("Description","description","term","Term","pathway","Pathway",
+                  "gs_name","GS_NAME","ID","id","NAME","Name","set","geneset"),
+  max_matches_per_file = 200
+) {
+  stopifnot(dir.exists(folder))
+  if (is.character(queries)) queries <- as.list(queries)
+
+  files <- list.files(folder, pattern = "\\.csv$", full.names = TRUE, recursive = recursive)
+  if (length(files) == 0) stop("No .csv files found under: ", folder)
+
+  # normalize queries (literal search; avoids regex surprises)
+  q_vec <- unlist(queries)
+  q_vec_cmp <- if (ignore_case) tolower(q_vec) else q_vec
+
+  res <- purrr::map_dfr(files, function(f) {
+    df <- read_csv_safe(f)
+    if (is.null(df) || nrow(df) == 0) return(NULL)
+
+    cn <- colnames(df)
+
+    prefer_present <- intersect(cols_prefer, cn)
+    if (length(prefer_present) == 0) {
+      search_cols <- cn[vapply(df, function(x) is.character(x) || is.factor(x), logical(1))]
+    } else {
+      search_cols <- prefer_present
+    }
+    if (length(search_cols) == 0) return(NULL)
+
+    mat <- df[, search_cols, drop = FALSE]
+    mat <- as.data.frame(lapply(mat, as.character), stringsAsFactors = FALSE)
+    row_text <- apply(mat, 1, function(x) paste(na.omit(x), collapse = " | "))
+
+    row_text_cmp <- if (ignore_case) tolower(row_text) else row_text
+
+    # literal "contains" match for any query
+    hit_idx <- which(vapply(row_text_cmp, function(s) any(stringr::str_detect(s, stringr::fixed(q_vec_cmp))), logical(1)))
+    if (length(hit_idx) == 0) return(NULL)
+
+    hit_idx <- head(hit_idx, max_matches_per_file)
+
+    tibble(
+      file = f,
+      row = hit_idx,
+      matched_text = row_text[hit_idx],
+      searched_columns = paste(search_cols, collapse = ", ")
+    )
+  })
+
+  res %>% arrange(file, row)
+}
+
+# ---- fetch a C5:BP gene set using GO ID (if MSigDB description contains the GO id) ----
+msig_go_id <- function(go_id, species="Homo sapiens", collection="C5", subcollection="BP") {
+  tb <- msigdbr(species = species) %>%
+    dplyr::filter(.data$gs_collection == collection, .data$gs_subcollection == subcollection)
+
+  hits <- tb %>%
+    dplyr::distinct(.data$gs_name, .data$gs_description) %>%
+    dplyr::mutate(desc = as.character(.data$gs_description)) %>%
+    dplyr::filter(
+      stringr::str_detect(.data$gs_name, stringr::fixed(go_id)) |
+      stringr::str_detect(.data$desc %||% "", stringr::fixed(go_id))
+    )
+
+  if (nrow(hits) == 0) stop("No MSigDB ", collection, ":", subcollection, " set found containing GO id: ", go_id)
+  if (nrow(hits) > 1) {
+    message("Multiple matches for GO id ", go_id, ". Pick one gs_name below and use msig_exact():")
+    print(hits)
+    stop("Ambiguous GO id match.")
+  }
+
+  msig_exact(hits$gs_name[1], species = species)
+}
+
+```
+
+```{r}
+#========================================
+# 8. Search enrichment result files for biologically relevant pathway terms
+#========================================
+# Query previous enrichment-analysis tables to identify pathways related to
+# antigen presentation, complement, prostaglandin signaling, fibroblasts, and leukocytes.
+
+results_folder <- "/media/Aleksandra/Computational/R programming/paper_projects/GSEA/output enrichment analysis/csv/"
+
+queries <- c(
+  "antigen processing", "presentation", "mhc",
+  "complement ",
+  "prostaglandin",
+  "fibroblasts",
+  "leukocyte", "rolling",
+  "extrafollicular", "follicular", "sars", "cov"
+)
+
+hits <- search_terms_in_csv_folder(results_folder, queries, recursive = TRUE)
+
+hits
+
+```
+
+
+```{r}
+#========================================
+# 9. Build the final pathway gene-set panel
+#========================================
+# Define the selected MSigDB gene sets, intersect them with detected genes, and
+# retain only pathways with sufficient gene coverage in the dataset.
+
+gene_sets <- list(
+  "H: INFLAMMATORY_RESPONSE" = msig_exact("HALLMARK_INFLAMMATORY_RESPONSE"),
+  "H: IL6_JAK_STAT3"         = msig_exact("HALLMARK_IL6_JAK_STAT3_SIGNALING"),
+  "H: IFNG_RESPONSE"         = msig_exact("HALLMARK_INTERFERON_GAMMA_RESPONSE"),
+  "H: IFNA_RESPONSE" =msig_exact("HALLMARK_INTERFERON_ALPHA_RESPONSE"),
+
+  # Gavish (this is a gs_name, so msig_exact is correct)
+  "C4: GAVISH_FIBROBLASTS_COMPLEMENT" =
+    msig_exact("GAVISH_3CA_METAPROGRAM_FIBROBLASTS_COMPLEMENT"),
+
+  # WikiPathways (IMPORTANT: msigdbr gs_name usually uses underscores, not " | WP####" display text)
+  # If your msigdbr truly contains exactly that string, this will work. If not, use the lookup panel to get the exact gs_name.
+  "C2: WP_BCELL_SARS_COV2" =
+    msig_exact("WP_EXTRAFOLLICULAR_AND_FOLLICULAR_B_CELL_ACTIVATION_BY_SARSCOV2"),
+
+  # GO BP (these look like proper gs_name values)
+  "C5: GOBP_REGULATION_OF_ANTIGEN_PROCESSING_AND_PRESENTATION" =
+    msig_exact("GOBP_ANTIGEN_PROCESSING_AND_PRESENTATION"),
+
+  "C5: GOBP_RESPONSE_TO_PROSTAGLANDIN_E" =
+    msig_exact("GOBP_RESPONSE_TO_PROSTAGLANDIN_E"),
+
+  # Reactome complement
+  "C2: REACTOME_INITIAL_TRIGGERING_OF_COMPLEMENT" =
+    msig_exact("REACTOME_INITIAL_TRIGGERING_OF_COMPLEMENT"),
+  
+  "C5: GOBP_LEUKOCYTE_TETHERING_OR_ROLLING" =
+    msig_exact("GOBP_LEUKOCYTE_TETHERING_OR_ROLLING")
+)
+
+# Intersect gene sets with expression genes and keep sets >= 10 genes
+gene_sets_use <- lapply(gene_sets, function(gs) intersect(gs, rownames(expr)))
+gene_sets_use <- gene_sets_use[sapply(gene_sets_use, length) >= 10]
+
+cat("Gene set sizes after intersection:\n")
+print(sort(sapply(gene_sets_use, length)))
+
+stopifnot(length(gene_sets_use) >= 2)
+```
+
+```{r}
+#========================================
+# 10. Compute ssGSEA pathway scores per spot
+#========================================
+# Score each nerve spot for the selected pathways using ssGSEA on log-normalized
+# expression values.
+
+ssgsea_scores <- gsva(
+  expr,
+  gene_sets_use,
+  method = "ssgsea",
+  kcdf = "Gaussian",   # correct for logcounts
+  abs.ranking = FALSE
+)
+
+# result: pathways x spots
+
+```
+
+
+dim(ssgsea_scores)
+C5: GOBP_REGULATION_OF_ANTIGEN_PROCESSING_AND_PRESENTATION                                           H: IFNG_RESPONSE 
+                                                        93                                                        188 
+                                  H: INFLAMMATORY_RESPONSE 
+                                                       198 
+                                                       
+```{r}
+#========================================
+# 11. Aggregate pathway scores from spot level to nerve level
+#========================================
+# Average spot-level ssGSEA scores within each nerve so that each nerve becomes
+# the analysis unit for group comparisons.
+
+score_df <- as.data.frame(t(ssgsea_scores))
+score_df$spot_id <- rownames(score_df)
+
+score_long <- score_df %>%
+  tidyr::pivot_longer(
+    cols = -spot_id,
+    names_to = "pathway",
+    values_to = "ssgsea_score"
+  ) %>%
+  left_join(meta %>% tibble::rownames_to_column("spot_id"),
+            by = "spot_id")
+
+# ---- aggregate per NerveID ----
+nerve_scores <- score_long %>%
+  group_by(NerveID, pathway, nerve_types, patient_id) %>%
+  summarise(
+    mean_score = mean(ssgsea_score),
+    .groups = "drop"
+  )
+```
+
+```{r}
+#========================================
+# 12. Standardize pathway scores across nerves
+#========================================
+# Convert aggregated pathway scores to z-scores to allow easier comparison of
+# relative pathway activity across nerve categories.
+
+nerve_scores <- nerve_scores %>%
+  group_by(pathway) %>%
+  mutate(
+    z_score = as.numeric(scale(mean_score))
+  ) %>%
+  ungroup()
+```
+
+```{r}
+#========================================
+# 13. Inspect available pathways before plotting
+#========================================
+# Check which pathways are present in the scored dataset and confirm that the
+# requested pathways are available for visualization.
+
+# what’s available in the plotted data:
+sort(unique(nerve_scores$pathway))
+
+# what’s available in your gene_sets list:
+names(gene_sets)
+```
+
+
+```{r}
+#========================================
+# 14. Visualize selected complement and stromal-related pathways
+#========================================
+# Plot violin, boxplot, and patient-level jitter distributions for selected
+# complement, fibroblast, and leukocyte-related pathway scores.
+
+
+# -----------------------------
+# USER CONTROLS
+# -----------------------------
+gene_sets_to_plot <- c(
+  "C5: GOBP_LEUKOCYTE_TETHERING_OR_ROLLING",
+  "C2: REACTOME_INITIAL_TRIGGERING_OF_COMPLEMENT",
+  "C4: GAVISH_FIBROBLASTS_COMPLEMENT"
+)
+
+facet_ncol   <- 1      # <--- set columns here
+facet_scales <- "free_y"
+base_size    <- 11
+panel_aspect <- 0.5   # <--- >1 makes panels taller; <1 flatter
+
+# Export controls (this is what truly controls the final graph size)
+out_file <- "nerve_scores_violin_facets.pdf"
+out_w    <- 7.0        # inches
+out_h    <- 4.5        # inches
+
+# -----------------------------
+# DATA
+# -----------------------------
+nerve_scores_plot <- nerve_scores %>%
+  filter(pathway %in% gene_sets_to_plot) %>%
+  mutate(
+    pathway = factor(pathway, levels = gene_sets_to_plot),
+    nerve_types = factor(nerve_types)  # optionally set your order here
+  )
+
+# -----------------------------
+# PLOT
+# -----------------------------
+p1 <- ggplot(nerve_scores_plot, aes(x = nerve_types, y = z_score)) +
+  geom_violin(fill = "grey85", color = NA, alpha = 0.6, trim = FALSE) +
+  geom_boxplot(width = 0.25, outlier.shape = NA,
+               fill = "white", color = "grey30", linewidth = 0.4) +
+  geom_jitter(aes(color = patient_id),
+              width = 0.10, size = 0.9, alpha = 0.95) +
+  facet_wrap(~ pathway, scales = facet_scales, ncol = facet_ncol) +
+  theme_classic(base_size = base_size) +
+  theme(
+    aspect.ratio = panel_aspect,
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = base_size * 0.85),
+    legend.position = "right",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.4),
+    panel.spacing = unit(6, "pt")   # spacing between facets
+  ) +
+  ylab("ssGSEA score (SD units, per nerve)") +
+  xlab("Nerve type") +
+  labs(color = "Patient ID")
+
+p1
+
+# -----------------------------
+# SAVE (recommended)
+# -----------------------------
+#ggsave(out_file, p1, width = out_w, height = out_h, units = "in", useDingbats = FALSE)
+
+```
+
+```{r}
+#========================================
+# 15. Save complement and stromal pathway figures
+#========================================
+# Export the first panel of pathway activity plots for use in figures or reports.
+
+ggsave(
+  filename = "complememnt_rolling.pdf",
+  plot = p1,
+  width = 5,
+  height = 10,
+  units = "in",
+  dpi = 600
+)
+```
+
+```{r}
+#========================================
+# 16. Inspect available pathways before plotting
+#========================================
+# Check which pathways are present in the scored dataset and confirm that the
+# requested pathways are available for visualization.
+
+# what’s available in the plotted data:
+sort(unique(nerve_scores$pathway))
+
+# what’s available in your gene_sets list:
+names(gene_sets)
+```
+
+```{r}
+
+#========================================
+# 17. Visualize inflammatory and cytokine-related pathways
+#========================================
+# Plot pathway activity distributions for interferon, IL6-JAK-STAT3, and
+# prostaglandin-related signatures across nerve groups.
+
+
+# -----------------------------
+# USER CONTROLS
+# -----------------------------
+gene_sets_to_plot <- c(
+  "H: IFNA_RESPONSE",
+  "H: IFNG_RESPONSE",
+  "H: IL6_JAK_STAT3",
+  "C5: GOBP_RESPONSE_TO_PROSTAGLANDIN_E"
+)
+
+facet_ncol   <- 2      # <--- set columns here
+facet_scales <- "free_y"
+base_size    <- 11
+panel_aspect <- 0.5   # <--- >1 makes panels taller; <1 flatter
+
+# Export controls (this is what truly controls the final graph size)
+out_file <- "nerve_scores_violin_facets.pdf"
+out_w    <- 7.0        # inches
+out_h    <- 4.5        # inches
+
+# -----------------------------
+# DATA
+# -----------------------------
+nerve_scores_plot <- nerve_scores %>%
+  filter(pathway %in% gene_sets_to_plot) %>%
+  mutate(
+    pathway = factor(pathway, levels = gene_sets_to_plot),
+    nerve_types = factor(nerve_types)  # optionally set your order here
+  )
+
+# -----------------------------
+# PLOT
+# -----------------------------
+p2 <- ggplot(nerve_scores_plot, aes(x = nerve_types, y = z_score)) +
+  geom_violin(fill = "grey85", color = NA, alpha = 0.6, trim = FALSE) +
+  geom_boxplot(width = 0.25, outlier.shape = NA,
+               fill = "white", color = "grey30", linewidth = 0.4) +
+  geom_jitter(aes(color = patient_id),
+              width = 0.10, size = 0.9, alpha = 0.95) +
+  facet_wrap(~ pathway, scales = facet_scales, ncol = facet_ncol) +
+  theme_classic(base_size = base_size) +
+  theme(
+    aspect.ratio = panel_aspect,
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = base_size * 0.85),
+    legend.position = "right",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.4),
+    panel.spacing = unit(6, "pt")   # spacing between facets
+  ) +
+  ylab("ssGSEA score (SD units, per nerve)") +
+  xlab("Nerve type") +
+  labs(color = "Patient ID")
+
+p2
+
+# -----------------------------
+# SAVE (recommended)
+# -----------------------------
+#ggsave(out_file, p, width = out_w, height = out_h, units = "in", useDingbats = FALSE)
+
+```
+
+```{r}
+#========================================
+# 18. Save inflammatory pathway figures
+#========================================
+# Export the second panel of pathway activity plots at publication-ready resolution.
+
+ggsave(
+  filename = "pathways_figure2.pdf",
+  plot = p2,
+  width = 10,
+  height = 10,
+  units = "in",
+  dpi = 600
+)
+```
+
+
+```{r}
+#========================================
+# 20. Test pathway differences across nerve categories
+#========================================
+# Use repeated-measures ANOVA to evaluate whether pathway activity differs across
+# nerve categories while accounting for patient-level pairing.
+
+patient_scores <- nerve_scores %>%
+  group_by(patient_id, nerve_types, pathway) %>%
+  summarise(mean_z = mean(z_score), .groups="drop")
+
+
+run_rm_anova <- function(df_one_pathway) {
+  df_one_pathway <- droplevels(df_one_pathway)
+  fit <- aov(mean_z ~ nerve_types + Error(patient_id/nerve_types), data = df_one_pathway)
+
+  # extract the p-value for nerve_types (within-subject)
+  sm <- summary(fit)
+  p <- sm[["Error: patient_id:nerve_types"]][[1]][["Pr(>F)"]][1]
+
+  tibble(p_value = p)
+}
+
+anova_tbl <- patient_scores %>%
+  group_by(pathway) %>%
+  group_modify(~ run_rm_anova(.x)) %>%
+  ungroup() %>%
+  mutate(FDR = p.adjust(p_value, method = "BH"))
+
+anova_tbl
+```
+
+
+                                                       
+
+  

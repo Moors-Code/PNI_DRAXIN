@@ -1,0 +1,529 @@
+```{r}
+# ============================================================
+# LEADING-EDGE pathway heatmaps across 0nM / 17nM / 68nM (BATCH-CORRECTED)
+# MERGED across comparisons:
+#   - For each term, union of leading-edge genes across comps (unique genes)
+#   - Optional row annotation showing which comparisons contributed the gene
+# Outputs: ONE heatmap per term (not per comp)
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+  library(stringr)
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+  library(limma)
+  library(matrixStats)
+})
+
+# ----------------------------
+# 0) Paths / comparisons
+# ----------------------------
+run_label <- "2026_03_23_GSEA_edgeR_3comparisons_signedlogP"
+comparisons <- c("DRAXIN_vs_ctrl", "diluted_vs_ctrl", "DRAXIN_vs_diluted")
+
+project_dir <- getwd()
+base_dir  <- file.path(project_dir, "bulkRNAseq", run_label)
+
+expr_path <- file.path(project_dir, "bulkRNAseq", "Heatmaps_input", "expr_logCPM_TMM.rds")
+meta_path <- file.path(project_dir, "bulkRNAseq", "Heatmaps_input", "meta2.csv")
+
+stopifnot(file.exists(expr_path), file.exists(meta_path))
+
+out_dir <- file.path(base_dir, "LEADINGEDGE_HEATMAPS_MERGEDTERMS_ALLCONDS_BATCHCORR")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ----------------------------
+# 1) Load expression + metadata
+# ----------------------------
+expr_mat <- readRDS(expr_path)
+
+meta <- read_csv(meta_path, show_col_types = FALSE) |> as.data.frame()
+stopifnot("sample" %in% colnames(meta))
+rownames(meta) <- meta$sample
+meta$sample <- NULL
+
+stopifnot(all(colnames(expr_mat) %in% rownames(meta)))
+meta <- meta[colnames(expr_mat), , drop = FALSE]
+stopifnot(all(colnames(expr_mat) == rownames(meta)))
+
+# strip ".1" etc in gene rownames if present
+rownames(expr_mat) <- sub("\\.\\d+$", "", rownames(expr_mat))
+
+stopifnot("condition" %in% colnames(meta))
+meta$condition <- factor(meta$condition, levels = c("ctrl", "diluted_DRAXIN", "DRAXIN"))
+cond_map <- c(ctrl="0nM", diluted_DRAXIN="17nM", DRAXIN="68nM")
+meta$condition_nm <- factor(cond_map[as.character(meta$condition)], levels = c("0nM","17nM","68nM"))
+```
+
+```{r}
+# ----------------------------
+# 1b) Batch + experiment columns
+# ----------------------------
+batch_var <- "batch3"
+if (!batch_var %in% colnames(meta)) {
+  stop("Batch column not found in meta: '", batch_var, "'. Available: ",
+       paste(colnames(meta), collapse=", "))
+}
+
+exp_var <- dplyr::case_when(
+  "exp" %in% colnames(meta) ~ "exp",
+  "experiment" %in% colnames(meta) ~ "experiment",
+  "Experiment" %in% colnames(meta) ~ "Experiment",
+  "run" %in% colnames(meta) ~ "run",
+  TRUE ~ NA_character_
+)
+if (is.na(exp_var)) {
+  meta$exp <- "exp1"
+  exp_var <- "exp"
+}
+
+meta[[batch_var]] <- as.factor(meta[[batch_var]])
+meta[[exp_var]]   <- as.factor(meta[[exp_var]])
+
+# ----------------------------
+# 1c) Batch correction (keeps condition effects)
+# ----------------------------
+expr_mat <- removeBatchEffect(
+  expr_mat,
+  batch  = meta[[batch_var]],
+  design = model.matrix(~ condition_nm, data = meta)
+)
+
+# ----------------------------
+# 2) Mapping helpers (core_enrichment IDs -> expr rownames)
+# ----------------------------
+detect_keytype <- function(rownms) {
+  if (any(grepl("^ENSG", rownms))) return("ENSEMBL")
+  if (all(grepl("^[0-9]+$", rownms))) return("ENTREZID")
+  "SYMBOL"
+}
+
+map_entrez <- function(entrez) {
+  entrez <- unique(as.character(entrez))
+  mp <- suppressWarnings(
+    AnnotationDbi::select(
+      org.Hs.eg.db,
+      keys = entrez,
+      keytype = "ENTREZID",
+      columns = c("SYMBOL","ENSEMBL")
+    )
+  ) |> tibble::as_tibble()
+
+  mp |>
+    mutate(ENTREZID = as.character(ENTREZID)) |>
+    arrange(ENTREZID, is.na(SYMBOL), is.na(ENSEMBL)) |>
+    distinct(ENTREZID, .keep_all = TRUE)
+}
+
+symbols_to_expr_ids <- function(expr_mat, symbols) {
+  symbols <- unique(as.character(symbols))
+  symbols <- symbols[!is.na(symbols) & symbols != ""]
+
+  keytype <- detect_keytype(rownames(expr_mat))
+
+  if (keytype == "SYMBOL") {
+    ids <- intersect(symbols, rownames(expr_mat))
+    return(list(ids=ids, label_map=setNames(ids, ids)))
+  }
+
+  mp <- suppressWarnings(
+    AnnotationDbi::select(
+      org.Hs.eg.db,
+      keys = symbols,
+      keytype = "SYMBOL",
+      columns = c("SYMBOL","ENSEMBL","ENTREZID")
+    )
+  ) |> tibble::as_tibble() |> distinct(SYMBOL, .keep_all = TRUE)
+
+  if (keytype == "ENSEMBL") {
+    ids <- mp$ENSEMBL
+    lbl <- mp$SYMBOL; names(lbl) <- mp$ENSEMBL
+  } else if (keytype == "ENTREZID") {
+    ids <- as.character(mp$ENTREZID)
+    lbl <- mp$SYMBOL; names(lbl) <- as.character(mp$ENTREZID)
+  } else {
+    stop("Unexpected keytype: ", keytype)
+  }
+
+  ids <- ids[!is.na(ids) & ids != ""]
+  ids <- intersect(ids, rownames(expr_mat))
+
+  lbl <- lbl[ids]
+  lbl[is.na(lbl) | lbl==""] <- ids[is.na(lbl) | lbl==""]
+  list(ids=ids, label_map=lbl)
+}
+
+entrez_to_expr_ids <- function(expr_mat, entrez) {
+  entrez <- unique(as.character(entrez))
+  entrez <- entrez[!is.na(entrez) & entrez != ""]
+  keytype <- detect_keytype(rownames(expr_mat))
+
+  mp <- map_entrez(entrez)
+
+  if (keytype == "ENTREZID") {
+    ids <- intersect(mp$ENTREZID, rownames(expr_mat))
+    lbl <- mp$SYMBOL; names(lbl) <- mp$ENTREZID
+    return(list(ids=ids, label_map=lbl[ids]))
+  }
+  if (keytype == "ENSEMBL") {
+    ids <- intersect(mp$ENSEMBL, rownames(expr_mat))
+    lbl <- mp$SYMBOL; names(lbl) <- mp$ENSEMBL
+    return(list(ids=ids, label_map=lbl[ids]))
+  }
+  ids <- intersect(mp$SYMBOL, rownames(expr_mat))
+  lbl <- mp$SYMBOL; names(lbl) <- mp$SYMBOL
+  list(ids=ids, label_map=lbl[ids])
+}
+
+guess_id_space <- function(x) {
+  x <- x[!is.na(x) & x != ""]
+  if (length(x) == 0) return("UNKNOWN")
+  if (all(grepl("^[0-9]+$", x))) return("ENTREZID")
+  if (any(grepl("^ENSG", x))) return("ENSEMBL")
+  "SYMBOL"
+}
+
+map_le_to_expr <- function(expr_mat, le_genes) {
+  le_genes <- unique(as.character(le_genes))
+  le_genes <- le_genes[!is.na(le_genes) & le_genes != ""]
+  if (length(le_genes) == 0) return(list(ids=character(0), label_map=character(0)))
+
+  space <- guess_id_space(le_genes)
+  if (space == "ENTREZID") return(entrez_to_expr_ids(expr_mat, le_genes))
+  if (space == "SYMBOL")   return(symbols_to_expr_ids(expr_mat, le_genes))
+
+  keytype <- detect_keytype(rownames(expr_mat))
+  mp <- suppressWarnings(
+    AnnotationDbi::select(
+      org.Hs.eg.db, keys = le_genes, keytype = "ENSEMBL",
+      columns = c("SYMBOL","ENSEMBL","ENTREZID")
+    )
+  ) |> tibble::as_tibble() |> distinct(ENSEMBL, .keep_all = TRUE)
+
+  if (keytype == "ENSEMBL") {
+    ids <- intersect(mp$ENSEMBL, rownames(expr_mat))
+    lbl <- mp$SYMBOL; names(lbl) <- mp$ENSEMBL
+    return(list(ids=ids, label_map=lbl[ids]))
+  } else if (keytype == "ENTREZID") {
+    ids <- intersect(as.character(mp$ENTREZID), rownames(expr_mat))
+    lbl <- mp$SYMBOL; names(lbl) <- as.character(mp$ENTREZID)
+    return(list(ids=ids, label_map=lbl[ids]))
+  } else {
+    ids <- intersect(mp$SYMBOL, rownames(expr_mat))
+    lbl <- mp$SYMBOL; names(lbl) <- mp$SYMBOL
+    return(list(ids=ids, label_map=lbl[ids]))
+  }
+}
+
+zscore_rows <- function(m) t(scale(t(as.matrix(m))))
+```
+
+```{r}
+# ----------------------------
+# 3) Leading-edge extraction
+# ----------------------------
+get_leading_edge <- function(gsea_obj, term_id) {
+  res <- gsea_obj@result |> as.data.frame()
+  hit <- res[res$ID == term_id, , drop = FALSE]
+  if (nrow(hit) == 0) return(NULL)  # for merged mode: return NULL instead of stop
+  core <- as.character(hit$core_enrichment[1])
+  if (is.na(core) || core == "") return(character(0))
+  strsplit(core, "/", fixed = TRUE)[[1]]
+}
+
+# ----------------------------
+# 4) Color palettes
+# ----------------------------
+cond_cols <- c("0nM"="#1b9e77", "17nM"="#d95f02", "68nM"="#7570b3")
+make_level_colors <- function(x) {
+  lv <- levels(as.factor(x))
+  cols <- circlize::rand_color(length(lv))
+  names(cols) <- lv
+  cols
+}
+batch_cols <- make_level_colors(meta[[batch_var]])
+exp_cols   <- make_level_colors(meta[[exp_var]])
+
+# ----------------------------
+# 5) RDS path builders
+# ----------------------------
+rds_go_bp <- function(comp) file.path(base_dir, comp, "GO",
+  paste0(run_label, "__", comp, "__gseGO_BP.rds"))
+rds_go_mf <- function(comp) file.path(base_dir, comp, "GO",
+  paste0(run_label, "__", comp, "__gseGO_MF.rds"))
+rds_kegg <- function(comp) file.path(base_dir, comp, "KEGG",
+  paste0(run_label, "__", comp, "__gseKEGG.rds"))
+rds_hallmark <- function(comp) {
+  p1 <- file.path(base_dir, comp, "MSigDB",
+                  paste0(run_label, "__", comp, "__msig_H.rds"))
+  p2 <- file.path(base_dir, comp, "MSigDB_ALL", "H",
+                  paste0(run_label, "__", comp, "__msig_H.rds"))
+  if (file.exists(p1)) return(p1)
+  if (file.exists(p2)) return(p2)
+  return(NA_character_)
+}
+
+# ----------------------------
+# 6) Targets
+# ----------------------------
+targets <- list(
+  list(collection="HALLMARK", rds_fun=rds_hallmark,
+       term_id="HALLMARK_OXIDATIVE_PHOSPHORYLATION", label="HM_OXPHOS_LE"),
+  list(collection="HALLMARK", rds_fun=rds_hallmark,
+       term_id="HALLMARK_G2M_CHECKPOINT", label="HM_G2M_LE"),
+  list(collection="HALLMARK", rds_fun=rds_hallmark,
+       term_id="HALLMARK_DNA_REPAIR", label="HM_DNA_REPAIR_LE"),
+  list(collection="HALLMARK", rds_fun=rds_hallmark,
+       term_id="HALLMARK_CHOLESTEROL_HOMEOSTASIS", label="HM_CHOLESTEROL_HOMEOSTASIS_LE"),
+
+  list(collection="GO_MF", rds_fun=rds_go_mf,
+       term_id="GO:0003954", label="GOMF_NADH_DEHYDROGENASE_ACTIVITY_LE"),
+  list(collection="GO_MF", rds_fun=rds_go_mf,
+       term_id="GO:0005506", label="GOMF_IRON_ION_BINDING_LE"),
+  list(collection="GO_MF", rds_fun=rds_go_mf,
+       term_id="GO:0015453", label="GOMF_OXIDOREDUCTION_TRANSMEMBRANE_TRANSPORTER_ACTIVITY_LE"),
+  list(collection="GO_MF", rds_fun=rds_go_mf,
+       term_id="GO:0050839", label="GOMF_CELL_ADHESION_MOLECULE_BINDING"),
+
+  list(collection="GO_BP", rds_fun=rds_go_bp,
+       term_id="GO:0033627", label="GOBP_INTEGRIN_MEDIATED_CELL_ADHESION_LE"),
+
+  list(collection="KEGG", rds_fun=rds_kegg,
+       term_id="hsa04216", label="KEGG_FERROPTOSIS_LE")
+)
+
+# ----------------------------
+# 7) MERGE leading-edge genes across comparisons (union + membership)
+# ----------------------------
+merge_leadingedge_across_comparisons <- function(expr_mat, comparisons, tgt,
+                                                require_present_in_at_least = 1) {
+  # Returns:
+  #   ids: union expr IDs (unique)
+  #   label_map: best label for those ids (SYMBOL if possible)
+  #   mem: data.frame row per id with logical columns per comparison
+  mem_list <- list()
+  label_map_all <- c()
+
+  for (comp in comparisons) {
+    rds_path <- tgt$rds_fun(comp)
+    if (is.na(rds_path) || !file.exists(rds_path)) {
+      mem_list[[comp]] <- character(0)
+      next
+    }
+
+    g_obj <- readRDS(rds_path)
+    le_raw <- get_leading_edge(g_obj, tgt$term_id)
+    if (is.null(le_raw)) {  # term not in that comparison result
+      mem_list[[comp]] <- character(0)
+      next
+    }
+
+    mp <- map_le_to_expr(expr_mat, le_raw)
+    mem_list[[comp]] <- unique(mp$ids)
+
+    # accumulate labels (later we’ll pick per-id)
+    if (length(mp$label_map)) {
+      label_map_all <- c(label_map_all, mp$label_map)
+    }
+  }
+
+  all_ids <- unique(unlist(mem_list, use.names = FALSE))
+  if (!length(all_ids)) {
+    return(list(ids=character(0), label_map=character(0), mem=data.frame()))
+  }
+
+  # membership matrix
+  mem_df <- data.frame(expr_id = all_ids, stringsAsFactors = FALSE)
+  for (comp in comparisons) {
+    mem_df[[comp]] <- mem_df$expr_id %in% mem_list[[comp]]
+  }
+
+  # filter: keep genes that appear in at least N comparisons (default 1 = union)
+  mem_df$n_comp <- rowSums(mem_df[, comparisons, drop = FALSE])
+  mem_df <- mem_df[mem_df$n_comp >= require_present_in_at_least, , drop = FALSE]
+  ids <- mem_df$expr_id
+
+  # label_map: prefer first non-empty mapping for each id
+  # label_map_all may have duplicates; keep first non-empty per name
+  if (length(label_map_all)) {
+    # ensure named vector
+    label_map_all <- label_map_all[!is.na(names(label_map_all)) & names(label_map_all) != ""]
+    # keep first occurrence per id
+    label_map_all <- label_map_all[!duplicated(names(label_map_all))]
+    lbl <- label_map_all[ids]
+  } else {
+    lbl <- setNames(ids, ids)
+    lbl <- lbl[ids]
+  }
+  lbl[is.na(lbl) | lbl == ""] <- ids[is.na(lbl) | lbl == ""]
+  list(ids=ids, label_map=lbl, mem=mem_df)
+}
+```
+
+```{r}
+# ----------------------------
+# 8) Heatmap plotting (MERGED) + optional row membership annotation
+# ----------------------------
+plot_leadingedge_heatmap_merged <- function(expr_mat, meta, ids, label_map, mem_df,
+                                            title, out_pdf,
+                                            top_n = 80,
+                                            show_membership = TRUE) {
+  if (length(ids) < 3) {
+    message("  Skipping (too few mapped genes): ", title, " (n=", length(ids), ")")
+    return(invisible(NULL))
+  }
+
+  # sample order: condition -> batch -> exp -> sample
+  keep_samps <- rownames(meta)[meta$condition_nm %in% c("0nM","17nM","68nM")]
+  ord_df <- meta[keep_samps, , drop = FALSE]
+  ord_df$.sample <- rownames(ord_df)
+
+  o <- order(
+    ord_df$condition_nm,
+    ord_df[[batch_var]],
+    ord_df[[exp_var]],
+    ord_df$.sample
+  )
+  samp_order <- ord_df$.sample[o]
+
+  m <- expr_mat[ids, samp_order, drop = FALSE]
+
+  # row labels
+  rlab <- unname(label_map[rownames(m)])
+  rlab[is.na(rlab) | rlab==""] <- rownames(m)[is.na(rlab) | rlab==""]
+  rownames(m) <- make.unique(rlab)
+
+  # If too many genes: keep top variable genes, BUT keep membership aligned
+  if (is.finite(top_n) && nrow(m) > top_n) {
+    vv <- matrixStats::rowVars(as.matrix(m), na.rm = TRUE)
+    ord <- order(vv, decreasing = TRUE)
+    keep <- rownames(m)[ord][seq_len(top_n)]
+    m <- m[keep, , drop = FALSE]
+
+    # rebuild ids by matching rownames back to expr ids via label_map (best-effort)
+    # safer: subset mem_df to original expr ids that were kept by rowname matching
+    # We do: keep any mem row whose label equals a kept rowname OR whose expr_id is in ids still.
+    # First create lookup label for each expr id:
+    label_for_id <- unname(label_map[mem_df$expr_id])
+    label_for_id[is.na(label_for_id) | label_for_id==""] <- mem_df$expr_id[is.na(label_for_id) | label_for_id==""]
+    label_for_id <- make.unique(label_for_id)
+    mem_df$._label_unique <- label_for_id
+    mem_df <- mem_df[mem_df$._label_unique %in% rownames(m), , drop = FALSE]
+  }
+
+  mz <- zscore_rows(m)
+  meta_aligned <- meta[colnames(mz), , drop = FALSE]
+
+  # column annotations (same as your version)
+  ha_top <- HeatmapAnnotation(
+    condition = meta_aligned$condition_nm,
+    batch     = meta_aligned[[batch_var]],
+    exp       = meta_aligned[[exp_var]],
+    col = list(condition = cond_cols, batch = batch_cols, exp = exp_cols),
+    annotation_legend_param = list(
+      condition = list(title = "Condition"),
+      batch     = list(title = batch_var),
+      exp       = list(title = exp_var)
+    )
+  )
+
+  # optional row annotation: which comparisons contributed the gene
+  ra <- NULL
+  if (isTRUE(show_membership) && nrow(mem_df)) {
+    # align mem rows to mz rows via the unique label we used
+    # create the same unique labels for current mz rows
+    # (mz rownames already unique)
+    # Build a data.frame in mz row order:
+    mem_use <- mem_df
+    if (!"._label_unique" %in% names(mem_use)) {
+      label_for_id <- unname(label_map[mem_use$expr_id])
+      label_for_id[is.na(label_for_id) | label_for_id==""] <- mem_use$expr_id[is.na(label_for_id) | label_for_id==""]
+      mem_use$._label_unique <- make.unique(label_for_id)
+    }
+    mem_use <- mem_use[match(rownames(mz), mem_use$._label_unique), , drop = FALSE]
+
+    # comparisons columns may include NAs if mismatch; convert to FALSE
+    for (cc in comparisons) mem_use[[cc]][is.na(mem_use[[cc]])] <- FALSE
+
+    ra <- rowAnnotation(
+      `LE in...` = ComplexHeatmap::anno_simple(
+        as.matrix(mem_use[, comparisons, drop = FALSE]) * 1,
+        col = c("0"="white","1"="black"),
+        gp = grid::gpar(col = NA)
+      ),
+      annotation_name_side = "top",
+      annotation_name_gp = grid::gpar(fontsize = 8)
+    )
+  }
+
+  ht <- Heatmap(
+    mz, name = "z",
+    top_annotation = ha_top,
+    left_annotation = ra,
+    show_column_names = FALSE,
+    cluster_columns = FALSE,
+    cluster_rows    = FALSE,
+    show_row_names  = TRUE,
+    row_names_gp    = grid::gpar(fontsize = 7),
+    column_split    = meta_aligned$condition_nm,
+    column_title    = title
+  )
+
+  grDevices::pdf(out_pdf, width = 12, height = 6.5, useDingbats = FALSE)
+  draw(ht, heatmap_legend_side = "right", annotation_legend_side = "right")
+  grDevices::dev.off()
+  message("  Wrote: ", out_pdf)
+}
+
+# ----------------------------
+# 9) Run: ONE heatmap per term (merged across comparisons)
+# ----------------------------
+for (tgt in targets) {
+  message("\n===============================")
+  message("Merged term: ", tgt$label, " | ", tgt$collection)
+  message("===============================")
+
+  merged <- tryCatch(
+    merge_leadingedge_across_comparisons(expr_mat, comparisons, tgt,
+                                         require_present_in_at_least = 1),  # set 2 if you want overlap-only
+    error = function(e) {
+      message("  FAILED merge: ", tgt$label, " | ", conditionMessage(e))
+      return(NULL)
+    }
+  )
+  if (is.null(merged) || length(merged$ids) < 3) {
+    message("  Skipping: insufficient genes after merge for ", tgt$label)
+    next
+  }
+
+  title <- paste0(
+    tgt$label, " | LE union across: ",
+    paste(comparisons, collapse = " / ")
+  )
+
+  out_pdf <- file.path(out_dir, paste0(tgt$label, "__MERGED_LEADINGEDGE_ALLCONDS_BATCHCORR_heatmap.pdf"))
+
+  plot_leadingedge_heatmap_merged(
+    expr_mat  = expr_mat,
+    meta      = meta,
+    ids       = merged$ids,
+    label_map = merged$label_map,
+    mem_df    = merged$mem,
+    title     = title,
+    out_pdf   = out_pdf,
+    top_n     = 80,         # set Inf to show ALL union genes
+    show_membership = FALSE  # adds row block showing which comps contributed
+  )
+}
+
+message("\nDone. Merged leading-edge heatmaps in: ", out_dir)
+
+```
+
+

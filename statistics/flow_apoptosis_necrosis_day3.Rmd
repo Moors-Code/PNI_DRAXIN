@@ -1,0 +1,150 @@
+
+```{r}
+library(readr)
+library(dplyr)
+library(stringr)
+library(pracma)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+```
+
+```{r}
+# =======================
+# INPUT / OUTPUT
+# =======================
+file <- "input_files/growth_tecan_BXPC3.csv"
+out_dir <- "output/growth_assays/"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r}
+# =======================
+# READ DATA
+# Required columns:
+#   Experiment
+#   Replicate
+#   Draxin
+#   Hr
+#   Count
+# =======================
+df <- read_csv(file, show_col_types = FALSE) %>%
+  mutate(
+    Experiment = factor(Experiment),
+    Replicate  = factor(Replicate),
+    Draxin     = str_trim(as.character(Draxin)),
+    Hr         = as.numeric(Hr),
+    Count      = as.numeric(Count)
+  ) %>%
+  filter(!is.na(Experiment), !is.na(Replicate), !is.na(Draxin), !is.na(Hr), !is.na(Count))
+
+# Optional manual order
+draxin_order <- c("0", "0.55", "8", "17", "34", "68", "140")
+draxin_order_present <- draxin_order[draxin_order %in% unique(df$Draxin)]
+
+if (length(draxin_order_present) == 0) {
+  draxin_order_present <- sort(unique(df$Draxin))
+}
+
+df <- df %>%
+  mutate(Draxin = factor(Draxin, levels = draxin_order_present))
+
+# =======================
+# CHECK BASELINE
+# =======================
+baseline_check <- df %>%
+  group_by(Experiment, Replicate, Draxin) %>%
+  summarise(
+    n_timepoints = n(),
+    baseline_hr = min(Hr, na.rm = TRUE),
+    baseline_count = Count[which.min(Hr)],
+    .groups = "drop"
+  )
+
+write.csv(
+  baseline_check,
+  file.path(out_dir, "baseline_check.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+# =======================
+# NORMALIZE TO BASELINE
+# within each Experiment × Replicate × Draxin
+# =======================
+df_norm <- df %>%
+  arrange(Experiment, Replicate, Draxin, Hr) %>%
+  group_by(Experiment, Replicate, Draxin) %>%
+  mutate(
+    baseline_hr = min(Hr, na.rm = TRUE),
+    baseline_count = Count[which.min(Hr)],
+    Count_norm = Count / baseline_count
+  ) %>%
+  ungroup()
+
+write.csv(
+  df_norm,
+  file.path(out_dir, "normalized_timecourse.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+# =======================
+# CALCULATE AUC
+# One AUC per replicate curve
+# =======================
+df_auc <- df_norm %>%
+  arrange(Experiment, Replicate, Draxin, Hr) %>%
+  group_by(Experiment, Replicate, Draxin) %>%
+  summarise(
+    baseline_hr = first(baseline_hr),
+    AUC_norm = trapz(Hr, Count_norm),
+    .groups = "drop"
+  )
+
+write.csv(
+  df_auc,
+  file.path(out_dir, "auc_normalized_by_replicate.csv"),
+  row.names = FALSE
+)
+
+# =======================
+# MIXED MODEL
+# =======================
+m_auc <- lmer(AUC_norm ~ Draxin + (1 | Experiment), data = df_auc)
+
+anova_auc <- anova(m_auc)
+
+write.csv(
+  as.data.frame(anova_auc),
+  file.path(out_dir, "auc_mixed_model_anova.csv"),
+  row.names = TRUE
+)
+
+# =======================
+# POST HOC: each Draxin vs control
+# =======================
+emm_auc <- emmeans(m_auc, ~ Draxin)
+
+posthoc_auc <- contrast(
+  emm_auc,
+  method = "trt.vs.ctrl",
+  ref = 1,
+  adjust = "dunnett"
+)
+
+write.csv(
+  as.data.frame(emm_auc),
+  file.path(out_dir, "auc_emmeans.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(posthoc_auc),
+  file.path(out_dir, "auc_draxin_vs_ctrl_dunnett.csv"),
+  row.names = FALSE
+)
+
+print("Done.")

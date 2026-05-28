@@ -1,0 +1,587 @@
+```{r}
+# =======================
+# PACKAGES
+# =======================
+library(readr)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(pracma)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(tidyr)
+```
+
+```{r}
+# =======================
+# INPUT / OUTPUT
+# =======================
+file <- "input_files/coating_pre_incubation.csv"
+out_dir <- "output/growth_assays/coating_pre_incubation"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# =======================
+# HELPER FUNCTION:
+# use lm() for 1 experiment, lmer() for >1 experiments
+# =======================
+fit_model_by_experiment <- function(formula_fixed, data, experiment_col = "Experiment") {
+  n_exp <- dplyr::n_distinct(data[[experiment_col]])
+  
+  if (n_exp <= 1) {
+    fit <- lm(formula_fixed, data = data)
+    model_type <- "lm"
+  } else {
+    form_lmer <- as.formula(
+      paste0(deparse(formula_fixed), " + (1 | ", experiment_col, ")")
+    )
+    fit <- lmer(form_lmer, data = data)
+    model_type <- "lmer"
+  }
+  
+  list(model = fit, model_type = model_type, n_exp = n_exp)
+}
+```
+
+```{r}
+# =======================
+# READ DATA
+# Required columns:
+#   Condition   (seeding, coating, pre_incubation)
+#   Draxin      (0 or 140)
+#   Experiment
+#   Replicate
+#   Hr or Hour
+#   Count
+# =======================
+df_raw <- read_csv(file, show_col_types = FALSE)
+
+if ("Hr" %in% names(df_raw) && !("Hour" %in% names(df_raw))) {
+  df_raw <- df_raw %>% rename(Hour = Hr)
+}
+
+required_cols <- c("Condition", "Draxin", "Experiment", "Replicate", "Hour", "Count")
+missing_cols <- setdiff(required_cols, names(df_raw))
+
+if (length(missing_cols) > 0) {
+  stop(paste("Missing required columns:", paste(missing_cols, collapse = ", ")))
+}
+```
+
+```{r}
+# =======================
+# CLEAN DATA
+# =======================
+condition_order <- c("seeding", "coating", "pre_incubation")
+
+df <- df_raw %>%
+  mutate(
+    Condition  = str_trim(as.character(Condition)),
+    Draxin     = str_trim(as.character(Draxin)),
+    Experiment = factor(as.character(Experiment)),
+    Replicate  = factor(as.character(Replicate)),
+    Hour       = as.numeric(Hour),
+    Count      = as.numeric(Count)
+  ) %>%
+  filter(
+    !is.na(Condition),
+    !is.na(Draxin),
+    !is.na(Experiment),
+    !is.na(Replicate),
+    !is.na(Hour),
+    !is.na(Count)
+  )
+
+condition_order_present <- condition_order[condition_order %in% unique(df$Condition)]
+if (length(condition_order_present) == 0) {
+  condition_order_present <- sort(unique(df$Condition))
+}
+
+df <- df %>%
+  mutate(
+    Condition = factor(Condition, levels = condition_order_present),
+    Draxin = factor(Draxin, levels = c("0", "140"))
+  )
+
+if (!("0" %in% levels(df$Draxin)) || !("140" %in% levels(df$Draxin))) {
+  stop("Draxin column must contain both '0' and '140'.")
+}
+```
+
+```{r}
+
+# =======================
+# INPUT SANITY CHECKS
+# =======================
+write.csv(
+  data.frame(column_name = names(df)),
+  file.path(out_dir, "input_column_names.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  data.frame(
+    column_name = names(df),
+    n_unique = sapply(df, dplyr::n_distinct)
+  ),
+  file.path(out_dir, "input_n_unique_per_column.csv"),
+  row.names = FALSE
+)
+
+curve_summary <- df %>%
+  group_by(Experiment, Replicate, Condition, Draxin) %>%
+  summarise(
+    n_timepoints = n(),
+    min_hour = min(Hour, na.rm = TRUE),
+    max_hour = max(Hour, na.rm = TRUE),
+    mean_count = mean(Count, na.rm = TRUE),
+    sd_count = sd(Count, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write.csv(
+  curve_summary,
+  file.path(out_dir, "count_summary_per_curve.csv"),
+  row.names = FALSE
+)
+
+dup_check <- df %>%
+  count(Experiment, Replicate, Condition, Draxin, Hour) %>%
+  filter(n > 1)
+
+write.csv(
+  dup_check,
+  file.path(out_dir, "duplicate_timepoints_check.csv"),
+  row.names = FALSE
+)
+
+cat("\n=======================\n")
+cat("INPUT DATA SUMMARY\n")
+cat("=======================\n")
+cat("Rows:", nrow(df), "\n")
+cat("Experiments:", paste(unique(df$Experiment), collapse = ", "), "\n")
+cat("Conditions:", paste(levels(df$Condition), collapse = ", "), "\n")
+cat("Draxin:", paste(levels(df$Draxin), collapse = ", "), "\n")
+cat("Hours:", paste(sort(unique(df$Hour)), collapse = ", "), "\n\n")
+
+print(df %>% count(Condition, Draxin))
+```
+
+```{r}
+# =======================
+# NORMALIZE TO BASELINE
+# within each Experiment x Replicate x Condition x Draxin
+# =======================
+df_norm <- df %>%
+  group_by(Experiment, Replicate, Condition, Draxin) %>%
+  arrange(Hour, .by_group = TRUE) %>%
+  mutate(
+    baseline_hr = first(Hour),
+    baseline_count = first(Count),
+    Count_norm = Count / baseline_count
+  ) %>%
+  ungroup() %>%
+  filter(
+    !is.na(Count_norm),
+    is.finite(Count_norm),
+    baseline_count > 0
+  )
+
+write.csv(
+  df_norm,
+  file.path(out_dir, "normalized_timecourse.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+# =======================
+# PLOT SUMMARIES
+# =======================
+df_plot_raw <- df %>%
+  group_by(Condition, Draxin, Hour) %>%
+  summarise(
+    n = n(),
+    mean_count = mean(Count, na.rm = TRUE),
+    sd_count = sd(Count, na.rm = TRUE),
+    sem_count = sd_count / sqrt(n),
+    .groups = "drop"
+  )
+
+df_plot_norm <- df_norm %>%
+  group_by(Condition, Draxin, Hour) %>%
+  summarise(
+    n = n(),
+    mean_norm = mean(Count_norm, na.rm = TRUE),
+    sd_norm = sd(Count_norm, na.rm = TRUE),
+    sem_norm = sd_norm / sqrt(n),
+    .groups = "drop"
+  )
+
+write.csv(
+  df_plot_raw,
+  file.path(out_dir, "raw_timecourse_summary.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  df_plot_norm,
+  file.path(out_dir, "normalized_timecourse_summary.csv"),
+  row.names = FALSE
+)
+
+# =======================
+# PLOT RAW
+# =======================
+p_raw <- ggplot(df_plot_raw, aes(x = Hour, y = mean_count, color = Draxin, group = Draxin)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_errorbar(
+    aes(ymin = mean_count - sem_count, ymax = mean_count + sem_count),
+    width = 2
+  ) +
+  facet_wrap(~ Condition, scales = "free_y") +
+  labs(
+    title = "Raw growth curves",
+    x = "Time (h)",
+    y = "Cell count",
+    color = "Draxin"
+  ) +
+  theme_classic(base_size = 13)
+
+ggsave(file.path(out_dir, "raw_growth_curves_mean_sem.png"), p_raw, width = 10, height = 5, dpi = 300)
+ggsave(file.path(out_dir, "raw_growth_curves_mean_sem.pdf"), p_raw, width = 10, height = 5)
+
+# =======================
+# PLOT NORMALIZED
+# =======================
+p_norm <- ggplot(df_plot_norm, aes(x = Hour, y = mean_norm, color = Draxin, group = Draxin)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_errorbar(
+    aes(ymin = mean_norm - sem_norm, ymax = mean_norm + sem_norm),
+    width = 2
+  ) +
+  facet_wrap(~ Condition, scales = "free_y") +
+  labs(
+    title = "Normalized growth curves",
+    x = "Time (h)",
+    y = "Cell count normalized to baseline",
+    color = "Draxin"
+  ) +
+  theme_classic(base_size = 13)
+
+ggsave(file.path(out_dir, "normalized_growth_curves_mean_sem.png"), p_norm, width = 10, height = 5, dpi = 300)
+ggsave(file.path(out_dir, "normalized_growth_curves_mean_sem.pdf"), p_norm, width = 10, height = 5)
+```
+
+```{r}
+# =======================
+# AUC PER CURVE
+# =======================
+df_auc <- df_norm %>%
+  arrange(Experiment, Replicate, Condition, Draxin, Hour) %>%
+  group_by(Experiment, Replicate, Condition, Draxin) %>%
+  summarise(
+    n_timepoints = n(),
+    AUC_norm = if (n() >= 2) trapz(Hour, Count_norm) else NA_real_,
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(AUC_norm))
+
+write.csv(
+  df_auc,
+  file.path(out_dir, "auc_normalized_by_replicate.csv"),
+  row.names = FALSE
+)
+
+# =======================
+# SLOPE PER CURVE
+# =======================
+df_slope <- df_norm %>%
+  group_by(Experiment, Replicate, Condition, Draxin) %>%
+  arrange(Hour, .by_group = TRUE) %>%
+  summarise(
+    n_timepoints = n(),
+    slope = if (n() >= 2) coef(lm(Count_norm ~ Hour))[2] else NA_real_,
+    intercept = if (n() >= 2) coef(lm(Count_norm ~ Hour))[1] else NA_real_,
+    r_squared = if (n() >= 2) summary(lm(Count_norm ~ Hour))$r.squared else NA_real_,
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(slope))
+
+write.csv(
+  df_slope,
+  file.path(out_dir, "trend_slope_by_replicate.csv"),
+  row.names = FALSE
+)
+
+# =======================
+# AUC MODEL
+# compare Draxin within each Condition
+# =======================
+if (nrow(df_auc) >= 4) {
+  fit_auc <- fit_model_by_experiment(AUC_norm ~ Condition * Draxin, df_auc)
+  m_auc <- fit_auc$model
+  
+  anova_auc <- anova(m_auc)
+  emm_auc <- emmeans(m_auc, ~ Draxin | Condition)
+  posthoc_auc <- contrast(emm_auc, method = "revpairwise", adjust = "BH")
+  
+  write.csv(as.data.frame(anova_auc), file.path(out_dir, "auc_model_anova.csv"), row.names = TRUE)
+  write.csv(as.data.frame(emm_auc), file.path(out_dir, "auc_emmeans_draxin_within_condition.csv"), row.names = FALSE)
+  write.csv(as.data.frame(posthoc_auc), file.path(out_dir, "auc_draxin_140_vs_0_within_condition.csv"), row.names = FALSE)
+}
+
+# =======================
+# SLOPE MODEL
+# =======================
+if (nrow(df_slope) >= 4) {
+  fit_slope <- fit_model_by_experiment(slope ~ Condition * Draxin, df_slope)
+  m_slope <- fit_slope$model
+  
+  anova_slope <- anova(m_slope)
+  emm_slope <- emmeans(m_slope, ~ Draxin | Condition)
+  posthoc_slope <- contrast(emm_slope, method = "revpairwise", adjust = "BH")
+  
+  write.csv(as.data.frame(anova_slope), file.path(out_dir, "slope_model_anova.csv"), row.names = TRUE)
+  write.csv(as.data.frame(emm_slope), file.path(out_dir, "slope_emmeans_draxin_within_condition.csv"), row.names = FALSE)
+  write.csv(as.data.frame(posthoc_slope), file.path(out_dir, "slope_draxin_140_vs_0_within_condition.csv"), row.names = FALSE)
+}
+```
+
+```{r}
+# =======================
+# FULL TIMECOURSE MODEL
+# =======================
+if (nrow(df_norm) >= 6) {
+  n_exp <- dplyr::n_distinct(df_norm$Experiment)
+  
+  if (n_exp <= 1) {
+    m_time <- lm(Count_norm ~ Hour * Condition * Draxin, data = df_norm)
+  } else {
+    m_time <- lmer(
+      Count_norm ~ Hour * Condition * Draxin + (1 | Experiment) + (1 | Experiment:Replicate),
+      data = df_norm
+    )
+  }
+  
+  anova_time <- anova(m_time)
+  emtr <- emtrends(m_time, ~ Draxin | Condition, var = "Hour")
+  posthoc_trend <- contrast(emtr, method = "revpairwise", adjust = "BH")
+  
+  write.csv(as.data.frame(anova_time), file.path(out_dir, "timecourse_model_anova.csv"), row.names = TRUE)
+  write.csv(as.data.frame(emtr), file.path(out_dir, "timecourse_emtrends_draxin_within_condition.csv"), row.names = FALSE)
+  write.csv(as.data.frame(posthoc_trend), file.path(out_dir, "timecourse_trend_draxin_140_vs_0_within_condition.csv"), row.names = FALSE)
+}
+
+# =======================
+# TIMEPOINT-SPECIFIC STATS
+# compare Draxin within each Condition at each hour
+# =======================
+df_norm_tp <- df_norm %>%
+  mutate(Hour_f = factor(Hour, levels = sort(unique(Hour))))
+
+if (nrow(df_norm_tp) >= 6) {
+  n_exp <- dplyr::n_distinct(df_norm_tp$Experiment)
+  
+  if (n_exp <= 1) {
+    m_time_tp <- lm(Count_norm ~ Condition * Draxin * Hour_f, data = df_norm_tp)
+  } else {
+    m_time_tp <- lmer(
+      Count_norm ~ Condition * Draxin * Hour_f + (1 | Experiment) + (1 | Experiment:Replicate),
+      data = df_norm_tp
+    )
+  }
+  
+  emm_time <- emmeans(m_time_tp, ~ Draxin | Condition + Hour_f)
+  contrast_time <- contrast(emm_time, method = "revpairwise", adjust = "BH")
+  
+  results_time <- as.data.frame(contrast_time) %>%
+    mutate(Hour = as.numeric(as.character(Hour_f)))
+  
+  write.csv(
+    results_time,
+    file.path(out_dir, "timepoint_specific_draxin_140_vs_0_within_condition_BH.csv"),
+    row.names = FALSE
+  )
+  
+  first_sig_time <- results_time %>%
+    mutate(
+      Hour = as.numeric(Hour),
+      p.value = as.numeric(p.value)
+    ) %>%
+    group_by(Condition) %>%
+    arrange(Hour, .by_group = TRUE) %>%
+    summarise(
+      first_sig_hour = if (any(p.value < 0.05, na.rm = TRUE)) min(Hour[p.value < 0.05], na.rm = TRUE) else NA_real_,
+      first_sig_p = if (any(p.value < 0.05, na.rm = TRUE)) p.value[match(first_sig_hour, Hour)] else NA_real_,
+      .groups = "drop"
+    )
+  
+  write.csv(
+    first_sig_time,
+    file.path(out_dir, "first_significant_timepoint_per_condition.csv"),
+    row.names = FALSE
+  )
+}
+```
+
+```{r}
+# =======================
+# 24 h ATTACHMENT ANALYSIS
+# RAW COUNTS
+# =======================
+df_24 <- df %>%
+  filter(Hour == 24)
+
+write.csv(
+  df_24,
+  file.path(out_dir, "raw_24h_values.csv"),
+  row.names = FALSE
+)
+
+df_24_summary <- df_24 %>%
+  group_by(Condition, Draxin) %>%
+  summarise(
+    n = n(),
+    mean_count = mean(Count, na.rm = TRUE),
+    sd_count = sd(Count, na.rm = TRUE),
+    sem_count = sd_count / sqrt(n),
+    .groups = "drop"
+  )
+
+write.csv(
+  df_24_summary,
+  file.path(out_dir, "raw_24h_summary.csv"),
+  row.names = FALSE
+)
+
+p_24_raw <- ggplot(df_24, aes(x = Draxin, y = Count)) +
+  geom_jitter(width = 0.12, height = 0, size = 2, alpha = 0.75) +
+  geom_point(
+    data = df_24_summary,
+    aes(x = Draxin, y = mean_count),
+    inherit.aes = FALSE,
+    size = 3
+  ) +
+  geom_errorbar(
+    data = df_24_summary,
+    aes(x = Draxin, ymin = mean_count - sem_count, ymax = mean_count + sem_count),
+    inherit.aes = FALSE,
+    width = 0.2
+  ) +
+  facet_wrap(~ Condition, scales = "free_y") +
+  labs(
+    title = "24 h attachment analysis (raw counts)",
+    x = "Draxin",
+    y = "Cell count at 24 h"
+  ) +
+  theme_classic(base_size = 13)
+
+ggsave(file.path(out_dir, "raw_24h_attachment_by_condition.png"), p_24_raw, width = 10, height = 5, dpi = 300)
+ggsave(file.path(out_dir, "raw_24h_attachment_by_condition.pdf"), p_24_raw, width = 10, height = 5)
+
+# =======================
+# 24 h NORMALIZED TO
+# condition-matched Draxin 0 mean
+# within each Experiment x Condition
+# =======================
+df_24_norm_ctrl <- df_24 %>%
+  group_by(Experiment, Condition) %>%
+  mutate(
+    ctrl_mean_24 = mean(Count[Draxin == "0"], na.rm = TRUE),
+    Count_24_norm_to_ctrl = Count / ctrl_mean_24
+  ) %>%
+  ungroup() %>%
+  filter(
+    !is.na(ctrl_mean_24),
+    is.finite(ctrl_mean_24),
+    ctrl_mean_24 > 0,
+    is.finite(Count_24_norm_to_ctrl)
+  )
+
+write.csv(
+  df_24_norm_ctrl,
+  file.path(out_dir, "raw_24h_normalized_to_condition_ctrl.csv"),
+  row.names = FALSE
+)
+
+df_24_norm_summary <- df_24_norm_ctrl %>%
+  group_by(Condition, Draxin) %>%
+  summarise(
+    n = n(),
+    mean_norm = mean(Count_24_norm_to_ctrl, na.rm = TRUE),
+    sd_norm = sd(Count_24_norm_to_ctrl, na.rm = TRUE),
+    sem_norm = sd_norm / sqrt(n),
+    .groups = "drop"
+  )
+
+write.csv(
+  df_24_norm_summary,
+  file.path(out_dir, "raw_24h_normalized_to_condition_ctrl_summary.csv"),
+  row.names = FALSE
+)
+
+p_24_norm <- ggplot(df_24_norm_ctrl, aes(x = Draxin, y = Count_24_norm_to_ctrl)) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  geom_jitter(width = 0.12, height = 0, size = 2, alpha = 0.75) +
+  geom_point(
+    data = df_24_norm_summary,
+    aes(x = Draxin, y = mean_norm),
+    inherit.aes = FALSE,
+    size = 3
+  ) +
+  geom_errorbar(
+    data = df_24_norm_summary,
+    aes(x = Draxin, ymin = mean_norm - sem_norm, ymax = mean_norm + sem_norm),
+    inherit.aes = FALSE,
+    width = 0.2
+  ) +
+  facet_wrap(~ Condition, scales = "free_y") +
+  labs(
+    title = "24 h attachment normalized to condition-matched Draxin 0",
+    x = "Draxin",
+    y = "Cell count at 24 h / mean Draxin 0"
+  ) +
+  theme_classic(base_size = 13)
+
+ggsave(file.path(out_dir, "raw_24h_normalized_to_condition_ctrl.png"), p_24_norm, width = 10, height = 5, dpi = 300)
+ggsave(file.path(out_dir, "raw_24h_normalized_to_condition_ctrl.pdf"), p_24_norm, width = 10, height = 5)
+```
+
+```{r}
+# =======================
+# 24 h RAW MODEL
+# =======================
+if (nrow(df_24) >= 4) {
+  fit_24_raw <- fit_model_by_experiment(Count ~ Condition * Draxin, df_24)
+  m_24_raw <- fit_24_raw$model
+  
+  anova_24_raw <- anova(m_24_raw)
+  emm_24_raw <- emmeans(m_24_raw, ~ Draxin | Condition)
+  posthoc_24_raw <- contrast(emm_24_raw, method = "revpairwise", adjust = "BH")
+  
+  write.csv(as.data.frame(anova_24_raw), file.path(out_dir, "24h_raw_model_anova.csv"), row.names = TRUE)
+  write.csv(as.data.frame(emm_24_raw), file.path(out_dir, "24h_raw_emmeans_draxin_within_condition.csv"), row.names = FALSE)
+  write.csv(as.data.frame(posthoc_24_raw), file.path(out_dir, "24h_raw_draxin_140_vs_0_within_condition.csv"), row.names = FALSE)
+}
+
+# =======================
+# 24 h NORMALIZED MODEL
+# =======================
+if (nrow(df_24_norm_ctrl) >= 4) {
+  fit_24_norm <- fit_model_by_experiment(Count_24_norm_to_ctrl ~ Condition * Draxin, df_24_norm_ctrl)
+  m_24_norm <- fit_24_norm$model
+  
+  anova_24_norm <- anova(m_24_norm)
+  emm_24_norm <- emmeans(m_24_norm, ~ Draxin | Condition)
+  posthoc_24_norm <- contrast(emm_24_norm, method = "revpairwise", adjust = "BH")
+  
+  write.csv(as.data.frame(anova_24_norm), file.path(out_dir, "24h_normalized_model_anova.csv"), row.names = TRUE)
+  write.csv(as.data.frame(emm_24_norm), file.path(out_dir, "24h_normalized_emmeans_draxin_within_condition.csv"), row.names = FALSE)
+  write.csv(as.data.frame(posthoc_24_norm), file.path(out_dir, "24h_normalized_draxin_140_vs_0_within_condition.csv"), row.names = FALSE)
+}
+
+cat("Done.\n")
+```

@@ -1,0 +1,339 @@
+
+```{r, warning=FALSE, message=FALSE}
+#=================================
+#1. Load required packages and input data
+#=================================
+# Statistics-only script for testing whether nerve-level mean DRAXIN differs
+# across nerve categories while adjusting for patient_id as a fixed effect.
+
+library(SpatialExperiment)
+library(SummarizedExperiment)
+library(S4Vectors)
+library(dplyr)
+library(car)
+library(emmeans)
+library(broom)
+
+# Load integrated spatial object
+spe <- readRDS("../../../../../Konstantina/12_Olas_project/Publication_files/data/SPE/Integrated_NMF.rds")
+
+# Load accompanying metadata
+colData(spe) <- DataFrame(read.csv("../../../../../Konstantina/12_Olas_project/Publication_files/data/coldata/DE_SPE_annotaion.csv"))
+
+# Ensure column names match barcodes
+colnames(spe) <- spe$barcode
+```
+
+```{r}
+#=================================
+#2. Define nerve metadata
+#=================================
+# Keep only nerve spots and define the 3 nerve categories:
+# - NonInvaded_Adjacent
+# - NonInvaded_Diseased
+# - Invaded
+
+spe_nerve <- spe[, colData(spe)$is.nerve == TRUE]
+
+nerve_meta_df <- data.frame(
+  barcode    = as.character(spe_nerve$barcode),
+  patient_id = as.character(colData(spe_nerve)$patient_id),
+  NerveID    = as.character(colData(spe_nerve)$NerveID),
+  Invaded    = as.character(colData(spe_nerve)$Invaded),
+  type_raw   = as.character(colData(spe_nerve)$type),
+  stringsAsFactors = FALSE
+)
+
+nerve_meta_df <- nerve_meta_df %>%
+  mutate(
+    types_grouped = ifelse(type_raw == "noPNI", "Adjacent", "Diseased"),
+    nerve_category = ifelse(
+      Invaded == "NonInvaded",
+      paste0("NonInvaded_", types_grouped),
+      Invaded
+    ),
+    patient_id = factor(patient_id, levels = c("54703", "6249", "70865")),
+    nerve_category = factor(
+      nerve_category,
+      levels = c("NonInvaded_Adjacent", "NonInvaded_Diseased", "Invaded")
+    )
+  ) %>%
+  filter(
+    !is.na(barcode),
+    !is.na(patient_id),
+    !is.na(NerveID),
+    NerveID != "",
+    !is.na(nerve_category)
+  )
+```
+
+```{r}
+#=================================
+#2. Define nerve metadata
+#=================================
+# Keep only nerve spots and define the 3 nerve categories:
+# - NonInvaded_Adjacent
+# - NonInvaded_Diseased
+# - Invaded
+
+spe_nerve <- spe[, colData(spe)$is.nerve == TRUE]
+
+nerve_meta_df <- data.frame(
+  barcode    = as.character(spe_nerve$barcode),
+  patient_id = as.character(colData(spe_nerve)$patient_id),
+  NerveID    = as.character(colData(spe_nerve)$NerveID),
+  Invaded    = as.character(colData(spe_nerve)$Invaded),
+  type_raw   = as.character(colData(spe_nerve)$type),
+  stringsAsFactors = FALSE
+)
+
+nerve_meta_df <- nerve_meta_df %>%
+  mutate(
+    types_grouped = ifelse(type_raw == "noPNI", "Adjacent", "Diseased"),
+    nerve_category = ifelse(
+      Invaded == "NonInvaded",
+      paste0("NonInvaded_", types_grouped),
+      Invaded
+    ),
+    patient_id = factor(patient_id, levels = c("54703", "6249", "70865")),
+    nerve_category = factor(
+      nerve_category,
+      levels = c("NonInvaded_Adjacent", "NonInvaded_Diseased", "Invaded")
+    )
+  ) %>%
+  filter(
+    !is.na(barcode),
+    !is.na(patient_id),
+    !is.na(NerveID),
+    NerveID != "",
+    !is.na(nerve_category)
+  )
+```
+
+
+```{r}
+#=================================
+#3. Extract DRAXIN expression
+#=================================
+# DRAXIN is extracted from the logcounts assay.
+
+if (!"logcounts" %in% assayNames(spe)) {
+  stop("The assay 'logcounts' was not found in spe.")
+}
+
+if (!"DRAXIN" %in% rownames(spe)) {
+  stop("DRAXIN was not found in rownames(spe).")
+}
+
+draxin_df <- data.frame(
+  barcode = as.character(spe$barcode),
+  DRAXIN = as.numeric(assay(spe, "logcounts")["DRAXIN", ]),
+  stringsAsFactors = FALSE
+)
+
+```
+
+```{r}
+#=================================
+#4. Aggregate DRAXIN to nerve level
+#=================================
+# The nerve is the statistical unit.
+# This avoids treating multiple spots from the same nerve as independent.
+
+spot_df <- nerve_meta_df %>%
+  left_join(draxin_df, by = "barcode") %>%
+  filter(!is.na(DRAXIN))
+
+nerve_level_df <- spot_df %>%
+  group_by(patient_id, NerveID, nerve_category) %>%
+  summarise(
+    DRAXIN = mean(DRAXIN, na.rm = TRUE),
+    n_spots = n(),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(DRAXIN)) %>%
+  droplevels()
+
+cat("\nNumber of nerve-level observations:\n")
+print(nrow(nerve_level_df))
+
+cat("\nNerves per patient and nerve category:\n")
+print(table(nerve_level_df$patient_id, nerve_level_df$nerve_category))
+
+cat("\nSummary of nerve-level DRAXIN by category:\n")
+print(
+  nerve_level_df %>%
+    group_by(nerve_category) %>%
+    summarise(
+      n_nerves = n(),
+      mean_DRAXIN = mean(DRAXIN, na.rm = TRUE),
+      sd_DRAXIN = sd(DRAXIN, na.rm = TRUE),
+      median_DRAXIN = median(DRAXIN, na.rm = TRUE),
+      .groups = "drop"
+    )
+)
+
+```
+
+
+```{r}
+#=================================
+#5. Patient-adjusted linear model
+#=================================
+# Model:
+# DRAXIN ~ patient_id + nerve_category
+#
+# patient_id is included as a fixed effect because there are only 3 patients.
+# The main test of interest is nerve_category.
+
+if (nlevels(nerve_level_df$patient_id) < 2) {
+  stop("Fewer than 2 patients are present after filtering.")
+}
+
+if (nlevels(nerve_level_df$nerve_category) < 2) {
+  stop("Fewer than 2 nerve categories are present after filtering.")
+}
+
+fit_draxin_nerve <- lm(
+  DRAXIN ~ patient_id + nerve_category,
+  data = nerve_level_df
+)
+
+cat("\nModel summary:\n")
+print(summary(fit_draxin_nerve))
+
+cat("\nModel alias check:\n")
+print(alias(fit_draxin_nerve))
+
+```
+
+```{r}
+#=================================
+#6. Patient-adjusted ANOVA
+#=================================
+# Type II ANOVA tests nerve_category after accounting for patient_id.
+
+anova_draxin_nerve <- car::Anova(
+  fit_draxin_nerve,
+  type = 2
+)
+
+cat("\nType II ANOVA, adjusted for patient_id:\n")
+print(anova_draxin_nerve)
+
+anova_draxin_nerve_df <- as.data.frame(anova_draxin_nerve)
+anova_draxin_nerve_df$term <- rownames(anova_draxin_nerve_df)
+anova_draxin_nerve_df <- anova_draxin_nerve_df %>%
+  select(term, everything())
+
+```
+
+```{r}
+#=================================
+#7. Patient-adjusted estimated marginal means
+#=================================
+# Estimated marginal means compare nerve categories after adjusting for patient_id.
+
+emm_draxin_nerve <- emmeans(
+  fit_draxin_nerve,
+  ~ nerve_category
+)
+
+cat("\nPatient-adjusted estimated marginal means:\n")
+print(emm_draxin_nerve)
+
+emm_draxin_nerve_df <- as.data.frame(emm_draxin_nerve)
+
+```
+
+
+```{r}
+#=================================
+#8. Pairwise comparisons between nerve categories
+#=================================
+# Holm correction is used for the 3 pairwise comparisons.
+
+pairwise_draxin_nerve <- pairs(
+  emm_draxin_nerve,
+  adjust = "holm"
+)
+
+cat("\nPairwise patient-adjusted comparisons, Holm-adjusted:\n")
+print(pairwise_draxin_nerve)
+
+pairwise_draxin_nerve_df <- as.data.frame(pairwise_draxin_nerve)
+
+```
+
+```{r}
+#=================================
+#9. Basic model diagnostics
+#=================================
+
+model_summary_df <- broom::glance(fit_draxin_nerve)
+
+cat("\nModel diagnostics summary:\n")
+print(model_summary_df)
+
+if (length(residuals(fit_draxin_nerve)) >= 3) {
+  shapiro_res <- shapiro.test(residuals(fit_draxin_nerve))
+  cat("\nShapiro-Wilk test on model residuals:\n")
+  print(shapiro_res)
+
+  shapiro_df <- data.frame(
+    statistic = unname(shapiro_res$statistic),
+    p_value = shapiro_res$p.value,
+    method = shapiro_res$method
+  )
+} else {
+  shapiro_df <- data.frame(
+    statistic = NA_real_,
+    p_value = NA_real_,
+    method = "Not enough residuals for Shapiro-Wilk test"
+  )
+}
+
+```
+
+```{r}
+#=================================
+#10. Save statistics outputs
+#=================================
+
+write.csv(
+  nerve_level_df,
+  "stats_Draxin/DRAXIN_nerve_level_input_table.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  anova_draxin_nerve_df,
+  "stats_Draxin/DRAXIN_nerve_level_patient_adjusted_ANOVA.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  emm_draxin_nerve_df,
+  "stats_Draxin/DRAXIN_nerve_level_patient_adjusted_EMMeans.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  pairwise_draxin_nerve_df,
+  "stats_Draxin/DRAXIN_nerve_level_patient_adjusted_pairwise.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  model_summary_df,
+  "stats_Draxin/DRAXIN_nerve_level_model_diagnostics.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  shapiro_df,
+  "stats_Draxin/DRAXIN_nerve_level_residual_shapiro_test.csv",
+  row.names = FALSE
+)
+
+```

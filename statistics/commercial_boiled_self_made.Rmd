@@ -1,0 +1,360 @@
+
+```{r}
+# =======================
+# PACKAGES
+# =======================
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(pracma)
+library(tibble)
+```
+
+```{r}
+
+# =======================
+# INPUT / OUTPUT
+# =======================
+file <- "input_files/boiled_sel_made.csv"
+out_dir <- "output/boiled_self_made"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# =======================
+# READ DATA
+# Required columns:
+#   Draxin
+#   Absorbance
+#   Condition
+#   Experiment
+#   Replicate
+# =======================
+df <- read_csv(file, show_col_types = FALSE) %>%
+  rename_with(~ gsub("\\s+", "_", .x)) %>%
+  mutate(
+    Draxin     = as.numeric(Draxin),
+    Absorbance = as.numeric(Absorbance),
+    Condition  = as.character(Condition),
+    Experiment = as.character(Experiment),
+    Replicate  = as.character(Replicate)
+  )
+
+# =======================
+# BASIC DATA CHECK
+# =======================
+cat("\n=======================\n")
+cat("DATA STRUCTURE CHECK\n")
+cat("=======================\n\n")
+
+cat("Column names:\n")
+print(names(df))
+
+cat("\nStructure:\n")
+str(df)
+
+cat("\nMissing values per column:\n")
+print(colSums(is.na(df)))
+
+cat("\nUnique Condition values:\n")
+print(sort(unique(df$Condition)))
+
+cat("\nUnique Draxin values:\n")
+print(sort(unique(df$Draxin)))
+
+cat("\nNumber of levels:\n")
+df %>%
+  summarise(
+    n_conditions  = n_distinct(Condition),
+    n_draxin      = n_distinct(Draxin),
+    n_experiments = n_distinct(Experiment),
+    n_replicates  = n_distinct(paste(Experiment, Replicate, sep = "__"))
+  ) %>%
+  print()
+
+cat("\nCounts per Condition x Draxin:\n")
+df %>%
+  count(Condition, Draxin) %>%
+  arrange(Condition, Draxin) %>%
+  print(n = Inf)
+
+cat("\nCounts per Experiment x Condition x Draxin:\n")
+df %>%
+  count(Experiment, Condition, Draxin) %>%
+  arrange(Experiment, Condition, Draxin) %>%
+  print(n = Inf)
+
+write_csv(
+  df %>% count(Condition, Draxin),
+  file.path(out_dir, "check_counts_condition_draxin.csv")
+)
+
+write_csv(
+  df %>% count(Experiment, Condition, Draxin),
+  file.path(out_dir, "check_counts_experiment_condition_draxin.csv")
+)
+
+# =======================
+# CLEAN FACTOR LEVELS
+# =======================
+condition_order <- c("control_protein", "commercial", "wild_type", "mutant", "boiled")
+
+df <- df %>%
+  mutate(
+    Condition = factor(Condition, levels = condition_order),
+    Draxin_f  = factor(Draxin, levels = sort(unique(Draxin))),
+    ExpRep    = interaction(Experiment, Replicate, drop = TRUE)
+  ) %>%
+  filter(!is.na(Condition))
+
+if (!("control_protein" %in% levels(droplevels(df$Condition)))) {
+  stop("Condition 'control_protein' not found in the data.")
+}
+```
+
+```{r}
+# =======================
+# RAW SUMMARY
+# =======================
+summary_raw <- df %>%
+  group_by(Condition, Draxin) %>%
+  summarise(
+    n        = n(),
+    mean_raw = mean(Absorbance, na.rm = TRUE),
+    sd_raw   = sd(Absorbance, na.rm = TRUE),
+    sem_raw  = sd_raw / sqrt(n),
+    .groups  = "drop"
+  )
+
+write_csv(summary_raw, file.path(out_dir, "summary_raw.csv"))
+
+# =======================
+# NORMALIZATION
+# Normalize within each Condition + Experiment
+# to mean of Draxin == 0
+# =======================
+baseline_tbl <- df %>%
+  filter(Draxin == 0) %>%
+  group_by(Condition, Experiment) %>%
+  summarise(
+    baseline_0 = mean(Absorbance, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+df_norm <- df %>%
+  left_join(baseline_tbl, by = c("Condition", "Experiment")) %>%
+  mutate(
+    Abs_norm = Absorbance / baseline_0
+  )
+
+cat("\nRows with missing baseline after normalization join:\n")
+print(sum(is.na(df_norm$baseline_0)))
+
+if (any(is.na(df_norm$baseline_0))) {
+  warning("Some rows could not be normalized because no Draxin == 0 baseline was found for that Condition + Experiment.")
+}
+
+write_csv(df_norm, file.path(out_dir, "data_with_normalization.csv"))
+```
+
+```{r}
+# =======================
+# SUMMARY FOR NORMALIZED DATA
+# =======================
+summary_norm <- df_norm %>%
+  group_by(Condition, Draxin) %>%
+  summarise(
+    n         = n(),
+    mean_norm = mean(Abs_norm, na.rm = TRUE),
+    sd_norm   = sd(Abs_norm, na.rm = TRUE),
+    sem_norm  = sd_norm / sqrt(n),
+    .groups   = "drop"
+  )
+
+write_csv(summary_norm, file.path(out_dir, "summary_normalized.csv"))
+
+# =======================
+# PLOT NORMALIZED DOSE RESPONSE
+# LOG SCALE ONLY
+# Exclude Draxin == 0 because log(0) is undefined
+# =======================
+p_norm_log <- ggplot(
+  summary_norm %>% filter(Draxin > 0),
+  aes(x = Draxin, y = mean_norm, group = Condition, color = Condition)
+) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.5) +
+  geom_errorbar(
+    aes(ymin = mean_norm - sem_norm,
+        ymax = mean_norm + sem_norm),
+    width = 0.08
+  ) +
+  scale_x_log10(breaks = sort(unique(summary_norm$Draxin[summary_norm$Draxin > 0]))) +
+  labs(
+    x = "Draxin (log scale)",
+    y = "Normalized absorbance\n(relative to mean 0 Draxin within Condition + Experiment)",
+    title = "Normalized dose-response by condition"
+  ) +
+  theme_classic(base_size = 12)
+
+ggsave(
+  filename = file.path(out_dir, "plot_normalized_log_scale.png"),
+  plot = p_norm_log, width = 8, height = 5, dpi = 300
+)
+```
+
+```{r}
+# =======================
+# PRIMARY MIXED MODEL ON RAW DATA
+# =======================
+m_raw <- lmer(
+  Absorbance ~ Draxin_f * Condition + (1 | Experiment),
+  data = df
+)
+
+cat("\n=======================\n")
+cat("MIXED MODEL ON RAW DATA\n")
+cat("=======================\n\n")
+print(anova(m_raw))
+
+anova_raw <- as.data.frame(anova(m_raw)) %>%
+  rownames_to_column("term") %>%
+  rename(
+    df_num  = NumDF,
+    df_den  = DenDF,
+    F_value = `F value`,
+    p_value = `Pr(>F)`
+  )
+
+write_csv(anova_raw, file.path(out_dir, "anova_mixed_model_raw.csv"))
+
+# =======================
+# POSTHOC:
+# Compare each Condition vs control_protein
+# within each Draxin concentration
+# =======================
+emm_cond_within_dose <- emmeans(m_raw, ~ Condition | Draxin_f)
+
+posthoc_vs_control_by_dose <- contrast(
+  emm_cond_within_dose,
+  method = "trt.vs.ctrl",
+  ref = "control_protein",
+  adjust = "BH"
+) %>%
+  as.data.frame()
+
+write_csv(
+  posthoc_vs_control_by_dose,
+  file.path(out_dir, "posthoc_vs_control_protein_within_each_draxin_BH.csv")
+)
+
+# =======================
+# AUC ON NORMALIZED DATA
+# Average within Experiment + Condition + Replicate + Draxin
+# then compute AUC per replicate profile
+# =======================
+auc_input <- df_norm %>%
+  group_by(Experiment, Condition, Replicate, Draxin) %>%
+  summarise(
+    Abs_norm = mean(Abs_norm, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+auc_tbl <- auc_input %>%
+  arrange(Experiment, Condition, Replicate, Draxin) %>%
+  group_by(Experiment, Condition, Replicate) %>%
+  summarise(
+    AUC_norm = trapz(Draxin, Abs_norm),
+    .groups = "drop"
+  )
+
+write_csv(auc_tbl, file.path(out_dir, "auc_normalized_per_replicate.csv"))
+
+# =======================
+# MIXED MODEL ON NORMALIZED AUC
+# =======================
+m_auc <- lmer(
+  AUC_norm ~ Condition + (1 | Experiment),
+  data = auc_tbl
+)
+
+cat("\n=======================\n")
+cat("MIXED MODEL ON NORMALIZED AUC\n")
+cat("=======================\n\n")
+print(anova(m_auc))
+
+anova_auc <- as.data.frame(anova(m_auc)) %>%
+  rownames_to_column("term") %>%
+  rename(
+    df_num  = NumDF,
+    df_den  = DenDF,
+    F_value = `F value`,
+    p_value = `Pr(>F)`
+  )
+
+write_csv(anova_auc, file.path(out_dir, "anova_auc_normalized.csv"))
+
+# =======================
+# AUC POSTHOC:
+# Compare each Condition vs control_protein only
+# =======================
+emm_auc <- emmeans(m_auc, ~ Condition)
+
+auc_vs_control <- contrast(
+  emm_auc,
+  method = "trt.vs.ctrl",
+  ref = "control_protein",
+  adjust = "BH"
+) %>%
+  as.data.frame()
+
+write_csv(
+  auc_vs_control,
+  file.path(out_dir, "posthoc_auc_vs_control_protein_BH.csv")
+)
+
+# =======================
+# PLOT AUC
+# =======================
+auc_summary <- auc_tbl %>%
+  group_by(Condition) %>%
+  summarise(
+    n        = n(),
+    mean_auc = mean(AUC_norm, na.rm = TRUE),
+    sd_auc   = sd(AUC_norm, na.rm = TRUE),
+    sem_auc  = sd_auc / sqrt(n),
+    .groups  = "drop"
+  )
+
+p_auc <- ggplot(auc_tbl, aes(x = Condition, y = AUC_norm, color = Condition)) +
+  geom_point(position = position_jitter(width = 0.1, height = 0), size = 2, alpha = 0.8) +
+  geom_point(data = auc_summary, aes(x = Condition, y = mean_auc), size = 3, inherit.aes = FALSE) +
+  geom_errorbar(
+    data = auc_summary,
+    aes(x = Condition, ymin = mean_auc - sem_auc, ymax = mean_auc + sem_auc),
+    width = 0.15,
+    inherit.aes = FALSE
+  ) +
+  labs(
+    x = "Condition",
+    y = "Normalized AUC",
+    title = "AUC of normalized dose-response curves"
+  ) +
+  theme_classic(base_size = 12)
+
+ggsave(
+  filename = file.path(out_dir, "plot_auc_normalized.png"),
+  plot = p_auc, width = 7, height = 5, dpi = 300
+)
+
+# =======================
+# SAVE MODEL SUMMARIES AS TEXT
+# =======================
+capture.output(summary(m_raw), file = file.path(out_dir, "model_summary_raw.txt"))
+capture.output(summary(m_auc), file = file.path(out_dir, "model_summary_auc.txt"))
+
+cat("\nAnalysis complete.\n")
+cat("Outputs saved in: ", out_dir, "\n")
+```

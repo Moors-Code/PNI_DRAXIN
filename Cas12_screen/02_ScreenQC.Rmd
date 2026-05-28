@@ -1,0 +1,674 @@
+# =========================================================
+# Screen count-matrix QC only
+# =========================================================
+#
+# Main goals:
+# 1) Read a pooled CRISPR screen count matrix
+# 2) Compute raw-count QC metrics per sample
+# 3) Add screen-specific QC:
+#    - detected sgRNAs
+#    - skew ratio
+#    - simple CPM and TMM-normalized logCPM
+#    - density plots
+#    - PCA
+#    - correlation heatmap
+#    - pairwise scatterplots
+#    - MDS
+#    - MD plots
+# =========================================================
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(edgeR)
+  library(limma)
+  library(ineq)
+  library(ggrepel)
+  library(pheatmap)
+  library(stringr)
+})
+```
+
+```{r}
+# =========================================================
+# 1. Paths
+# =========================================================
+input_file <- "input_files/Library_and_Screen.csv"
+outdir <- "output_files/qc_screen_only"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+# Optional control/QC files
+essential_file <- "input_files/AchillesCommonEssentialControls.csv"
+nontargeting_file <- "input_files/neg_controls_clean.txt"
+```
+
+```{r}
+# =========================================================
+# 2. Read count matrix
+# Expected columns:
+#   sgRNA or sgRNAID | Gene | sample1 | sample2 | ...
+# =========================================================
+count_matrix <- read.csv(input_file, check.names = FALSE)
+
+if ("sgRNAID" %in% colnames(count_matrix) && !"sgRNA" %in% colnames(count_matrix)) {
+  colnames(count_matrix)[colnames(count_matrix) == "sgRNAID"] <- "sgRNA"
+}
+
+stopifnot(all(c("sgRNA", "Gene") %in% colnames(count_matrix)))
+
+meta_cols <- c("sgRNA", "Gene")
+sample_cols <- setdiff(colnames(count_matrix), meta_cols)
+
+meta_info <- count_matrix[, meta_cols, drop = FALSE]
+raw_counts <- count_matrix[, sample_cols, drop = FALSE]
+
+raw_counts[] <- lapply(raw_counts, as.numeric)
+
+if (any(is.na(raw_counts))) {
+  warning("Some count values are NA. Replacing NA with 0.")
+  raw_counts[is.na(raw_counts)] <- 0
+}
+
+raw_counts_mat <- as.matrix(raw_counts)
+rownames(raw_counts_mat) <- count_matrix$sgRNA
+```
+
+```{r}
+# =========================================================
+# 3. Define sample groups
+# Adjust patterns if your naming differs
+# =========================================================
+sample_group_df <- tibble(
+  Sample = sample_cols,
+  Group = case_when(
+    str_detect(sample_cols, "rep\\d*_counts") ~ "library_input",
+    str_detect(sample_cols, "^Draxin") ~ "draxin",
+    str_detect(sample_cols, "^Ctr") ~ "control",
+    str_detect(sample_cols, "^Before") ~ "T0",
+    TRUE ~ "unknown"
+  )
+)
+
+group_colors <- c(
+  "library_input" = "grey",
+  "control" = "#6DAEB0",
+  "draxin" = "#FF6666",
+  "T0" = "black",
+  "unknown" = "orange"
+)
+```
+
+```{r}
+# =========================================================
+# 4. Save clean raw count matrix
+# =========================================================
+raw_count_matrix_clean <- cbind(meta_info, raw_counts)
+
+write.csv(
+  raw_count_matrix_clean,
+  file.path(outdir, "raw_count_matrix_clean.csv"),
+  row.names = FALSE,
+  quote = FALSE
+)
+
+# =========================================================
+# 5. Raw-count QC summary
+# =========================================================
+raw_qc <- tibble(
+  Sample = sample_cols,
+  Group = sample_group_df$Group,
+  Total_Reads = colSums(raw_counts, na.rm = TRUE),
+  Detected_sgRNAs = colSums(raw_counts > 0, na.rm = TRUE),
+  Percent_Zero = 100 * colMeans(raw_counts == 0, na.rm = TRUE),
+  Percent_Low_Count_lt10 = 100 * colMeans(raw_counts < 10, na.rm = TRUE),
+  Percent_Low_Count_lt30 = 100 * colMeans(raw_counts < 30, na.rm = TRUE),
+  GiniIndex_Raw = sapply(raw_counts, gini)
+)
+
+write.table(
+  raw_qc,
+  file.path(outdir, "raw_count_qc_summary.tsv"),
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+```{r}
+# =========================================================
+# 6. Long-format counts
+# =========================================================
+long_counts <- count_matrix %>%
+  pivot_longer(
+    cols = all_of(sample_cols),
+    names_to = "Sample",
+    values_to = "Count"
+  ) %>%
+  left_join(sample_group_df, by = "Sample")
+
+# =========================================================
+# 7. Detected sgRNAs per sample
+# =========================================================
+detected_counts <- long_counts %>%
+  filter(Count > 0) %>%
+  group_by(Sample, Group) %>%
+  summarise(Detected_sgRNAs = n(), .groups = "drop")
+
+write.csv(
+  detected_counts,
+  file.path(outdir, "detected_sgRNAs_per_sample.csv"),
+  row.names = FALSE
+)
+
+p_detected <- ggplot(detected_counts, aes(x = Sample, y = Detected_sgRNAs, fill = Group)) +
+  geom_col() +
+  scale_fill_manual(values = group_colors) +
+  labs(
+    title = "Detected sgRNAs per sample",
+    x = "Sample",
+    y = "Number of detected sgRNAs"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(
+  file.path(outdir, "detected_sgRNAs_per_sample.pdf"),
+  p_detected,
+  width = 8,
+  height = 5
+)
+```
+
+```{r}
+# =========================================================
+# 8. Skew ratio per sample
+# =========================================================
+skew_ratios <- long_counts %>%
+  group_by(Sample, Group) %>%
+  summarise(
+    percentile_90 = quantile(Count, 0.9, names = FALSE, na.rm = TRUE),
+    percentile_10 = quantile(Count, 0.1, names = FALSE, na.rm = TRUE),
+    skew_ratio_90_10 = ifelse(percentile_10 == 0, NA, percentile_90 / percentile_10),
+    .groups = "drop"
+  )
+
+write.csv(
+  skew_ratios,
+  file.path(outdir, "skew_ratio_per_sample.csv"),
+  row.names = FALSE
+)
+
+p_skew <- ggplot(skew_ratios, aes(x = Sample, y = skew_ratio_90_10, fill = Group)) +
+  geom_col() +
+  scale_fill_manual(values = group_colors) +
+  labs(
+    title = "Skew ratio (90th / 10th percentile) per sample",
+    x = "Sample",
+    y = "Skew ratio"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(
+  file.path(outdir, "skew_ratio_per_sample.pdf"),
+  p_skew,
+  width = 8,
+  height = 5
+)
+```
+
+```{r}
+# =========================================================
+# 9. Simple CPM normalization + log2 transform
+# =========================================================
+cpm_counts <- sweep(raw_counts, 2, colSums(raw_counts), FUN = "/") * 1e6
+log_cpm_simple <- log2(cpm_counts + 1)
+
+count_matrix_norm_simple <- cbind(meta_info, log_cpm_simple)
+
+write.csv(
+  count_matrix_norm_simple,
+  file.path(outdir, "normalizedcountmatrix_simple_log2CPM.csv"),
+  row.names = FALSE
+)
+
+# =========================================================
+# 10. TMM normalization + logCPM
+# =========================================================
+dge_all <- DGEList(counts = raw_counts_mat)
+dge_all <- calcNormFactors(dge_all)
+log_cpm_tmm <- cpm(dge_all, log = TRUE)
+
+log_cpm_tmm_df <- as.data.frame(log_cpm_tmm) %>%
+  rownames_to_column(var = "sgRNA") %>%
+  left_join(meta_info, by = "sgRNA") %>%
+  dplyr::select(sgRNA, Gene, all_of(sample_cols))
+
+write.csv(
+  log_cpm_tmm_df,
+  file.path(outdir, "normalizedcountmatrix_TMM_logCPM.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+# =========================================================
+# 11. Density plots: TMM-normalized logCPM
+# =========================================================
+log_cpm_tmm_long <- log_cpm_tmm_df %>%
+  pivot_longer(
+    cols = all_of(sample_cols),
+    names_to = "Sample",
+    values_to = "logCPM"
+  ) %>%
+  left_join(sample_group_df, by = "Sample")
+
+p_density_raw <- ggplot(log_cpm_tmm_long, aes(x = logCPM, color = Group, group = Sample)) +
+  geom_density(linewidth = 1, alpha = 0.7) +
+  scale_color_manual(values = group_colors) +
+  labs(
+    title = "LogCPM density (TMM normalized, raw counts)",
+    x = "log2-CPM",
+    y = "Density"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave(
+  file.path(outdir, "logCPM_density_raw_TMM.pdf"),
+  p_density_raw,
+  width = 8,
+  height = 5
+)
+```
+
+```{r}
+# =========================================================
+# 12. Normalized QC summary from simple log2(CPM + 1)
+# =========================================================
+qc_long <- count_matrix_norm_simple %>%
+  pivot_longer(
+    cols = all_of(sample_cols),
+    names_to = "Sample",
+    values_to = "Log2_CPM"
+  ) %>%
+  left_join(sample_group_df, by = "Sample")
+
+qc_summary <- qc_long %>%
+  group_by(Sample, Group) %>%
+  summarise(
+    Median_Log2_CPM = median(Log2_CPM, na.rm = TRUE),
+    IQR_Log2_CPM = IQR(Log2_CPM, na.rm = TRUE),
+    Percent_NearZero_CPM = 100 * mean(Log2_CPM < log2(5 + 1), na.rm = TRUE),
+    Percent_Zero_CPM = 100 * mean(Log2_CPM == 0, na.rm = TRUE),
+    GiniIndex_CPM = gini(2^Log2_CPM - 1),
+    .groups = "drop"
+  )
+
+write.table(
+  qc_summary,
+  file.path(outdir, "normalized_qc_summary.tsv"),
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+```{r}
+# =========================================================
+# 13. Combined per-sample QC summary
+# =========================================================
+combined_qc <- raw_qc %>%
+  left_join(qc_summary, by = c("Sample", "Group")) %>%
+  left_join(skew_ratios %>% dplyr::select(Sample, skew_ratio_90_10), by = "Sample")
+
+write.csv(
+  combined_qc,
+  file.path(outdir, "combined_screen_qc_summary.csv"),
+  row.names = FALSE
+)
+
+# =========================================================
+# 14. Histograms of simple log2(CPM + 1)
+# =========================================================
+pdf(file.path(outdir, "histograms_simple_log2CPM.pdf"), width = 10, height = 8)
+
+for (sample in sample_cols) {
+  p <- ggplot(count_matrix_norm_simple, aes(x = .data[[sample]])) +
+    geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+    theme_minimal() +
+    labs(
+      title = paste("Histogram of", sample),
+      x = "log2(CPM + 1)",
+      y = "Number of sgRNAs"
+    )
+  print(p)
+}
+
+dev.off()
+```
+
+```{r}
+# =========================================================
+# 15. PCA on simple log2(CPM + 1)
+# =========================================================
+pca_input <- t(as.matrix(log_cpm_simple))
+zero_var_cols <- apply(pca_input, 2, function(x) var(x, na.rm = TRUE) == 0)
+pca_input_filtered <- pca_input[, !zero_var_cols, drop = FALSE]
+
+pca <- prcomp(pca_input_filtered, center = TRUE, scale. = TRUE)
+
+pca_df <- as.data.frame(pca$x) %>%
+  rownames_to_column(var = "Sample") %>%
+  left_join(sample_group_df, by = "Sample")
+
+p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, label = Sample, color = Group)) +
+  geom_point(size = 4) +
+  geom_text_repel(size = 4) +
+  scale_color_manual(values = group_colors) +
+  theme_minimal() +
+  labs(
+    title = "PCA: log2(CPM + 1)",
+    x = paste0("PC1 (", round(100 * summary(pca)$importance[2, 1], 1), "%)"),
+    y = paste0("PC2 (", round(100 * summary(pca)$importance[2, 2], 1), "%)")
+  )
+
+ggsave(
+  file.path(outdir, "pca_plot_simple_log2CPM.pdf"),
+  plot = p_pca,
+  width = 7,
+  height = 5
+)
+```
+
+```{r}
+# =========================================================
+# 16. Pearson correlation heatmap
+# =========================================================
+cor_matrix <- cor(log_cpm_simple, method = "pearson", use = "pairwise.complete.obs")
+
+write.table(
+  cor_matrix,
+  file.path(outdir, "sample_correlation_matrix.tsv"),
+  sep = "\t",
+  quote = FALSE
+)
+
+annotation_df <- data.frame(
+  Group = sample_group_df$Group,
+  row.names = sample_group_df$Sample
+)
+
+pdf(file.path(outdir, "sample_correlation_heatmap.pdf"), width = 6, height = 6)
+pheatmap(
+  cor_matrix,
+  main = "Sample correlation (Pearson)",
+  clustering_distance_rows = "correlation",
+  clustering_distance_cols = "correlation",
+  display_numbers = TRUE,
+  number_format = "%.2f",
+  color = colorRampPalette(c("white", "blue"))(50),
+  annotation_col = annotation_df,
+  annotation_row = annotation_df,
+  annotation_colors = list(Group = group_colors)
+)
+dev.off()
+```
+
+```{r}
+# =========================================================
+# 17. Pairwise scatterplots
+# =========================================================
+if (length(sample_cols) >= 2) {
+  combs <- combn(sample_cols, 2, simplify = FALSE)
+
+  pdf(file.path(outdir, "sample_pairwise_scatterplots.pdf"), width = 6, height = 6)
+  for (pair in combs) {
+    df_plot <- tibble(
+      x = log_cpm_simple[, pair[1]],
+      y = log_cpm_simple[, pair[2]]
+    )
+
+    p <- ggplot(df_plot, aes(x = x, y = y)) +
+      geom_point(alpha = 0.3, size = 0.8) +
+      theme_minimal() +
+      labs(
+        title = paste(pair[1], "vs", pair[2]),
+        x = paste0(pair[1], " log2(CPM + 1)"),
+        y = paste0(pair[2], " log2(CPM + 1)")
+      )
+
+    print(p)
+  }
+  dev.off()
+}
+```
+
+```{r}
+# =========================================================
+# 18. Boxplots of TMM-normalized logCPM
+# =========================================================
+group_factor <- factor(
+  sample_group_df$Group[match(colnames(raw_counts_mat), sample_group_df$Sample)]
+)
+
+d_raw <- DGEList(counts = raw_counts_mat, group = group_factor)
+d_raw <- calcNormFactors(d_raw)
+logcpm_raw <- cpm(d_raw, log = TRUE)
+
+pdf(file.path(outdir, "boxplots_raw_TMM_logCPM.pdf"), width = 10, height = 5)
+boxplot(
+  logcpm_raw,
+  las = 2,
+  pch = 19,
+  col = group_colors[as.character(d_raw$samples$group)],
+  outcex = 0.3,
+  outcol = group_colors[as.character(d_raw$samples$group)],
+  labels = colnames(logcpm_raw),
+  main = "TMM-normalized raw data",
+  ylab = "sgRNA representation (log2-CPM)"
+)
+legend(
+  "topleft",
+  legend = levels(factor(d_raw$samples$group)),
+  col = group_colors[levels(factor(d_raw$samples$group))],
+  pch = 19,
+  cex = 0.6
+)
+dev.off()
+
+# =========================================================
+# 19. MDS plot
+# =========================================================
+selected_groups <- c("control", "draxin", "T0")
+keep_mds <- sample_group_df$Group %in% selected_groups
+
+pdf(file.path(outdir, "MDS_raw.pdf"), width = 6, height = 5)
+
+if (sum(keep_mds) >= 2) {
+  d_mds_raw <- d_raw[, keep_mds]
+  d_mds_raw$samples$group <- droplevels(factor(sample_group_df$Group[keep_mds]))
+
+  plotMDS(
+    d_mds_raw,
+    col = group_colors[as.character(d_mds_raw$samples$group)],
+    pch = 16,
+    cex = 1.8,
+    main = "MDS: raw data"
+  )
+  legend(
+    "topright",
+    inset = c(-0.05, 0),
+    legend = levels(d_mds_raw$samples$group),
+    col = group_colors[levels(d_mds_raw$samples$group)],
+    pch = 16,
+    cex = 0.8,
+    title = "Group"
+  )
+} else {
+  plot.new()
+  title("MDS: raw data\nnot enough selected samples")
+}
+
+dev.off()
+```
+
+```{r}
+# =========================================================
+# 20. MD plots per sample
+# =========================================================
+pdf(file.path(outdir, "MD_plots_raw.pdf"), width = 10, height = 12)
+par(mfrow = c(ceiling(ncol(d_raw) / 2), 2))
+
+for (i in seq_len(ncol(d_raw))) {
+  plotMD(d_raw, column = i, main = colnames(d_raw)[i])
+  abline(h = 0, col = "red", lty = 2, lwd = 2)
+}
+
+dev.off()
+```
+
+
+
+```{r}
+# =========================================================
+# 21. Essential-gene QC (optional)
+# =========================================================
+essential <- read.csv(essential_file, check.names = FALSE)
+
+colnames(essential)[1] <- "Gene"
+essential <- essential["Gene"]
+
+# remove trailing " (number)"
+essential$Gene <- sub("\\s*\\([^)]*\\)$", "", essential$Gene)
+
+head(essential)
+
+    essential_df <- log_cpm_tmm_df %>%
+      mutate(essential = ifelse(Gene %in% essential$Gene, "yes", "no"))
+
+    essential_long <- essential_df %>%
+      pivot_longer(
+        cols = all_of(sample_cols),
+        names_to = "Sample",
+        values_to = "logCPM"
+      )
+
+    p_essential <- ggplot(
+      essential_long %>% filter(essential %in% c("yes", "no")),
+      aes(x = logCPM, color = essential, group = essential)
+    ) +
+      geom_density(linewidth = 1, alpha = 0.8) +
+      facet_wrap(~ Sample, scales = "free_y") +
+      scale_color_manual(values = c("yes" = "#e41a1c", "no" = "#377eb8")) +
+      labs(
+        title = "Distribution of logCPM: essential vs non-essential guides",
+        x = "log2-CPM (TMM normalized)",
+        y = "Density",
+        color = "Essential"
+      ) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+
+    ggsave(
+      file.path(outdir, "essential_vs_nonessential_logCPM_density.pdf"),
+      p_essential,
+      width = 12,
+      height = 8
+    )
+```
+```{r}
+# =========================================================
+# Optional: Wilcoxon tests for essential vs non-essential
+# =========================================================
+essential_test_results <- lapply(sample_cols, function(cond) {
+  group_yes <- log_cpm_tmm_df %>%
+    filter(Gene %in% essential$Gene) %>%
+    pull(all_of(cond))
+
+  group_no <- log_cpm_tmm_df %>%
+    filter(!Gene %in% essential$Gene) %>%
+    pull(all_of(cond))
+
+  wt <- wilcox.test(group_yes, group_no)
+
+  tibble(
+    Sample = cond,
+    W = unname(wt$statistic),
+    p_value = wt$p.value,
+    median_essential = median(group_yes, na.rm = TRUE),
+    median_nonessential = median(group_no, na.rm = TRUE)
+  )
+}) %>%
+  bind_rows()
+
+write.csv(
+  essential_test_results,
+  file.path(outdir, "essential_vs_nonessential_wilcoxon.csv"),
+  row.names = FALSE
+)
+
+wilcox.test(
+  log_cpm_tmm_df %>% filter(Gene %in% essential$Gene) %>% pull(rep1_counts),
+  log_cpm_tmm_df %>% filter(Gene %in% essential$Gene) %>% pull(Before1)
+)
+```
+
+```{r}
+# =========================================================
+# 22. Non-targeting QC (optional)
+# =========================================================
+if (file.exists(nontargeting_file)) {
+  nontargeting <- tryCatch(
+    read.table(nontargeting_file, header = FALSE, stringsAsFactors = FALSE),
+    error = function(e) NULL
+  )
+
+  if (!is.null(nontargeting) && ncol(nontargeting) >= 1) {
+    colnames(nontargeting)[1] <- "sgRNA"
+
+    nt_df <- log_cpm_tmm_df %>%
+      mutate(nontargeting = ifelse(sgRNA %in% nontargeting$sgRNA, "yes", "no"))
+
+    nt_long <- nt_df %>%
+      pivot_longer(
+        cols = all_of(sample_cols),
+        names_to = "Sample",
+        values_to = "logCPM"
+      )
+
+    p_nt <- ggplot(
+      nt_long %>% filter(nontargeting %in% c("yes", "no")),
+      aes(x = logCPM, color = nontargeting, group = nontargeting)
+    ) +
+      geom_density(linewidth = 1, alpha = 0.8) +
+      facet_wrap(~ Sample, scales = "free_y") +
+      scale_color_manual(values = c("yes" = "#e41a1c", "no" = "#377eb8")) +
+      labs(
+        title = "Distribution of logCPM: non-targeting vs other guides",
+        x = "log2-CPM (TMM normalized)",
+        y = "Density",
+        color = "Non-targeting"
+      ) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+
+    ggsave(
+      file.path(outdir, "nontargeting_vs_other_logCPM_density.pdf"),
+      p_nt,
+      width = 12,
+      height = 8
+    )
+  }
+}
+
+# =========================================================
+# 23. Run summary
+# =========================================================
+cat("Screen QC complete.\n")
+cat("Input file:", input_file, "\n")
+cat("Number of sgRNAs:", nrow(raw_counts_mat), "\n")
+cat("Number of samples:", ncol(raw_counts_mat), "\n")
+cat("Outputs written to:", outdir, "\n")
+
+```

@@ -1,0 +1,657 @@
+```{r}
+library(readr)
+library(stringr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)
+library(FSA)
+library(dplyr)
+```
+
+```{r}
+
+# ----------------------------------------------------------
+# Color palette used across the paper
+# ----------------------------------------------------------
+color_maping <- c(
+  "Acinar" = "gold1",
+  "B_cells" = "maroon",
+  "Lymphocyte(CD4)" = "green4",
+  "Lymphocytes" = "green4",
+  "Myeloid(Macrophages)" = "#6A3D9A",
+  "Endothelial" = "#FF7F00",
+  "Endocrine" = "yellow4",
+  "Stellate" = "khaki2",
+  "Other immune" = "skyblue2",
+  "Adipocytes" = "steelblue4",
+  "Lymphocyte(NK)" = "green2",
+  "Lymphocyte(CD8)" = "palegreen2",
+  "Lymphocytes(CD4-CD8-)" ="darkolivegreen",
+  "Myeloid(DCs)" ="orchid1",
+  "Myeloid" = "#CAB2D6",
+  "Schwann" = "#FDBF6F",
+  "Myeloid(C1q_macrophages)" = "#CAB2D6",
+  "Nerve" = "#FDBF6F",
+  "B_cells_(Plasma_cells)"  = "brown1", 
+  "Non_immune" ="grey"
+)
+
+# ----------------------------------------------------------
+# Immune label harmonization (your corrected mapping)
+# ----------------------------------------------------------
+immune_recode <- c(
+  "CD4 T cells" = "Lymphocyte(CD4)",
+  "CD8 T cells" = "Lymphocyte(CD8)",
+  "CD8- CD4- T cells" = "Lymphocytes(CD4-CD8-)",
+  "NK cells" = "Lymphocyte(NK)",
+  "CD20+ cells" = "B_cells",
+  "CD11c DCs" = "Myeloid(DCs)",
+  "CD68+ macro" = "Myeloid(Macrophages)",
+  "Other immune cells" = "Other immune",
+  "non immune cells" = "Non_immune"
+)
+```
+
+```{r}
+# ----------------------------------------------------------
+# Helper: palette that NEVER has missing colors
+# ----------------------------------------------------------
+make_safe_palette <- function(levels_vec, base_palette) {
+  levels_vec <- unique(as.character(levels_vec))
+  missing <- setdiff(levels_vec, names(base_palette))
+
+  # Deterministic fallback colors for missing labels (base R)
+  fallback <- setNames(
+    grDevices::hcl.colors(max(3, length(missing)), palette = "Dark 3"),
+    missing
+  )
+
+  pal <- c(base_palette, fallback)
+  pal <- pal[levels_vec]
+  pal
+}
+
+# ----------------------------------------------------------
+# 1) Read + normalize strings
+# ----------------------------------------------------------
+combined <- read.csv("combined_selected_columns_corrected_manually.csv",
+                     stringsAsFactors = FALSE)
+
+combined <- combined %>%
+  mutate(
+    ROI_ID = ifelse(is.na(ROI_ID) | ROI_ID == "", "ROI22", ROI_ID),
+    ROI_ID = str_trim(ROI_ID),
+
+    RB_CD45   = str_squish(str_trim(RB_CD45)),
+    RB_Immune = str_squish(str_trim(RB_Immune)),
+    RB_PDL1   = str_squish(str_trim(RB_PDL1))
+  ) %>%
+  mutate(
+    RB_Immune = dplyr::recode(RB_Immune, !!!immune_recode, .default = RB_Immune)
+  )
+
+# Quick NA check
+combined %>% summarise(across(everything(), ~sum(is.na(.))))
+
+# ----------------------------------------------------------
+# 2) Helper: percent summary -> wide table
+# ----------------------------------------------------------
+make_percent_wide <- function(df, roi_col, group_col, prefix) {
+
+  long <- df %>%
+    filter(!is.na(.data[[group_col]]), .data[[group_col]] != "") %>%
+    group_by(.data[[roi_col]], .data[[group_col]]) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    group_by(.data[[roi_col]]) %>%
+    mutate(
+      total_cells = sum(n),
+      percent = 100 * n / total_cells
+    ) %>%
+    ungroup()
+
+  wide <- long %>%
+    transmute(
+      ROI_ID = .data[[roi_col]],
+      group  = .data[[group_col]],
+      percent
+    ) %>%
+    pivot_wider(
+      names_from  = group,
+      values_from = percent,
+      names_glue  = paste0(prefix, "{group}"),
+      values_fill = 0
+    )
+
+  list(long = long, wide = wide)
+}
+
+# ----------------------------------------------------------
+# 3) CD45 / Immune / PDL1
+# ----------------------------------------------------------
+cd45_obj   <- make_percent_wide(combined, "ROI_ID", "RB_CD45",   "CD45_")
+immune_obj <- make_percent_wide(combined, "ROI_ID", "RB_Immune", "immune_")
+pdl1_obj   <- make_percent_wide(combined, "ROI_ID", "RB_PDL1",   "PDL1_")
+
+cd45_wide   <- cd45_obj$wide
+immune_wide <- immune_obj$wide
+pdl1_wide   <- pdl1_obj$wide
+
+stopifnot(!any(duplicated(names(immune_wide))))
+stopifnot(!any(duplicated(names(cd45_wide))))
+stopifnot(!any(duplicated(names(pdl1_wide))))
+
+# ----------------------------------------------------------
+# 4) Cytokines (avoid divide-by-zero)
+# ----------------------------------------------------------
+cytokine_summary <- combined %>%
+  filter(RB_CD45 == "CD45+") %>%
+  group_by(ROI_ID) %>%
+  summarise(
+    total_CD45 = n(),
+
+    IFNG_pos  = sum(Nuc_IFNG_dots  >= 5, na.rm = TRUE),
+    CXCL9_pos = sum(Nuc_CXCL9_dots >= 5, na.rm = TRUE),
+    IL1B_pos  = sum(Nuc_IL1B_dots  >= 5, na.rm = TRUE),
+
+    IFNG_percent  = if_else(total_CD45 > 0, 100 * IFNG_pos  / total_CD45, NA_real_),
+    CXCL9_percent = if_else(total_CD45 > 0, 100 * CXCL9_pos / total_CD45, NA_real_),
+    IL1B_percent  = if_else(total_CD45 > 0, 100 * IL1B_pos  / total_CD45, NA_real_),
+
+    .groups = "drop"
+  )
+
+cytokine_wide <- cytokine_summary %>%
+  dplyr::select(ROI_ID, IFNG_percent, CXCL9_percent, IL1B_percent)
+
+# ----------------------------------------------------------
+# 5) ROI totals + CD45 counts
+# ----------------------------------------------------------
+roi_total <- combined %>%
+  group_by(ROI_ID) %>%
+  summarise(total_cells = n(), .groups = "drop")
+
+cd45_counts <- combined %>%
+  filter(RB_CD45 == "CD45+") %>%
+  group_by(ROI_ID) %>%
+  summarise(total_CD45 = n(), .groups = "drop")
+
+# ----------------------------------------------------------
+# 6) Distance table (trim ROI)
+# ----------------------------------------------------------
+distance <- read.csv("ROIs_immune_cells.csv",
+                     stringsAsFactors = FALSE)
+
+roi_distance <- distance %>%
+  dplyr::rename(ROI_ID = ROI) %>%
+  mutate(ROI_ID = str_trim(ROI_ID))
+
+# Diagnose which ROIs fail to join
+anti_join(roi_total, roi_distance, by = "ROI_ID")
+
+# ----------------------------------------------------------
+# 7) Final join (start from roi_total to keep ALL ROIs)
+# ----------------------------------------------------------
+roi_summary <- roi_total %>%
+  dplyr::left_join(cd45_counts,   by = "ROI_ID") %>%
+  dplyr::left_join(cd45_wide,     by = "ROI_ID") %>%
+  dplyr::left_join(immune_wide,   by = "ROI_ID") %>%
+  dplyr::left_join(pdl1_wide,     by = "ROI_ID") %>%
+  dplyr::left_join(cytokine_wide, by = "ROI_ID") %>%
+  dplyr::left_join(roi_distance,  by = "ROI_ID") %>%
+  dplyr::mutate(
+    total_CD45 = tidyr::replace_na(total_CD45, 0),
+    distance_um = as.numeric(.data[["Distance_nerve_um"]]),
+    distance_bin = dplyr::case_when(
+      distance_um <= 200 ~ "≤200 µm",
+      distance_um > 200 & distance_um < 700 ~ "200–699 µm",
+      distance_um >= 700 ~ "≥700 µm",
+      TRUE ~ NA_character_
+    ),
+    distance_bin = factor(distance_bin, levels = c("≤200 µm", "200–699 µm", "≥700 µm"))
+  )
+```
+
+```{r}
+# ----------------------------------------------------------
+# 0) ROI order: ROI1..ROI39
+# ----------------------------------------------------------
+roi_order <- roi_summary %>%
+  distinct(ROI_ID) %>%
+  mutate(roi_num = as.integer(str_remove(ROI_ID, "^ROI"))) %>%
+  arrange(roi_num) %>%
+  pull(ROI_ID)
+
+# ----------------------------------------------------------
+# 1) IMMUNE composition plots (with safe colors)
+# ----------------------------------------------------------
+immune_levels <- combined %>%
+  filter(!is.na(RB_Immune), RB_Immune != "") %>%
+  distinct(RB_Immune) %>%
+  pull(RB_Immune) %>%
+  sort()
+
+immune_cols <- paste0("immune_", immune_levels)
+immune_cols <- immune_cols[immune_cols %in% names(roi_summary)]
+
+immune_long <- roi_summary %>%
+  mutate(ROI_ID = factor(ROI_ID, levels = roi_order)) %>%
+  dplyr::select(ROI_ID, all_of(immune_cols)) %>%
+  pivot_longer(-ROI_ID, names_to = "RB_Immune", values_to = "percent") %>%
+  mutate(
+    RB_Immune = str_remove(RB_Immune, "^immune_"),
+    RB_Immune = factor(RB_Immune, levels = immune_levels)
+  )
+
+immune_palette <- make_safe_palette(levels(immune_long$RB_Immune), color_maping)
+
+p_immune_per_roi <- ggplot(immune_long, aes(x = ROI_ID, y = percent, fill = RB_Immune)) +
+  geom_col() +
+  scale_fill_manual(values = immune_palette, drop = FALSE) +
+  ylab("Percent of cells") + xlab("ROI") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+p_immune_per_roi
+
+immune_mean <- immune_long %>%
+  group_by(RB_Immune) %>%
+  summarise(mean_percent = mean(percent, na.rm = TRUE), .groups = "drop")
+
+p_immune_mean <- ggplot(immune_mean, aes(x = "Average_ROI", y = mean_percent, fill = RB_Immune)) +
+  geom_col() +
+  scale_fill_manual(values = immune_palette, drop = FALSE) +
+  ylab("Mean percent across ROIs") + xlab("") +
+  theme_minimal()
+
+p_immune_mean
+
+# ----------------------------------------------------------
+# 2) Marker plots (NOT stacked)
+# ----------------------------------------------------------
+marker_cols <- c("IFNG_percent", "CXCL9_percent", "IL1B_percent", "PDL1_CD45+PDL1+")
+marker_cols <- marker_cols[marker_cols %in% names(roi_summary)]
+
+marker_long <- roi_summary %>%
+  mutate(ROI_ID = factor(ROI_ID, levels = roi_order)) %>%
+  dplyr::select(ROI_ID, all_of(marker_cols)) %>%
+  pivot_longer(cols = -ROI_ID, names_to = "marker", values_to = "percent")
+
+p_markers_per_roi <- ggplot(marker_long, aes(x = ROI_ID, y = percent)) +
+  geom_col() +
+  facet_wrap(~ marker, scales = "free_y", ncol = 2) +
+  ylab("% (per ROI)") + xlab("ROI") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+p_markers_per_roi
+
+marker_mean <- marker_long %>%
+  group_by(marker) %>%
+  summarise(
+    mean_percent = mean(percent, na.rm = TRUE),
+    sd_percent   = sd(percent, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p_markers_mean <- ggplot(marker_mean, aes(x = marker, y = mean_percent)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = mean_percent - sd_percent,
+                    ymax = mean_percent + sd_percent),
+                width = 0.2) +
+  ylab("Mean % across ROIs (± SD)") + xlab("") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+p_markers_mean
+```
+
+```{r}
+# ----------------------------------------------------------
+# 3) Distance bin immune composition (stacked + facet)
+# ----------------------------------------------------------
+# Find distance column name
+grep("dist|Dist|um|mic|Distance", names(roi_summary), value = TRUE)
+
+dist_col <- "Distance_nerve_um"
+
+roi_binned <- roi_summary %>%
+  mutate(
+    distance_um = as.numeric(.data[[dist_col]]),
+    distance_bin = case_when(
+      distance_um <= 200 ~ "≤200 µm",
+      distance_um > 200 & distance_um <= 600 ~ "200–600 µm",
+      distance_um >= 700 ~ "≥700 µm",
+      TRUE ~ NA_character_
+    ),
+    distance_bin = factor(distance_bin, levels = c("≤200 µm", "200–600 µm", "≥700 µm"))
+  ) %>%
+  filter(!is.na(distance_bin))
+
+roi_binned %>% dplyr::count(distance_bin)
+
+immune_long_bin <- roi_binned %>%
+  dplyr::select(ROI_ID, distance_bin, all_of(immune_cols)) %>%
+  pivot_longer(cols = all_of(immune_cols), names_to = "RB_Immune", values_to = "percent") %>%
+  mutate(
+    RB_Immune = str_remove(RB_Immune, "^immune_"),
+    RB_Immune = factor(RB_Immune, levels = immune_levels)
+  )
+
+immune_bin_mean <- immune_long_bin %>%
+  dplyr::group_by(distance_bin, RB_Immune) %>%
+  summarise(
+    mean_percent = mean(percent, na.rm = TRUE),
+    sd_percent   = sd(percent, na.rm = TRUE),
+    n_roi        = n_distinct(ROI_ID),
+    .groups = "drop"
+  )
+
+p_bin_stacked <- ggplot(
+  immune_bin_mean,
+  aes(x = distance_bin, y = mean_percent, fill = RB_Immune)
+) +
+
+  geom_col() +
+
+  scale_fill_manual(values = immune_palette, drop = FALSE) +
+
+  ylab("Mean % across ROIs") +
+  xlab("Distance bin") +
+
+  theme_classic(base_size = 14) +
+
+  theme(
+    panel.grid.major.y = element_line(color = "grey85", linewidth = 0.4),
+    panel.grid.minor.y = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+p_bin_stacked
+
+p_bin_facet <- ggplot(immune_bin_mean, aes(x = distance_bin, y = mean_percent)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = mean_percent - sd_percent, ymax = mean_percent + sd_percent), width = 0.2) +
+  facet_wrap(~RB_Immune, scales = "free_y", ncol = 3) +
+  ylab("Mean % across ROIs (±SD)") + xlab("Distance bin") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_bin_facet
+
+ggsave("immune_mean_by_distancebin_stacked.pdf", p_bin_stacked, width = 7, height = 4)
+ggsave("immune_mean_by_distancebin_facet.pdf",   p_bin_facet,   width = 12, height = 8)
+```
+
+```{r}
+# ----------------------------------------------------------
+# 4) Correlation analysis (Spearman)
+# ----------------------------------------------------------
+markers <- c("IFNG_percent", "CXCL9_percent", "IL1B_percent", "PDL1_CD45+PDL1+")
+markers <- markers[markers %in% names(roi_summary)]
+
+cor_results <- lapply(markers, function(m) {
+
+  df <- roi_summary %>%
+    dplyr::select(distance = all_of(dist_col), value = all_of(m)) %>%
+    mutate(distance = as.numeric(distance)) %>%
+    filter(!is.na(distance), !is.na(value))
+
+  test <- cor.test(df$distance, df$value, method = "spearman")
+
+  data.frame(
+    marker = m,
+    rho = unname(test$estimate),
+    p_value = test$p.value,
+    n = nrow(df)
+  )
+})
+
+cor_results <- bind_rows(cor_results)
+cor_results
+
+# Scatter + stat_cor
+marker_long_corr <- roi_summary %>%
+  dplyr::select(ROI_ID, distance = all_of(dist_col), all_of(markers)) %>%
+  mutate(distance = as.numeric(distance)) %>%
+  pivot_longer(cols = all_of(markers), names_to = "marker", values_to = "percent") %>%
+  filter(!is.na(percent), !is.na(distance))
+
+p_corr <- ggplot(marker_long_corr, aes(x = distance, y = percent)) +
+  geom_point(size = 2.8, alpha = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.8, color = "black") +
+  stat_cor(method = "spearman",
+           label.x.npc = "left",
+           label.y.npc = "top",
+           size = 4) +
+  facet_wrap(~marker, scales = "free_y", ncol = 2) +
+  labs(x = "Distance to nerve (µm)",
+       y = "% positive cells per ROI") +
+  theme_classic(base_size = 14) +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face = "bold"),
+        axis.text = element_text(color = "black"))
+
+p_corr
+```
+
+
+```{r}
+# ----------------------------------------------------------
+# Cytokine / checkpoint markers across distance bins
+# ----------------------------------------------------------
+
+markers <- c(
+  "IFNG_percent",
+  "CXCL9_percent",
+  "IL1B_percent",
+  "PDL1_CD45+PDL1+"
+)
+
+markers <- markers[markers %in% names(roi_summary)]
+
+marker_bin_long <- roi_summary %>%
+  dplyr::select(ROI_ID, distance_bin, all_of(markers)) %>%
+  pivot_longer(
+    cols = all_of(markers),
+    names_to = "marker",
+    values_to = "percent"
+  ) %>%
+  filter(!is.na(distance_bin), !is.na(percent))
+
+# ------------------------------------------
+# Mean + SD per bin
+# ------------------------------------------
+
+marker_bin_summary <- marker_bin_long %>%
+  group_by(marker, distance_bin) %>%
+  summarise(
+    mean_percent = mean(percent, na.rm = TRUE),
+    sd_percent = sd(percent, na.rm = TRUE),
+    n_roi = n_distinct(ROI_ID),
+    .groups = "drop"
+  )
+
+# ------------------------------------------
+# Plot mean ± SD
+# ------------------------------------------
+
+p_marker_bins <- ggplot(
+  marker_bin_summary,
+  aes(x = distance_bin, y = mean_percent)
+) +
+  geom_col(fill = "steelblue") +
+  geom_errorbar(
+    aes(
+      ymin = mean_percent - sd_percent,
+      ymax = mean_percent + sd_percent
+    ),
+    width = 0.2
+  ) +
+  facet_wrap(~marker, scales = "free_y", ncol = 2) +
+  xlab("Distance to nerve") +
+  ylab("Mean % positive cells per ROI (± SD)") +
+  theme_classic(base_size = 14) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    axis.text = element_text(color = "black")
+  )
+
+p_marker_bins
+
+# ----------------------------------------------------------
+# Cytokine / checkpoint markers across distance bins
+# (boxplot + ROI points)
+# ----------------------------------------------------------
+
+# ----------------------------------------------------------
+# Cytokine / checkpoint markers across distance bins
+# (boxplot + ROI points)
+# ----------------------------------------------------------
+
+markers <- c(
+  "IFNG_percent",
+  "CXCL9_percent",
+  "IL1B_percent",
+  "PDL1_CD45+PDL1+"
+)
+
+markers <- markers[markers %in% names(roi_summary)]
+
+marker_bin_long <- roi_summary %>%
+  dplyr::select(ROI_ID, distance_bin, all_of(markers)) %>%
+  pivot_longer(
+    cols = all_of(markers),
+    names_to = "marker",
+    values_to = "percent"
+  ) %>%
+  filter(!is.na(distance_bin), !is.na(percent))
+
+p_marker_bins2 <- ggplot(
+  marker_bin_long,
+  aes(x = distance_bin, y = percent)
+) +
+
+  geom_boxplot(
+    width = 0.55,
+    outlier.shape = NA,
+    fill = "grey85",
+    color = "black"
+  ) +
+
+  geom_jitter(
+    width = 0.15,
+    size = 2.6,
+    alpha = 0.85
+  ) +
+
+  facet_wrap(~marker, scales = "free_y", ncol = 2) +
+
+  labs(
+    x = "Distance to nerve",
+    y = "% positive cells per ROI"
+  ) +
+
+  theme_classic(base_size = 14) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    axis.text = element_text(color = "black")
+  )
+
+p_marker_bins2
+ggsave("inflammatory_millieu_bins.pdf",   p_marker_bins2,   width = 12, height = 8)
+```
+
+
+```{r}
+# ----------------------------------------------------------
+# 5) Kruskal tests by distance bin + Dunn posthoc
+# ----------------------------------------------------------
+roi_summary <- roi_summary %>%
+  mutate(
+    distance_um = as.numeric(.data[[dist_col]]),
+    distance_bin = case_when(
+      distance_um <= 200 ~ "≤200 µm",
+      distance_um > 200 & distance_um <= 600 ~ "200–600 µm",
+      distance_um >= 700 ~ "≥700 µm",
+      TRUE ~ NA_character_
+    ),
+    distance_bin = factor(distance_bin, levels = c("≤200 µm", "200–600 µm", "≥700 µm"))
+  )
+
+kw_results <- lapply(markers, function(m) {
+
+  df <- roi_summary %>%
+    dplyr::select(distance_bin, value = all_of(m)) %>%
+    filter(!is.na(distance_bin), !is.na(value))
+
+  test <- kruskal.test(value ~ distance_bin, data = df)
+
+  data.frame(
+    marker = m,
+    statistic = unname(test$statistic),
+    p_value = test$p.value,
+    n = nrow(df)
+  )
+})
+
+kw_results <- bind_rows(kw_results)
+kw_results
+
+# Save Kruskal-Wallis results
+readr::write_csv(
+  kw_results,
+  "kruskal_distance_bin_results.csv"
+)
+
+# Dunn tests (BH correction) for each marker
+dunn_results <- lapply(markers, function(m) {
+  df <- roi_summary %>%
+    dplyr::select(distance_bin, value = all_of(m)) %>%
+    filter(!is.na(distance_bin), !is.na(value))
+
+  out <- FSA::dunnTest(value ~ distance_bin, data = df, method = "bh")$res
+  out$marker <- m
+  out
+})
+
+dunn_results <- bind_rows(dunn_results)
+dunn_results
+
+# Save Dunn posthoc results
+readr::write_csv(
+  dunn_results,
+  "dunn_distance_bin_posthoc_results.csv"
+)
+
+```
+
+```{r}
+
+# ----------------------------------------------------------
+# 6) Save main plots
+# ----------------------------------------------------------
+ggsave("immune_composition_per_ROI.pdf", p_immune_per_roi, width = 12, height = 6)
+ggsave("immune_composition_mean_across_ROIs.pdf", p_immune_mean, width = 6, height = 4)
+
+ggsave("per_ROI_marker_percentages.pdf", p_markers_per_roi, width = 12, height = 6)
+ggsave("mean_marker_percentages_across_ROIs.pdf", p_markers_mean, width = 7, height = 4)
+
+ggsave("marker_distance_correlations.pdf", p_corr, width = 10, height = 6)
+```
+
+```{r}
+# ----------------------------------------------------------
+# 7) Report which immune labels used fallback colors
+# ----------------------------------------------------------
+fallback_used <- setdiff(levels(immune_long$RB_Immune), names(color_maping))
+if (length(fallback_used) > 0) {
+  message("No color in color_maping for: ", paste(fallback_used, collapse = ", "))
+  message("Assigned fallback colors automatically (hcl.colors Dark 3).")
+} else {
+  message("All immune categories have a defined color in color_maping.")
+}
+```

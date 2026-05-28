@@ -1,0 +1,250 @@
+#Plasma cell representation
+We notices some differences in the plasma cell composition between nerves, so we wanted to further investigate that. 
+```{r}
+library(ggplot2)
+library(patchwork)
+library(SpatialExperiment)
+library(tidyr)
+library(tidyverse)
+library(purrr)
+library(grid)
+theme_set(theme_minimal(base_size=14))
+c25 <- c(
+  "dodgerblue2", "#E31A1C", # red
+"green4",
+"#6A3D9A", # purple
+"#FF7F00", # orange
+"black", "gold1",
+"skyblue2", "#FB9A99", # lt pink
+"palegreen2",
+"#CAB2D6", # lt purple
+"#FDBF6F", # lt orange
+"gray70", "khaki2",
+"maroon", "orchid1", "deeppink1", "blue1", "steelblue4",
+"darkturquoise", "green1", "yellow4", "yellow3",
+"darkorange4", "brown"
+)
+
+spe <- readRDS("../data/SPE/Integrated_NMF.rds")
+colData(spe) <- DataFrame(read.csv("../data/coldata/DE_SPE_annotaion.csv"))
+colnames(spe) <- spe$barcode
+
+W_df<- readRDS("../data/Deconvolution/RCTD_weights.Rds")
+
+```
+
+```{r}
+plasma_cells <- data.frame(Status = ifelse(W_nerve$'B_cells_(Plasma cells)' >
+                                             mean(W_nerve$'B_cells_(Plasma cells)',  na.rm = TRUE), "Plasma_High", "Plasma_Low"), row.names = row.names(W_nerve))
+
+plasma_map <- setNames(plasma_cells$Status, row.names(plasma_cells))
+spe$plasma <- recode(spe$barcode, !!!plasma_map, .default = NA_character_)
+
+spe$plasma <- paste(spe$Invaded, spe$plasma, sep = "_")
+```
+
+
+```{r}
+p <- ggcells(spe, aes(x=array_col, y=-array_row, color = plasma)) +
+  geom_point(size=0.8) +
+  facet_wrap(~sample_id,
+             labeller = as_labeller(c(
+               "70865bl15_highPNI" = "Patient 3 - Diseased",
+               "6249bl18_noPNIandhighPNI" = "Patient 2 - Diseased",
+               "70865bl5_noPNI" = "Patient 3 - Adjacent",
+               "54703bl38_noPNI" = "Patient 1 - Adjacent",
+               "54703bl28_highPNI" = "Patient 1 - Diseased",
+               "6249bl23_noPNI" = "Patient 2 - Adjacent"
+             ))) +
+  scale_color_manual(
+    name = "Type",
+    values = c(c25[18], c25[1], "grey90", c25[2], c25[5]), labels = c(
+    "NA_NA" = "Other",
+    "NonInvaded_Plasma_Low" = "Non-invaded - Plasma Low",
+    "NonInvaded_Plasma_High" = "Non-invaded - Plasma High",
+    "Invaded_Plasma_High" = "Invaded - Plasma High",
+    "Invaded_Plasma_Low" = "Invaded - Plasma Low"
+  )) +
+  theme_void() +
+  theme(legend.position ="right")
+ggsave("../figures/plasma_cells_spatial.pdf", p, width = 18, height = 12)
+p
+```
+
+```{r}
+df_spots <- as.data.frame(colData(spe)) %>%
+  mutate(
+    barcode = colnames(spe),
+    x = array_col,
+    y = -array_row
+  ) %>%
+  left_join(
+    W_df %>% transmute(barcode, plasma_weight_rctd = `B_cells(Plasma cells)`),
+    by = "barcode"
+  )
+
+stopifnot("plasma_weight_rctd" %in% names(df_spots))
+summary(df_spots$plasma_weight_rctd)
+```
+
+```{r}
+# =========================
+# Plasma weight + nerve hulls (control panel)
+# =========================
+
+library(dplyr)
+library(ggplot2)
+
+# ---- CONTROL PANEL ----
+plot_cfg <- list(
+  # IMPORTANT: must match df_spots$sample_label values (yours are P1-Adjacent etc.)
+  sample_order = c(
+    "P1-Adjacent",
+    "P2-Adjacent",
+    "P3-Adjacent",
+    "P1-Diseased",
+    "P2-Diseased",
+    "P3-Diseased"
+  ),
+
+  # points
+  point_size = 0.4,
+
+  # hull styling
+  halo_color = "white",
+  halo_lwd   = 0.3,
+  hull_lwd   = 0.7,
+  hull_color_invaded    = "#E31A1C",
+  hull_color_noninvaded = "skyblue2",
+
+  # plasma scaling
+  use_clipping = TRUE,
+  clip_q = c(0.01, 0.99),
+  viridis_option = "A",
+  na_color = "grey85",
+
+  coord_fixed = TRUE
+)
+
+# ---- BUILD df_spots (NO CHANGES TO spe) ----
+df_spots <- as.data.frame(colData(spe)) %>%
+  mutate(
+    barcode = colnames(spe),
+    x = array_col,
+    y = -array_row
+  ) %>%
+  left_join(
+    W_df %>% transmute(barcode, plasma_weight_rctd = `B_cells(Plasma cells)`),
+    by = "barcode"
+  )
+
+# sanity: make sure we have values
+stopifnot("plasma_weight_rctd" %in% names(df_spots))
+
+# ---- helper: convex hull per nerve per sample ----
+make_hulls <- function(dat) {
+  dat %>%
+    group_by(sample_label, NerveID) %>%
+    filter(n() >= 3) %>%
+    slice(chull(x, y)) %>%
+    ungroup() %>%
+    mutate(group_id = interaction(sample_label, NerveID, drop = TRUE))
+}
+
+# ---- plot function obeying control panel ----
+plot_plasma_hulls <- function(df_spots, cfg) {
+  df <- df_spots
+
+  # SAFE sample ordering: keep any samples not listed (append to end)
+  present <- unique(df$sample_label)
+  extra <- setdiff(present, cfg$sample_order)
+  df$sample_label <- factor(df$sample_label, levels = c(cfg$sample_order, extra))
+
+  # plasma scaling (optional clipping)
+  if (isTRUE(cfg$use_clipping)) {
+    q <- quantile(df$plasma_weight_rctd, probs = cfg$clip_q, na.rm = TRUE)
+    df$plasma_for_plot <- pmin(pmax(df$plasma_weight_rctd, q[1]), q[2])
+  } else {
+    df$plasma_for_plot <- df$plasma_weight_rctd
+  }
+
+  # nerve spots only for hulls
+  df_nerve <- df %>%
+    filter(!is.na(NerveID), !is.na(sample_label), !is.na(InvadedNerve), !is.na(x), !is.na(y))
+
+  hulls_inv <- df_nerve %>%
+    filter(InvadedNerve %in% TRUE) %>%
+    make_hulls()
+
+  hulls_non <- df_nerve %>%
+    filter(InvadedNerve %in% FALSE) %>%
+    make_hulls()
+  p <- ggplot(df, aes(x = x, y = y)) +
+    geom_point(aes(color = plasma_for_plot), size = cfg$point_size) +
+    scale_color_viridis_c(
+      name = "Plasma cell weight (RCTD)",
+      option = cfg$viridis_option,
+      na.value = cfg$na_color
+    ) +
+
+    # ---- halo (no legend) ----
+    geom_polygon(
+      data = hulls_non,
+      inherit.aes = FALSE,
+      aes(x = x, y = y, group = group_id),
+      fill = NA,
+      linewidth = cfg$halo_lwd,
+      color = cfg$halo_color
+    ) +
+    geom_polygon(
+      data = hulls_inv,
+      inherit.aes = FALSE,
+      aes(x = x, y = y, group = group_id),
+      fill = NA,
+      linewidth = cfg$halo_lwd,
+      color = cfg$halo_color
+    ) +
+
+    # ---- outlines WITH legend via linetype ----
+    geom_polygon(
+      data = hulls_non,
+      inherit.aes = FALSE,
+      aes(x = x, y = y, group = group_id, linetype = "Uninvaded"),
+      fill = NA,
+      linewidth = cfg$hull_lwd,
+      color = cfg$hull_color_noninvaded
+    ) +
+    geom_polygon(
+      data = hulls_inv,
+      inherit.aes = FALSE,
+      aes(x = x, y = y, group = group_id, linetype = "Invaded"),
+      fill = NA,
+      linewidth = cfg$hull_lwd,
+      color = cfg$hull_color_invaded
+    ) +
+
+    scale_linetype_manual(
+      name = "Nerve border",
+      values = c(
+        "Uninvaded" = "solid",
+        "Invaded" = "solid"
+      )
+    ) +
+
+    facet_wrap(~sample_label, drop = FALSE) +
+    theme_void()
+  
+}
+
+# ---- run ----
+p <- plot_plasma_hulls(df_spots, plot_cfg)
+p
+
+
+
+```
+
+
+```{r}
+ggsave("../figures/plasma_weight_rctd_spatial_with_nerve_borders.pdf", p, width = 15, height = 10, dpi= 1200)
+```

@@ -1,0 +1,136 @@
+## This is the code prepared for the computational and spatial analysis part of the paper
+This part of the script includes the quality control and filtering of the data. 
+
+#Samples
+We have got 6 samples in total. Always a pair of two samples from the same patient. The blocks were classified as either high_PNI, no_PNI or noandhigh_PNI. For each of these we retained all spots on the slide (14336 per sample).
+
+```{r}
+library(patchwork)
+library(SpatialExperiment)
+library(scuttle)
+library(scran)
+library(scater)
+library(ggplot2)
+library(ggspavis)
+theme_set(theme_minimal(base_size=14))
+
+source("../scripts/general_functions.R")
+# Load Data
+spe <- readRDS("../data/SPE/PNI_SPE.rds")
+# Shuffle for plotting
+set.seed(42)
+spe <- spe[,sample(1:ncol(spe),ncol(spe))]
+# Some Formatting
+rownames(spe) <- uniquifyFeatureNames(rownames(spe), rowData(spe)$symbol)
+spe$patient_id <- unlist(lapply(strsplit(spe$sample_id,"bl"), function(X) X[[1]]))
+spe$type <- unlist(lapply(strsplit(spe$sample_id,"_"), function(X) X[[2]]))
+# Calculate QC
+mtgen <- grepl("^MT-",rownames(spe))
+hbbgn <- grepl("^HBB$",rownames(spe))
+spe <- addPerCellQC(spe,subsets=list("Mito"=mtgen,"HBB"=hbbgn))
+table("Patient" = spe$patient_id, "Type" = spe$type)
+```
+# Spots in tissue
+```{r}
+spe$in_tissue <- factor(spe$in_tissue)
+levels(spe$in_tissue) <- c("no","yes")
+# The areas specified below are actually fatty tissue (verified by H&E images)
+spe$in_tissue[spe$sample_id=="54703bl28_highPNI" & spe$array_row > 100] <- "yes"
+spe$in_tissue[spe$sample_id=="54703bl28_highPNI" & spe$array_col < 100] <- "yes"
+spe$in_tissue[spe$sample_id=="6249bl18_noPNIandhighPNI" & spe$array_row > 95] <- "yes"
+spe$in_tissue[spe$sample_id=="6249bl18_noPNIandhighPNI" & spe$array_row < 38] <- "yes"
+spe$in_tissue[spe$sample_id=="6249bl23_noPNI" & spe$array_row > 90 & spe$array_col > 130] <- "yes"
+
+# Quality control visualization 
+plotVisium(spe[,spe$in_tissue=="yes"], y_coord='pxl_row_in_fullres', x_coord='pxl_col_in_fullres', spots=TRUE, image=FALSE)
+```
+
+# Transcriptomics quality control 
+We need to validate the UMI and gene count of our data: 
+```{r}
+spe$sample_label <- factor(spe$sample_id,
+                        levels = c("70865bl15_highPNI", "6249bl18_noPNIandhighPNI", "70865bl5_noPNI","54703bl38_noPNI","54703bl28_highPNI",  "6249bl23_noPNI"),
+                        labels = c("P3-Diseased", "P2-Diseased", "P3-Adjacent","P1-Adjacent","P1-Diseased", "P2-Adjacent"))
+p0 <- ggcells(spe, aes(x=sample_label,y=sum,fill=in_tissue)) +
+    geom_violin(draw_quantiles=0.75,scale="width") +
+    ylab("UMIs") +
+    scale_y_log10() +
+    theme(legend.position="none")
+    
+p1 <- ggcells(spe, aes(x=sample_label,y=detected,fill=in_tissue)) +
+    geom_violin(draw_quantiles=0.75,scale="width") +
+    ylab("Number of Genes") +
+    theme(legend.position="bottom", axis.text.x = element_text(angle = 45, hjust = 1))
+
+p2 <- ggcells(spe, aes(x=sum,y=detected,color=patient_id)) +
+    geom_point(size=0.1,alpha=.3) +
+    scale_x_log10() +
+    scale_y_log10() +
+    ylab("Number of Genes detected") +
+    xlab("UMIs") +
+    theme(legend.position="none") +
+    facet_wrap(~in_tissue)
+
+ptch <- (p0) / (p1 + p2)
+ptch + plot_annotation(title="Quality Overview of ST")
+ggsave("../figures/F1_A_1.pdf", ptch, width = 12, height = 8, dpi = 300)
+```
+**Definition of low quality**
+We use the standard definition of 3 MADs away from the median (log space) only considering the spots within the tissue. We do this for both genes detected and UMI counts.
+```{r}
+sumqcpass <- !(isOutlier(spe$sum, subset=spe$in_tissue=="yes", log=TRUE, nmads=3, batch=spe$sample_id, type="lower"))
+gdqcpass <- spe$detected > 500 
+spe$QCPass <- sumqcpass & gdqcpass 
+# Quality control visualization 
+plotVisium(spe[,spe$in_tissue=="yes"], y_coord='pxl_row_in_fullres', x_coord='pxl_col_in_fullres', spots=TRUE, image=FALSE,fill="QCPass")
+```
+**Mitochondrial Fraction**
+We want to check the Mitochondrial fraction for further filtering. The only ones with high fractions are the ones that have very few counts, primarily from the one sample with a lot of adipose tissue. Therefore, we do not need to filter further. 
+
+```{r}
+p0 <- ggcells(spe, aes(x=sample_id,y=subsets_Mito_percent,fill=in_tissue)) +
+  geom_violin(draw_quantiles=0.5,scale="width") +
+  geom_jitter(size=.2,alpha=0.1) +
+  ylab("[%] Mitochondrial") +
+  theme(legend.position="none")
+p1 <- ggcells(spe, aes(x=sum,y=subsets_Mito_percent,color=in_tissue)) +
+  geom_point(size=0.2,alpha=.4) +
+  scale_x_log10() +
+  xlab("UMIs") +
+  ylab("[%] Mitochondrial") +
+  theme(legend.position="none")
+p0 + p1
+```
+**Hemoglobin**
+We also checked spots that have primarily hemoglobin.
+```{r}
+p0 <- ggcells(spe, aes(x=sample_id,y=subsets_HBB_percent,fill=in_tissue)) +
+  geom_violin(draw_quantiles=0.5,scale="width") +
+  geom_jitter(size=.2,alpha=0.1) +
+  ylab("[%] HBB") +
+  theme(legend.position="none")
+p1 <- ggcells(spe, aes(x=sum,y=subsets_HBB_percent,color=in_tissue)) +
+  geom_point(size=0.2,alpha=.4) +
+  scale_x_log10() +
+  xlab("UMIs") +
+  ylab("[%] HBB") +
+  theme(legend.position="none")
+p0 + p1
+```
+
+#Gene Filtering
+We only remove genes with less than 100 counts across the entire dataset.
+```{r}
+rm <- rowSums(counts(spe)) < 100
+spe <- spe[!rm,]
+```
+
+**Normalization and Save**
+We keep only QC Pass spots and spots in the tissue, lib size normalize and save.
+```{r}
+spe <- spe[,spe$QCPass & spe$in_tissue=="yes"]
+spe <- logNormCounts(spe)
+saveRDS(spe,"../data/SPE/PNI_SPE_QC.rds")
+```
+
+

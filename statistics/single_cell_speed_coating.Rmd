@@ -1,0 +1,453 @@
+This code generates a summary file with median speeds from the orginal tracked cells, one median speed per well
+````{r}
+# ==== CONFIG ====
+root_dir <- "../../../../../Alumni/Maria/Thesis/experiments/attachment/data/2026_02_04_random_migration/20260204/output/TrackMate_2026-04-04/TrackMate_2026-04-04/"   # <- change this to your main folder
+out_xlsx <- file.path(root_dir, "median_track_speed_summary.xlsx")
+out_csv  <- file.path(root_dir, "median_summary_all.csv")
+
+# =======================
+# PACKAGES
+# =======================
+
+library(readr)
+library(dplyr)
+library(stringr)
+library(openxlsx)
+
+# =======================
+# HELPERS
+# =======================
+
+# Extract well like B02 from filenames like ECM_B02_C2_T1-13_tracks(.csv)
+extract_well_B02 <- function(path) {
+  base <- tools::file_path_sans_ext(basename(path))
+  m <- str_match(base, "(?i)(?:^|[^A-Za-z0-9])([A-H][0-9]{2})(?:[^A-Za-z0-9]|$)")
+  if (is.na(m[1, 2])) return(NA_character_)
+  toupper(m[1, 2])
+}
+
+# Detect delimiter by looking at the header line
+detect_delim <- function(path) {
+  header <- readLines(path, n = 1, warn = FALSE)
+  header <- sub("^\ufeff", "", header)  # remove BOM if present
+  counts <- c(
+    comma = str_count(header, ","),
+    semicolon = str_count(header, ";"),
+    tab = str_count(header, "\t")
+  )
+  if (all(counts == 0)) return(",")
+  if (which.max(counts) == 1) return(",")
+  if (which.max(counts) == 2) return(";")
+  "\t"
+}
+
+# Read TrackMate CSV robustly
+read_trackmate <- function(path) {
+  delim <- detect_delim(path)
+  read_delim(
+    file = path,
+    delim = delim,
+    col_names = TRUE,
+    show_col_types = FALSE,
+    progress = FALSE,
+    trim_ws = TRUE
+  )
+}
+
+# =======================
+# MAIN
+# =======================
+
+# Read ALL csv files recursively from root_dir and subfolders
+csvs <- list.files(
+  root_dir,
+  pattern = "\\.csv$",
+  recursive = TRUE,
+  full.names = TRUE,
+  ignore.case = TRUE
+)
+
+if (length(csvs) == 0) {
+  stop("No CSV files found under root_dir (check path and extensions).")
+}
+
+results <- lapply(csvs, function(f) {
+  well <- extract_well_B02(f)
+
+  df <- tryCatch(read_trackmate(f), error = function(e) NULL)
+  if (is.null(df)) {
+    return(data.frame(
+      Folder = basename(dirname(f)),
+      Well = well,
+      MedianSpeed = NA_real_,
+      File = basename(f),
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  if (!("TRACK_MEDIAN_SPEED" %in% names(df))) {
+    return(data.frame(
+      Folder = basename(dirname(f)),
+      Well = well,
+      MedianSpeed = NA_real_,
+      File = basename(f),
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  # Each CSV = one well; calculate one median value per file
+  x <- suppressWarnings(as.numeric(df$TRACK_MEDIAN_SPEED))
+  med <- median(x, na.rm = TRUE)
+  if (is.infinite(med)) med <- NA_real_
+
+  data.frame(
+    Folder = basename(dirname(f)),
+    Well = well,
+    MedianSpeed = med,
+    File = basename(f),
+    stringsAsFactors = FALSE
+  )
+})
+
+df_all <- bind_rows(results) %>%
+  arrange(Well, File)
+
+# Write CSV
+write.csv(df_all, out_csv, row.names = FALSE)
+
+# Write Excel
+wb <- createWorkbook()
+addWorksheet(wb, "summary")
+writeData(wb, "summary", df_all)
+saveWorkbook(wb, out_xlsx, overwrite = TRUE)
+
+message("Done.")
+message("CSV written to: ", out_csv)
+message("XLSX written to: ", out_xlsx)
+```
+
+This code plots median speeds/well per condition
+```{r}
+# =======================
+# LIBRARIES
+# =======================
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+
+# =======================
+# READ DATA
+# =======================
+file <- "input_files/median_summary_all.csv"
+
+df_all <- read_csv(file, show_col_types = FALSE) %>%
+  mutate(
+    Speed_um_h = as.numeric(Speed_um_h),
+    Draxin_nM   = as.numeric(Draxin_nM),
+    Coating     = str_trim(as.character(Coating)),
+    Coating     = factor(Coating)
+  )
+
+# =======================
+# OUTPUT DIR
+# =======================
+out_dir <- "output/single_cell"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# =======================
+# FACTOR LEVELS
+# =======================
+coating_levels <- c("Ctrl", "ECM", "Fibronectin", "PolyD", "17nM", "140nM")
+draxin_levels  <- c(0, 17, 140)
+
+# =======================
+# COMMON Y-AXIS RANGE
+# =======================
+df_used <- df_all %>%
+  filter(Coating %in% coating_levels, Draxin_nM %in% draxin_levels)
+
+ylims <- range(df_used$Speed_um_h, na.rm = TRUE)
+pad <- 0.05 * diff(ylims)
+ylims <- c(ylims[1] - pad, ylims[2] + pad)
+
+# =======================
+# PLOT 1:
+# Coating effect at Draxin = 0
+# =======================
+p1 <- df_all %>%
+  filter(Draxin_nM == 0, Coating %in% coating_levels) %>%
+  mutate(Coating = factor(Coating, levels = coating_levels)) %>%
+  ggplot(aes(x = Coating, y = Speed_um_h)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.15), alpha = 0.7) +
+  coord_cartesian(ylim = ylims) +
+  labs(
+    title = "Median speed by coating (Draxin = 0 nM)",
+    x = "Coating",
+    y = "Median track speed"
+  ) +
+  theme_classic()
+
+print(p1)
+ggsave(
+  file.path(out_dir, "plot1_coating_effect_draxin0.png"),
+  p1, width = 8, height = 4.5, dpi = 300
+)
+
+# =======================
+# PLOT 2A:
+# Draxin effect on Ctrl only
+# =======================
+p2a <- df_all %>%
+  filter(Coating == "Ctrl", Draxin_nM %in% draxin_levels) %>%
+  mutate(Draxin_nM = factor(Draxin_nM, levels = draxin_levels)) %>%
+  ggplot(aes(x = Draxin_nM, y = Speed_um_h)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.15), alpha = 0.7) +
+  coord_cartesian(ylim = ylims) +
+  labs(
+    title = "Draxin effect on median speed (Ctrl coating)",
+    x = "Draxin (nM)",
+    y = "Median track speed"
+  ) +
+  theme_classic()
+
+print(p2a)
+ggsave(
+  file.path(out_dir, "plot2a_draxin_effect_ctrl.png"),
+  p2a, width = 6.5, height = 4.5, dpi = 300
+)
+
+# =======================
+# PLOT 2B:
+# Draxin effect within each coating
+# =======================
+p2b <- df_all %>%
+  filter(Coating %in% coating_levels, Draxin_nM %in% draxin_levels) %>%
+  mutate(
+    Coating   = factor(Coating, levels = coating_levels),
+    Draxin_nM = factor(Draxin_nM, levels = draxin_levels)
+  ) %>%
+  ggplot(aes(x = Draxin_nM, y = Speed_um_h)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.15), alpha = 0.6) +
+  facet_wrap(~ Coating, nrow = 2) +
+  coord_cartesian(ylim = ylims) +
+  labs(
+    title = "Draxin × coating",
+    x = "Draxin (nM)",
+    y = "Median track speed"
+  ) +
+  theme_classic()
+
+print(p2b)
+ggsave(
+  file.path(out_dir, "plot2b_rescue_facet_by_coating.png"),
+  p2b, width = 10, height = 6, dpi = 300
+)
+```
+
+This code calculates stats
+```{r}
+# =======================
+# LIBRARIES
+# =======================
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(car)
+library(emmeans)
+library(stringr)
+
+# =======================
+# HELPERS
+# =======================
+eta2_from_anova <- function(aov_tab) {
+  ss <- aov_tab[["Sum Sq"]]
+  terms <- rownames(aov_tab)
+  total_ss <- sum(ss, na.rm = TRUE)
+  ss_res <- ss[length(ss)]  # residuals last
+
+  data.frame(
+    Term = terms,
+    SS = ss,
+    Eta2 = ss / total_ss,
+    Partial_Eta2 = ss / (ss + ss_res)
+  )
+}
+
+# =======================
+# READ DATA
+# =======================
+file <- "input_files/median_summary_all.csv"
+
+df_all <- read_csv(file, show_col_types = FALSE) %>%
+  mutate(
+    Speed_um_h = as.numeric(Speed_um_h),
+    Draxin_nM  = as.numeric(Draxin_nM),
+    Coating    = str_trim(as.character(Coating)),
+    Coating    = factor(Coating)
+  )
+
+out_dir <- "output/single_cell/"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+coating_levels <- c("Ctrl", "ECM", "Fibronectin", "PolyD", "17nM", "140nM")
+draxin_levels  <- c(0, 17, 140)
+
+# =======================
+# TEST 1:
+# Coating effect at Draxin = 0
+# only each coating vs Ctrl
+# =======================
+d1 <- df_all %>%
+  filter(Draxin_nM == 0, Coating %in% coating_levels) %>%
+  mutate(
+    Coating = factor(Coating, levels = coating_levels)
+  ) %>%
+  filter(!is.na(Speed_um_h))
+
+m1 <- lm(Speed_um_h ~ Coating, data = d1)
+
+sh1 <- shapiro.test(resid(m1))
+lv1 <- car::leveneTest(Speed_um_h ~ Coating, data = d1)
+
+a1  <- anova(m1)
+es1 <- eta2_from_anova(a1)
+
+emm1 <- emmeans(m1, ~ Coating)
+ph1  <- contrast(emm1, method = "trt.vs.ctrl", ref = "Ctrl", adjust = "dunnett")
+
+write.csv(
+  data.frame(
+    statistic = unname(sh1$statistic),
+    p.value = sh1$p.value,
+    method = sh1$method
+  ),
+  file.path(out_dir, "test1_residual_shapiro.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(lv1),
+  file.path(out_dir, "test1_levene.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(a1),
+  file.path(out_dir, "test1_coating_ANOVA.csv"),
+  row.names = TRUE
+)
+
+write.csv(
+  es1,
+  file.path(out_dir, "test1_coating_effectsizes_eta2.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(ph1),
+  file.path(out_dir, "test1_coating_vs_ctrl.csv"),
+  row.names = FALSE
+)
+
+# =======================
+# TEST 2:
+# Draxin + Coating + Interaction
+# =======================
+d2 <- df_all %>%
+  filter(Draxin_nM %in% draxin_levels, Coating %in% coating_levels) %>%
+  mutate(
+    Draxin  = factor(Draxin_nM, levels = draxin_levels),
+    Coating = factor(Coating, levels = coating_levels)
+  ) %>%
+  filter(!is.na(Speed_um_h))
+
+m2 <- lm(Speed_um_h ~ Coating * Draxin, data = d2)
+
+a2 <- car::Anova(m2, type = 2)
+
+ss_res <- sum(resid(m2)^2)
+es2 <- data.frame(
+  Term = rownames(a2),
+  SS = a2[["Sum Sq"]],
+  Partial_Eta2 = a2[["Sum Sq"]] / (a2[["Sum Sq"]] + ss_res)
+)
+
+eemm_draxin_within_coating <- emmeans(m2, ~ Draxin | Coating)
+ph_draxin_within_coating  <- contrast(
+  emm_draxin_within_coating,
+  method = "trt.vs.ctrl",
+  ref = "0",
+  adjust = "dunnett"
+)
+
+emm_coating_within_draxin <- emmeans(m2, ~ Coating | Draxin)
+ph_coating_within_draxin  <- contrast(
+  emm_coating_within_draxin,
+  method = "trt.vs.ctrl",
+  ref = "Ctrl",
+  adjust = "dunnett"
+)
+
+write.csv(
+  as.data.frame(a2),
+  file.path(out_dir, "test2_draxin_coating_TypeII_ANOVA.csv"),
+  row.names = TRUE
+)
+
+write.csv(
+  es2,
+  file.path(out_dir, "test2_effectsizes_partial_eta2.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(ph_draxin_within_coating),
+  file.path(out_dir, "test2_posthoc_draxin_within_each_coating.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(ph_coating_within_draxin),
+  file.path(out_dir, "test2_posthoc_coating_vs_ctrl_within_each_draxin.csv"),
+  row.names = FALSE
+)
+
+# =======================
+# RESCUE / DIFFERENCE-IN-DIFFERENCES
+# Compare (140 - 0) within each coating vs Ctrl
+# =======================
+emm <- emmeans(m2, ~ Draxin | Coating)
+
+draxin_140_vs_0 <- contrast(
+  emm,
+  method = list("140-0" = c(-1, 0, 1)),
+  by = "Coating"
+)
+
+draxin_effect_by_coating <- emmeans(draxin_140_vs_0, ~ Coating)
+
+rescue_vs_ctrl <- contrast(
+  draxin_effect_by_coating,
+  method = "trt.vs.ctrl",
+  ref = "Ctrl",
+  adjust = "dunnett"
+)
+
+write.csv(
+  as.data.frame(draxin_140_vs_0),
+  file.path(out_dir, "test2_draxin_140minus0_within_each_coating.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(rescue_vs_ctrl),
+  file.path(out_dir, "test2_rescue_vs_ctrl_140minus0.csv"),
+  row.names = FALSE
+)
+
+print("Done.")
+```

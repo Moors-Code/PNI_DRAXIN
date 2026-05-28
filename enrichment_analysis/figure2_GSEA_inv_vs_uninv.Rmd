@@ -1,0 +1,714 @@
+#========================================================
+# GSEA analysis for invaded vs uninvaded nerve DE results
+#========================================================
+#
+# Purpose:
+# This script performs gene set enrichment analysis (GSEA) on a ranked
+# differential expression table comparing invaded versus uninvaded nerve
+# profiles.
+#
+# Workflow:
+#   1. Read the differential expression table.
+#   2. Build ranked gene lists using:
+#        - ENTREZ IDs for ontology/pathway analyses
+#        - gene SYMBOLs for custom GMT-based analyses
+#   3. Run multiple GSEA analyses in a reproducible framework.
+#   4. Save:
+#        - CSV result tables
+#        - PDF dotplots
+#        - RDS objects
+#        - QC outputs and session information
+#
+# Expected input columns:
+#   - Gene
+#   - logFC
+#   - FDR
+#
+# Notes:
+#   - The ranking formula is:
+#         sign(logFC) * -log10(FDR)
+#   - A single seed is used throughout for reproducibility.
+#   - nPermSimple can be adjusted centrally in the parameter section.
+#   - For ENTREZ-based analyses, exported result tables are made more
+#     interpretable using setReadable().
+#
+#========================================================
+```{r}
+library(renv)
+renv::activate() 
+```
+
+```{r}
+#========================================================
+# 1. Load packages
+#========================================================
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(tibble)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(ReactomePA)
+  library(DOSE)
+  library(msigdbr)
+  library(enrichplot)
+  library(ggplot2)
+  library(fgsea)
+})
+```
+
+
+```{r}
+#========================================================
+# 2. User-defined parameters
+#========================================================
+
+#---- Reproducibility ----
+seed_value <- 1234
+
+#---- GSEA parameters ----
+n_perm          <- 100000   # adjust here if needed
+min_gs_size     <- 10
+max_gs_size     <- 800
+p_cutoff        <- 0.05
+adjust_method   <- "BH"
+show_categories <- 30
+
+#---- Project directories ----
+project_dir <- "~/NAS/Aleksandra/Computational/R programming/paper_projects/"
+input_dir   <- file.path(project_dir, "input lists")
+gmt_dir     <- file.path(project_dir, "single_nuclei_PDAC")
+output_dir  <- file.path(project_dir, "output enrichment analysis")
+
+#---- Input files ----
+de_file           <- file.path(input_dir, "FullDE_List.csv")
+combined_gmt_file <- file.path(gmt_dir, "combined_signatures.gmt")
+
+#---- Output folders ----
+csv_dir <- file.path(output_dir, "csv", "GSEA")
+pdf_dir <- file.path(output_dir, "pdf", "GSEA")
+rds_dir <- file.path(output_dir, "rds", "GSEA")
+qc_dir  <- file.path(output_dir, "qc",  "GSEA")
+log_dir <- file.path(output_dir, "logs")
+
+dir.create(csv_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(pdf_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(rds_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(qc_dir,  recursive = TRUE, showWarnings = FALSE)
+dir.create(log_dir, recursive = TRUE, showWarnings = FALSE)
+
+#---- Log file ----
+log_file <- file.path(log_dir, paste0("GSEA_run_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".log"))
+
+log_message <- function(...) {
+  msg <- paste0("[", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "] ", paste(..., collapse = ""))
+  cat(msg, "\n")
+  write(msg, file = log_file, append = TRUE)
+}
+
+set.seed(seed_value)
+log_message("Starting GSEA pipeline.")
+log_message("Seed set to: ", seed_value)
+log_message("nPermSimple set to: ", n_perm)
+```
+
+```{r}
+#========================================================
+# 3. Helper functions
+#========================================================
+
+#--------------------------------------------------------
+# 3.1 Check that required input columns are present
+#--------------------------------------------------------
+check_required_columns <- function(df, required_cols = c("Gene", "logFC", "FDR")) {
+  missing_cols <- setdiff(required_cols, colnames(df))
+  if (length(missing_cols) > 0) {
+    stop(
+      "Input file is missing required columns: ",
+      paste(missing_cols, collapse = ", ")
+    )
+  }
+}
+
+#--------------------------------------------------------
+# 3.2 Build ranked gene vector
+#--------------------------------------------------------
+make_rank_vector <- function(df, gene_col, logfc_col = "logFC", fdr_col = "FDR") {
+  df_clean <- df %>%
+    dplyr::filter(!is.na(.data[[gene_col]]),
+                  !is.na(.data[[logfc_col]]),
+                  !is.na(.data[[fdr_col]])) %>%
+    dplyr::filter(.data[[fdr_col]] > 0) %>%
+    dplyr::mutate(rank_score = sign(.data[[logfc_col]]) * -log10(.data[[fdr_col]])) %>%
+    dplyr::distinct(.data[[gene_col]], .keep_all = TRUE)
+
+  ranks <- df_clean$rank_score
+  names(ranks) <- df_clean[[gene_col]]
+  ranks <- sort(ranks, decreasing = TRUE)
+
+  return(ranks)
+}
+
+#--------------------------------------------------------
+# 3.3 Save ranked list as CSV
+#--------------------------------------------------------
+save_rank_table <- function(ranks, gene_id_name, outfile) {
+  rank_df <- tibble(
+    !!gene_id_name := names(ranks),
+    rank_score = as.numeric(ranks)
+  )
+  readr::write_csv(rank_df, outfile)
+}
+
+#--------------------------------------------------------
+# 3.4 Save ranked list barplot
+#--------------------------------------------------------
+save_rank_barplot <- function(ranks, file, main_title) {
+  pdf(file, width = 12, height = 6, useDingbats = FALSE)
+  barplot(
+    ranks,
+    border = NA,
+    las = 2,
+    main = main_title,
+    cex.names = 0.4
+  )
+  dev.off()
+}
+
+#--------------------------------------------------------
+# 3.5 Export GSEA result table
+#--------------------------------------------------------
+save_gsea_table <- function(gsea_obj, analysis_name, csv_dir, rds_dir) {
+  res <- gsea_obj@result %>% as.data.frame()
+
+  if (nrow(res) == 0) {
+    log_message("No enriched terms found for ", analysis_name)
+  }
+
+  if (!"Description" %in% colnames(res)) {
+    res$Description <- NA_character_
+  }
+
+  if (!"geneID" %in% colnames(res)) {
+    res$geneID <- NA_character_
+  }
+
+  # Make exported table easier to inspect
+  preferred_order <- c(
+    "ID", "Description", "setSize", "enrichmentScore", "NES",
+    "pvalue", "p.adjust", "qvalues", "rank", "leading_edge", "core_enrichment", "geneID"
+  )
+  existing_order <- preferred_order[preferred_order %in% colnames(res)]
+  remaining_cols <- setdiff(colnames(res), existing_order)
+  res <- res[, c(existing_order, remaining_cols), drop = FALSE]
+
+  readr::write_csv(res, file.path(csv_dir, paste0(analysis_name, "_results.csv")))
+  saveRDS(gsea_obj, file = file.path(rds_dir, paste0(analysis_name, ".rds")))
+
+  return(res)
+}
+
+#--------------------------------------------------------
+# 3.6 Save GSEA dotplot
+#--------------------------------------------------------
+save_gsea_dotplot <- function(gsea_obj, analysis_name, pdf_dir, show_categories = 30) {
+  res <- gsea_obj@result
+  pdf_file <- file.path(pdf_dir, paste0(analysis_name, "_dotplot.pdf"))
+
+  pdf(pdf_file, width = 10, height = 8, useDingbats = FALSE)
+
+  if (nrow(res) > 0) {
+    p <- dotplot(gsea_obj, x = "NES", showCategory = show_categories) +
+      ggtitle(analysis_name) +
+      theme_bw(base_size = 12)
+    print(p)
+  } else {
+    plot.new()
+    title(main = paste("No enriched terms for", analysis_name))
+    text(0.5, 0.5, "No terms passed the enrichment threshold.")
+  }
+
+  dev.off()
+}
+
+#--------------------------------------------------------
+# 3.7 Add readable gene symbols to exported results
+#--------------------------------------------------------
+# This improves readability of saved CSV files. For many clusterProfiler
+# outputs, geneID contains slash-separated ENTREZ IDs. This function maps
+# them back to gene symbols when possible.
+add_readable_gene_symbols <- function(result_df) {
+  if (!"geneID" %in% colnames(result_df)) {
+    result_df$gene_symbols <- NA_character_
+    return(result_df)
+  }
+
+  unique_ids <- unique(unlist(strsplit(result_df$geneID, "/")))
+  unique_ids <- unique_ids[!is.na(unique_ids) & unique_ids != ""]
+
+  if (length(unique_ids) == 0) {
+    result_df$gene_symbols <- NA_character_
+    return(result_df)
+  }
+
+  suppressWarnings({
+    id_map <- bitr(
+      unique_ids,
+      fromType = "ENTREZID",
+      toType   = "SYMBOL",
+      OrgDb    = org.Hs.eg.db
+    )
+  })
+
+  if (is.null(id_map) || nrow(id_map) == 0) {
+    result_df$gene_symbols <- NA_character_
+    return(result_df)
+  }
+
+  id_lookup <- stats::setNames(id_map$SYMBOL, id_map$ENTREZID)
+
+  result_df$gene_symbols <- vapply(
+    strsplit(result_df$geneID, "/"),
+    function(id_vec) {
+      syms <- id_lookup[id_vec]
+      syms <- syms[!is.na(syms)]
+      paste(unique(syms), collapse = "/")
+    },
+    character(1)
+  )
+
+  return(result_df)
+}
+
+#--------------------------------------------------------
+# 3.8 Save final GSEA outputs consistently
+#--------------------------------------------------------
+save_all_outputs <- function(gsea_obj, analysis_name, csv_dir, pdf_dir, rds_dir, show_categories = 30) {
+  res <- save_gsea_table(gsea_obj, analysis_name, csv_dir, rds_dir)
+
+  if ("geneID" %in% colnames(res)) {
+    res <- add_readable_gene_symbols(res)
+    readr::write_csv(res, file.path(csv_dir, paste0(analysis_name, "_results.csv")))
+  }
+
+  save_gsea_dotplot(gsea_obj, analysis_name, pdf_dir, show_categories = show_categories)
+
+  invisible(res)
+}
+
+#--------------------------------------------------------
+# 3.9 Run a standard ENTREZ-based GSEA analysis
+#--------------------------------------------------------
+run_gsea_entrez <- function(fun,
+                            analysis_name,
+                            gene_list,
+                            make_readable = TRUE,
+                            ...) {
+  log_message("Running analysis: ", analysis_name)
+
+  set.seed(seed_value)
+
+  gsea_obj <- fun(
+    geneList      = gene_list,
+    nPermSimple   = n_perm,
+    minGSSize     = min_gs_size,
+    maxGSSize     = max_gs_size,
+    pvalueCutoff  = p_cutoff,
+    pAdjustMethod = adjust_method,
+    verbose       = TRUE,
+    eps           = 0,
+    seed          = TRUE,
+    by            = "fgsea",
+    ...
+  )
+
+  if (make_readable) {
+    gsea_obj <- setReadable(gsea_obj, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+  }
+
+  save_all_outputs(
+    gsea_obj = gsea_obj,
+    analysis_name = analysis_name,
+    csv_dir = csv_dir,
+    pdf_dir = pdf_dir,
+    rds_dir = rds_dir,
+    show_categories = show_categories
+  )
+
+  return(gsea_obj)
+}
+
+#--------------------------------------------------------
+# 3.10 Run generic TERM2GENE GSEA
+#--------------------------------------------------------
+run_gsea_term2gene <- function(analysis_name,
+                               gene_list,
+                               term2gene,
+                               gene_id_type = c("ENTREZID", "SYMBOL"),
+                               make_readable = TRUE) {
+  gene_id_type <- match.arg(gene_id_type)
+
+  log_message("Running analysis: ", analysis_name)
+
+  set.seed(seed_value)
+
+  gsea_obj <- GSEA(
+    geneList      = gene_list,
+    TERM2GENE     = term2gene,
+    nPermSimple   = n_perm,
+    minGSSize     = min_gs_size,
+    maxGSSize     = max_gs_size,
+    pvalueCutoff  = p_cutoff,
+    pAdjustMethod = adjust_method,
+    eps           = 0,
+    seed          = TRUE,
+    verbose       = TRUE,
+    by            = "fgsea"
+  )
+
+  if (make_readable && gene_id_type == "ENTREZID") {
+    gsea_obj <- setReadable(gsea_obj, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+  }
+
+  save_all_outputs(
+    gsea_obj = gsea_obj,
+    analysis_name = analysis_name,
+    csv_dir = csv_dir,
+    pdf_dir = pdf_dir,
+    rds_dir = rds_dir,
+    show_categories = show_categories
+  )
+
+  return(gsea_obj)
+}
+```
+
+
+```{r}
+#========================================================
+# 4. Read input data
+#========================================================
+log_message("Reading input DE table: ", de_file)
+
+background <- readr::read_csv(de_file, show_col_types = FALSE)
+check_required_columns(background)
+
+log_message("Input table loaded successfully.")
+log_message("Number of rows in DE table: ", nrow(background))
+```
+
+```{r}
+#========================================================
+# 5. Prepare ranked gene lists
+#========================================================
+
+#--------------------------------------------------------
+# 5.1 Map gene symbols to ENTREZ IDs
+#--------------------------------------------------------
+log_message("Converting gene symbols to ENTREZ IDs.")
+
+background_entrez <- bitr(
+  background$Gene,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db
+)
+
+background_with_id <- background %>%
+  dplyr::left_join(background_entrez, by = c("Gene" = "SYMBOL")) %>%
+  dplyr::distinct(Gene, .keep_all = TRUE) %>%
+  dplyr::filter(!is.na(ENTREZID))
+
+log_message("Genes with valid ENTREZ IDs: ", nrow(background_with_id))
+
+#--------------------------------------------------------
+# 5.2 Build ranked lists
+#--------------------------------------------------------
+ranks_entrez <- make_rank_vector(
+  df = background_with_id,
+  gene_col = "ENTREZID"
+)
+
+ranks_symbol <- make_rank_vector(
+  df = background,
+  gene_col = "Gene"
+)
+
+log_message("ENTREZ ranked list length: ", length(ranks_entrez))
+log_message("SYMBOL ranked list length: ", length(ranks_symbol))
+
+#--------------------------------------------------------
+# 5.3 Save ranked lists and QC plots
+#--------------------------------------------------------
+save_rank_table(
+  ranks = ranks_entrez,
+  gene_id_name = "ENTREZID",
+  outfile = file.path(qc_dir, "ranked_genes_entrez.csv")
+)
+
+save_rank_table(
+  ranks = ranks_symbol,
+  gene_id_name = "Gene",
+  outfile = file.path(qc_dir, "ranked_genes_symbol.csv")
+)
+
+save_rank_barplot(
+  ranks = ranks_entrez,
+  file = file.path(qc_dir, "ranked_genes_entrez_barplot.pdf"),
+  main_title = "Ranked genes (ENTREZ)"
+)
+
+save_rank_barplot(
+  ranks = ranks_symbol,
+  file = file.path(qc_dir, "ranked_genes_symbol_barplot.pdf"),
+  main_title = "Ranked genes (SYMBOL)"
+)
+
+log_message("Ranked gene lists and QC plots saved.")
+```
+
+```{r}
+#========================================================
+# 6. GO and pathway enrichment analyses
+#========================================================
+
+#--------------------------------------------------------
+# 6.1 Gene Ontology - Cellular Component
+#--------------------------------------------------------
+gse_cc <- run_gsea_entrez(
+  fun = gseGO,
+  analysis_name = "gse_go_cc",
+  gene_list = ranks_entrez,
+  make_readable = TRUE,
+  ont = "CC",
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID"
+)
+
+#--------------------------------------------------------
+# 6.2 Gene Ontology - Biological Process
+#--------------------------------------------------------
+gse_bp <- run_gsea_entrez(
+  fun = gseGO,
+  analysis_name = "gse_go_bp",
+  gene_list = ranks_entrez,
+  make_readable = TRUE,
+  ont = "BP",
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID"
+)
+
+#--------------------------------------------------------
+# 6.3 Gene Ontology - Molecular Function
+#--------------------------------------------------------
+gse_mf <- run_gsea_entrez(
+  fun = gseGO,
+  analysis_name = "gse_go_mf",
+  gene_list = ranks_entrez,
+  make_readable = TRUE,
+  ont = "MF",
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID"
+)
+
+#--------------------------------------------------------
+# 6.4 Reactome pathway analysis
+#--------------------------------------------------------
+gse_reactome <- run_gsea_entrez(
+  fun = gsePathway,
+  analysis_name = "gse_reactome",
+  gene_list = ranks_entrez,
+  make_readable = TRUE,
+  organism = "human"
+)
+
+#--------------------------------------------------------
+# 6.5 WikiPathways analysis
+#--------------------------------------------------------
+gse_wikipathways <- run_gsea_entrez(
+  fun = gseWP,
+  analysis_name = "gse_wikipathways",
+  gene_list = ranks_entrez,
+  make_readable = TRUE,
+  organism = "Homo sapiens"
+)
+
+#--------------------------------------------------------
+# 6.6 Disease Ontology analysis
+#--------------------------------------------------------
+gse_do <- run_gsea_entrez(
+  fun = gseDO,
+  analysis_name = "gse_disease_ontology",
+  gene_list = ranks_entrez,
+  make_readable = TRUE,
+  organism = "hsa"
+)
+
+#--------------------------------------------------------
+# 6.7 Network of Cancer Genes analysis
+#--------------------------------------------------------
+gse_ncg <- run_gsea_entrez(
+  fun = gseNCG,
+  analysis_name = "gse_ncg",
+  gene_list = ranks_entrez,
+  make_readable = TRUE,
+  exponent = 1
+)
+
+#--------------------------------------------------------
+# 6.8 KEGG pathway analysis
+#--------------------------------------------------------
+gse_kegg <- run_gsea_entrez(
+  fun = gseKEGG,
+  analysis_name = "gse_kegg",
+  gene_list = ranks_entrez,
+  make_readable = TRUE
+)
+```
+
+```{r}
+#========================================================
+# 7. Custom GMT-based enrichment analysis
+#========================================================
+
+#--------------------------------------------------------
+# 7.1 Load custom cell-state GMT signatures
+#--------------------------------------------------------
+log_message("Reading custom GMT file: ", combined_gmt_file)
+
+m_t2g_cells_combined <- read.gmt(combined_gmt_file)
+
+#--------------------------------------------------------
+# 7.2 Run SYMBOL-based custom GSEA
+#--------------------------------------------------------
+gse_cells_combined <- run_gsea_term2gene(
+  analysis_name = "gse_cells_combined",
+  gene_list = ranks_symbol,
+  term2gene = m_t2g_cells_combined,
+  gene_id_type = "SYMBOL",
+  make_readable = FALSE
+)
+
+
+#========================================================
+# 8. MSigDB collection analyses
+#========================================================
+
+run_msigdb_collection <- function(category_name) {
+  log_message("Preparing MSigDB collection: ", category_name)
+
+  term2gene <- msigdbr(
+    species = "Homo sapiens",
+    category = category_name
+  ) %>%
+    dplyr::select(gs_name, entrez_gene)
+
+  run_gsea_term2gene(
+    analysis_name = paste0("gse_msigdb_", category_name),
+    gene_list = ranks_entrez,
+    term2gene = term2gene,
+    gene_id_type = "ENTREZID",
+    make_readable = TRUE
+  )
+}
+
+#--------------------------------------------------------
+# 8.1 Hallmark
+#--------------------------------------------------------
+gse_msigdb_h <- run_msigdb_collection("H")
+
+#--------------------------------------------------------
+# 8.2 Positional gene sets
+#--------------------------------------------------------
+gse_msigdb_c1 <- run_msigdb_collection("C1")
+
+#--------------------------------------------------------
+# 8.3 Curated gene sets
+#--------------------------------------------------------
+gse_msigdb_c2 <- run_msigdb_collection("C2")
+
+#--------------------------------------------------------
+# 8.4 Regulatory target gene sets
+#--------------------------------------------------------
+gse_msigdb_c3 <- run_msigdb_collection("C3")
+
+#--------------------------------------------------------
+# 8.5 Computational gene sets
+#--------------------------------------------------------
+gse_msigdb_c4 <- run_msigdb_collection("C4")
+
+#--------------------------------------------------------
+# 8.6 GO gene sets
+#--------------------------------------------------------
+gse_msigdb_c5 <- run_msigdb_collection("C5")
+
+#--------------------------------------------------------
+# 8.7 Oncogenic signatures
+#--------------------------------------------------------
+gse_msigdb_c6 <- run_msigdb_collection("C6")
+
+#--------------------------------------------------------
+# 8.8 Immunologic signatures
+#--------------------------------------------------------
+gse_msigdb_c7 <- run_msigdb_collection("C7")
+
+#--------------------------------------------------------
+# 8.9 Cell type signatures
+#--------------------------------------------------------
+gse_msigdb_c8 <- run_msigdb_collection("C8")
+```
+
+```{r}
+#========================================================
+# 9. Save reproducibility information
+#========================================================
+
+#--------------------------------------------------------
+# 9.1 Save session info
+#--------------------------------------------------------
+writeLines(
+  capture.output(sessionInfo()),
+  con = file.path(qc_dir, "sessionInfo.txt")
+)
+
+#--------------------------------------------------------
+# 9.2 Save run parameters
+#--------------------------------------------------------
+params_df <- tibble(
+  parameter = c(
+    "seed_value",
+    "n_perm",
+    "min_gs_size",
+    "max_gs_size",
+    "p_cutoff",
+    "adjust_method",
+    "show_categories",
+    "de_file",
+    "combined_gmt_file"
+  ),
+  value = c(
+    as.character(seed_value),
+    as.character(n_perm),
+    as.character(min_gs_size),
+    as.character(max_gs_size),
+    as.character(p_cutoff),
+    adjust_method,
+    as.character(show_categories),
+    de_file,
+    combined_gmt_file
+  )
+)
+
+readr::write_csv(params_df, file.path(qc_dir, "run_parameters.csv"))
+```
+
+```{r}
+#========================================================
+# 10. Completion message
+#========================================================
+log_message("GSEA pipeline completed successfully.")
+log_message("CSV output directory: ", csv_dir)
+log_message("PDF output directory: ", pdf_dir)
+log_message("RDS output directory: ", rds_dir)
+log_message("QC output directory: ", qc_dir)
+```

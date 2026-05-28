@@ -1,0 +1,49 @@
+
+````{r}
+# =======================
+# LIBRARIES
+# =======================
+library(readr)
+library(dplyr)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+
+# =======================
+# READ DATA
+# =======================
+file <- "input_files/Cumulative_absorbance.csv.csv"
+
+df <- read_csv(file, show_col_types = FALSE) %>%
+  mutate(
+    Draxin     = factor(Draxin, levels = c("0", "68")),
+    Experiment = factor(Experiment),
+    Absorbance = as.numeric(Absorbance)
+  ) %>%
+  filter(!is.na(Absorbance))
+
+# =======================
+# MODEL
+# =======================
+m <- lmer(Absorbance ~ Draxin + (1 | Experiment), data = df)
+
+# =======================
+# ESTIMATED MEANS + TEST
+# =======================
+emm <- emmeans(m, ~ Draxin)
+
+# Only one comparison → simplest + robust
+contrast_res <- pairs(emm)
+
+# =======================
+# EXPORT
+# =======================
+write.csv(
+  as.data.frame(contrast_res),
+  "output/growth_assays/absorbance_68_vs_0.csv",
+  row.names = FALSE
+)
+
+print("Done.")
+```
+

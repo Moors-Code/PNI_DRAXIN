@@ -1,0 +1,234 @@
+
+Load libraries
+```{r}
+suppressPackageStartupMessages({
+  #install.packages(tidyverse)
+  library(tidyverse)
+  #install.packages(readxl)
+  library(readxl)
+  #install.packages(writexl)
+  library(writexl)
+  #install.packages(readr)
+  library(readr)
+  library(ggplot2)
+})
+```
+
+```{r}
+cancer_class_lisa <- read_excel("Cancer_labeling_Lisa.xlsx")
+cancer_class_ola_raw <- read_excel("Cancer_labeling_Ola.xlsx")
+
+cancer_class_ola <- read_excel("Cancer_labeling_Ola.xlsx") |> select(c("image","label"))
+ 
+mask <- !is.na(cancer_class_ola)
+
+all.equal(cancer_class_lisa[mask],cancer_class_ola[mask])
+
+```
+
+```{r}
+nerve_class_1 <- read_excel("Nerve_Only_labeling_Gabriela.xlsx")
+nerve_class_2 <- read_excel("Nerve_Only_labeling_Antonello.xlsx")
+nerve_class_3 <- read_excel("Nerve_Only_labeling_Elena.xlsx")
+```
+
+```{r}
+# First, merge all three dataframes on 'image'
+merged <- Reduce(function(x, y) merge(x, y, by = "image", all = TRUE),
+                 list(
+                   nerve_class_1, nerve_class_2, nerve_class_3
+                 ))
+
+# merged will have: image, label.x, comments.x, label.y, comments.y, ...
+
+# Rename columns for clarity
+names(merged) <- c("image", "label_1", "comments_1", "label_2", "comments_2", "label_3", "comments_3")
+
+#Merge with the cancer annotation
+merged_all <- merge(merged, cancer_class_lisa[, c("image", "label")], by = "image", all.x = TRUE)
+colnames(merged_all)[8]<- "label_cancer"
+
+# Filter rows where all comments are NA
+filtered <- subset(merged_all, is.na(comments_1) & is.na(comments_2) & is.na(comments_3))
+
+# Keep only desired columns
+final_df <- filtered[, c("image", "label_1", "label_2", "label_3","label_cancer")]
+
+final_df_unfiltered <- merged_all[, c("image", "label_1", "label_2", "label_3","label_cancer")]
+
+names(final_df) <- c("image", "nerve_class_1", "nerve_class_2", "nerve_class_3", "cancer_class")
+names(final_df_unfiltered)<- c("image", "nerve_class_1", "nerve_class_2", "nerve_class_3", "cancer_class")
+
+```
+
+Find consensus
+```{r}
+# Function to calculate majority vote per row
+majority_vote <- function(x) {
+  tab <- table(x)
+  if (length(tab) == 0) return(NA)
+  names(which.max(tab))
+}
+
+# Apply row-wise majority vote
+final_df$surrounding_line_consensus <- apply(final_df[, c("nerve_class_1", "nerve_class_2", "nerve_class_3")], 1, majority_vote)
+
+```
+
+Same for unfiltered table
+```{r}
+# Function to calculate majority vote per row
+majority_vote <- function(x) {
+  tab <- table(x)
+  if (length(tab) == 0) return(NA)
+  names(which.max(tab))
+}
+
+# Apply row-wise majority vote
+final_df_unfiltered$surrounding_line_consensus <- apply(final_df_unfiltered[, c("nerve_class_1", "nerve_class_2", "nerve_class_3")], 1, majority_vote)
+
+```
+
+
+```{r}
+
+summary_df <- final_df %>%
+  group_by(cancer_class, surrounding_line_consensus) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(cancer_class) %>%
+  mutate(proportion = count / sum(count))
+
+```
+
+```{r}
+summary_df_unfiltered <- final_df_unfiltered %>%
+  group_by(cancer_class, surrounding_line_consensus) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(cancer_class) %>%
+  mutate(proportion = count / sum(count))
+
+```
+
+
+Measure Annotation Agreement:
+```{r}
+library(irr)
+
+# Fleiss' Kappa on surrounding line annotations
+kappa_data <- final_df[, c("nerve_class_1", "nerve_class_2", "nerve_class_3")]
+kappam.fleiss(kappa_data)
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(summary_df, aes(x = cancer_class, y = proportion, fill = surrounding_line_consensus)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(
+    title = "Proportion of Nerves with/without Surrounding Line",
+    x = "Cancer Class",
+    y = "Proportion",
+    fill = "Surrounding Line"
+  ) +
+  theme_minimal()
+
+```
+
+```{r, whidth= 3, height = 10}
+ggplot(summary_df_unfiltered, aes(x = cancer_class, y = count, fill = surrounding_line_consensus)) +
+  geom_bar(stat = "identity", position = "fill") +  # fill = proportion
+  geom_text(aes(label = count),
+            position = position_fill(vjust = 0.5), size = 3, color = "black") +
+  labs(
+    title = "Proportion of Surrounding Line in Invaded vs Uninvaded Nerves",
+    x = "Cancer Class",
+    y = "Proportion",
+    fill = "Surrounding Line"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+## Publication-ready plot with corrected labels
+
+library(ggplot2)
+library(dplyr)
+library(scales)
+
+summary_df_plot <- summary_df %>%
+  mutate(
+    cancer_class = factor(
+      cancer_class,
+      levels = c("Non Invaded Nerve", "Invaded Nerve"),
+      labels = c("Non-invaded nerve", "Invaded nerve")
+    ),
+    surrounding_line_consensus = factor(
+      surrounding_line_consensus,
+      levels = c("No Surrounding Line", "Surrounding Line"),
+      labels = c("Absent", "Present")
+    )
+  ) %>%
+  filter(!is.na(cancer_class), !is.na(surrounding_line_consensus))
+
+ggplot(
+  summary_df_plot,
+  aes(
+    x = cancer_class,
+    y = count,
+    fill = surrounding_line_consensus
+  )
+) +
+  geom_bar(
+    stat = "identity",
+    position = "fill",
+    width = 0.7,
+    colour = "black",
+    linewidth = 0.35
+  ) +
+  geom_text(
+    aes(label = count),
+    position = position_fill(vjust = 0.5),
+    size = 5,
+    colour = "black"
+  ) +
+  scale_y_continuous(
+    labels = function(x) x * 100,
+    breaks = seq(0, 1, 0.25),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Absent" = "lightblue",
+      "Present" = "orange"
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = "Nerves [%]",
+    fill = "Surrounding\nP75NTR+ line"
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    panel.background = element_rect(fill = "white", colour = NA),
+    plot.background = element_rect(fill = "white", colour = NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.background = element_rect(fill = "white", colour = NA),
+    legend.key = element_rect(fill = "white", colour = NA),
+    axis.text.x = element_text(size = 17, colour = "black"),
+    axis.text.y = element_text(size = 16, colour = "black"),
+    axis.title.y = element_text(size = 18, colour = "black", margin = margin(r = 10)),
+    axis.line = element_line(linewidth = 0.8, colour = "black"),
+    axis.ticks = element_line(linewidth = 0.8, colour = "black"),
+    legend.title = element_text(size = 15, colour = "black"),
+    legend.text = element_text(size = 15, colour = "black"),
+    legend.key.size = unit(0.7, "cm"),
+    plot.margin = margin(8, 8, 8, 8)
+  )
+```
+```{r}
+ggsave("surrounding_p75ntr_line_plot.pdf", width = 4.8, height = 4.2, bg = "white")
+ggsave("surrounding_p75ntr_line_plot.png", width = 4.8, height = 4.2, dpi = 300, bg = "white")
+```
+

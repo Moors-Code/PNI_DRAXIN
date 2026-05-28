@@ -1,0 +1,337 @@
+# Plotting of Deconvolution data 
+This section quantifies immune cell composition and macrophage-associated transcriptional programs in spatial transcriptomic spots corresponding to pancreatic nerves. Spatial spots annotated as nerves were classified into three biologically meaningful categories based on pathological annotation:
+Invaded, Non-Invaded Diseased, Non-invaded Adjacent.
+
+Cell type proportions estimated using RCTD deconvolution, while transcriptional programs were derived from NMF decomposition of spatial transcriptomic data.
+
+#Figures generated in this section
+#Figure2F_violin_Adaptive.pdf
+#Distribution of adaptive immune and plasma cell proportions across nerve categories.
+#Figure2F_violin_Myeloid_NMF.pdf
+#Distribution of macrophage-associated NMF transcriptional programs across nerve categories.
+#Individual_nerve_deconvolution_3cat.pdf
+#Cell-type composition of individual nerves based on RCTD deconvolution.
+#Nerves_mean_composition_by_cat3.pdf
+#Mean cell-type composition across nerve categories.
+#heatmap_deconvolution_cat3_nerves.pdf
+#Enrichment heatmap of deconvolved cell types across nerve categories.
+#Nerves_mean_composition_NMF_by_cat3.pdf
+#Mean transcriptional program composition across nerve categories
+
+
+```{r}
+#=================================
+#1. Load Libraries and input data 
+#================================
+library(spacexr)
+library(readxl)
+library(stringr)
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(S4Vectors)
+library(SpatialExperiment)
+library(SummarizedExperiment)
+library(scuttle)
+library(scran)
+library(scater)
+library(ggspavis)
+library(dplyr)
+library(ggrepel)
+library(batchelor)
+library(reshape2)
+library(Matrix)
+library(scatterpie)
+library(tidyr)
+library(pheatmap)
+library(tidyverse)
+library(purrr)
+library(grid)
+library(zellkonverter)
+library(lme4)
+library(msigdbr)
+
+c25 <- c(
+  "dodgerblue2", "#E31A1C", # red
+"green4",
+"#6A3D9A", # purple
+"#FF7F00", # orange
+"black", "gold1",
+"skyblue2", "#FB9A99", # lt pink
+"palegreen2",
+"#CAB2D6", # lt purple
+"#FDBF6F", # lt orange
+"gray70", "khaki2",
+"maroon", "orchid1", "deeppink1", "blue1", "steelblue4",
+"darkturquoise", "green1", "yellow4", "yellow3",
+"darkorange4", "brown"
+)
+
+
+merged_obj <-readRDS("../data/Deconvolution/sc_sn_merged_obj.Rds")
+spe <- readRDS("../data/SPE/Integrated_NMF.rds")
+colData(spe) <- DataFrame(read.csv("../data/coldata/DE_SPE_annotaion.csv"))
+colnames(spe) <- spe$barcode
+
+W_df <- readRDS("../data/Deconvolution/RCTD_weights.Rds")
+weights_df_copy <- W_df
+
+```
+
+```{r}
+#==========================================
+# 2. Identify nerve spots and define groups
+#==========================================
+
+# Identify nerve spots
+nerve_mask <- colData(spe)$is.nerve == TRUE
+
+nerve_meta_df <- data.frame(
+  barcode     = as.character(spe$barcode[nerve_mask]),
+  patient_id  = as.factor(colData(spe)$patient_id[nerve_mask]),
+  NerveID     = as.factor(colData(spe)$NerveID[nerve_mask]),
+  Invaded     = as.character(colData(spe)$Invaded[nerve_mask]),
+  type_raw    = as.character(colData(spe)$type[nerve_mask])
+)
+
+# Create category (new column in new dataframe only)
+nerve_meta_df$types_grouped <- ifelse(
+  nerve_meta_df$type_raw == "noPNI",
+  "Adjacent",
+  "Diseased"
+)
+
+nerve_meta_df$nerve_category <- ifelse(
+  nerve_meta_df$Invaded == "NonInvaded",
+  paste0("NonInvaded_", nerve_meta_df$types_grouped),
+  nerve_meta_df$Invaded
+)
+
+nerve_meta_df <- nerve_meta_df[!is.na(nerve_meta_df$nerve_category), ]
+
+# Join with RCTD weights (copy only)
+analysis_df <- nerve_meta_df %>%
+  left_join(weights_df_copy, by = "barcode")
+```
+
+```{r}
+#=====================================================
+# RCTD-only plotting: 4 selected immune cell types
+#=====================================================
+
+#=====================================================
+# Set plotting order and labels
+#=====================================================
+
+nerve_order <- c("NonInvaded_Adjacent", "NonInvaded_Diseased", "Invaded")
+patient_order <- c("54703", "6249", "70865")
+
+rctd_selected_cols <- c(
+  "Myeloid",
+  "Lymphocyte(NK)",
+  "Lymphocyte(CD8)",
+  "B_cells_(Plasma_cells)"
+)
+
+rctd_labels <- c(
+  "Myeloid"                = "Myeloid",
+  "Lymphocyte(NK)"         = "NK lymphocytes",
+  "Lymphocyte(CD8)"        = "CD8 T cells",
+  "B_cells_(Plasma_cells)" = "B/plasma cells"
+)
+```
+
+```{r}
+#=====================================================
+# Prepare spot-level RCTD table
+#=====================================================
+
+rctd_spot_long <- analysis_df %>%
+  dplyr::select(
+    barcode,
+    patient_id,
+    NerveID,
+    nerve_category,
+    dplyr::all_of(rctd_selected_cols)
+  ) %>%
+  dplyr::mutate(
+    barcode = as.character(barcode),
+    NerveID = as.character(NerveID),
+    patient_id = factor(as.character(patient_id), levels = patient_order),
+    nerve_category = factor(as.character(nerve_category), levels = nerve_order)
+  ) %>%
+  tidyr::pivot_longer(
+    cols = dplyr::all_of(rctd_selected_cols),
+    names_to = "CellType",
+    values_to = "Proportion"
+  ) %>%
+  dplyr::mutate(
+    CellType = factor(CellType, levels = rctd_selected_cols),
+    CellTypeLabel = factor(
+      rctd_labels[as.character(CellType)],
+      levels = unname(rctd_labels[rctd_selected_cols])
+    )
+  ) %>%
+  dplyr::filter(
+    !is.na(nerve_category),
+    !is.na(NerveID),
+    !is.na(Proportion)
+  )
+```
+
+```{r}
+#=====================================================
+# Aggregate from spot level to nerve level
+#=====================================================
+
+rctd_nerve_long <- rctd_spot_long %>%
+  dplyr::group_by(
+    NerveID,
+    patient_id,
+    nerve_category,
+    CellType,
+    CellTypeLabel
+  ) %>%
+  dplyr::summarise(
+    MeanProportion = mean(Proportion, na.rm = TRUE),
+    n_spots = dplyr::n(),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    nerve_category = factor(nerve_category, levels = nerve_order),
+    patient_id = factor(patient_id, levels = patient_order)
+  )
+
+```
+
+```{r}
+#=====================================================
+# Plot spot-level RCTD proportions
+#=====================================================
+
+facet_ncol   <- 2
+facet_scales <- "free_y"
+base_size    <- 11
+panel_aspect <- 0.5
+
+p_rctd_spot <- ggplot(
+  rctd_spot_long,
+  aes(x = nerve_category, y = Proportion)
+) +
+  geom_violin(
+    fill = "grey85",
+    color = NA,
+    alpha = 0.6,
+    trim = FALSE
+  ) +
+  geom_boxplot(
+    width = 0.25,
+    outlier.shape = NA,
+    fill = "white",
+    color = "grey30",
+    linewidth = 0.4
+  ) +
+  geom_jitter(
+    aes(color = patient_id),
+    width = 0.10,
+    size = 0.9,
+    alpha = 0.95
+  ) +
+  facet_wrap(
+    ~ CellTypeLabel,
+    scales = "free_y",
+    ncol = 2
+  ) +
+  theme_classic(base_size = base_size) +
+  theme(
+    aspect.ratio = panel_aspect,
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = base_size * 0.85),
+    legend.position = "right",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.4),
+    panel.spacing = unit(6, "pt")
+  ) +
+  ylab("RCTD proportion per spot") +
+  xlab("Nerve category") +
+  labs(color = "Patient ID")
+
+p_rctd_spot
+
+```
+
+```{r}
+#=====================================================
+# Plot nerve-level RCTD proportions
+#=====================================================
+
+p_rctd_nerve <- ggplot(
+  rctd_nerve_long,
+  aes(x = nerve_category, y = MeanProportion)
+) +
+  geom_violin(
+    fill = "grey85",
+    color = NA,
+    alpha = 0.6,
+    trim = FALSE
+  ) +
+  geom_boxplot(
+    width = 0.25,
+    outlier.shape = NA,
+    fill = "white",
+    color = "grey30",
+    linewidth = 0.4
+  ) +
+  geom_jitter(
+    aes(color = patient_id),
+    width = 0.10,
+    size = 0.9,
+    alpha = 0.95
+  ) +
+  facet_wrap(
+    ~ CellTypeLabel,
+    scales = "free_y",
+    ncol = 2
+  ) +
+  theme_classic(base_size = base_size) +
+  theme(
+    aspect.ratio = panel_aspect,
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = base_size * 0.85),
+    legend.position = "right",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.4),
+    panel.spacing = unit(6, "pt")
+  ) +
+  ylab("Mean RCTD proportion per nerve") +
+  xlab("Nerve category") +
+  labs(color = "Patient ID")
+
+p_rctd_nerve
+
+```
+
+```{r}
+#=====================================================
+# Save RCTD-only 4-panel plots
+#=====================================================
+
+ggsave(
+  filename = "../figures/RCTD_selected_immune_spot_level.pdf",
+  plot = p_rctd_spot,
+  width = 7,
+  height = 7,
+  units = "in",
+  dpi = 600,
+  useDingbats = FALSE
+)
+
+ggsave(
+  filename = "../figures/RCTD_selected_immune_nerve_level.pdf",
+  plot = p_rctd_nerve,
+  width = 7,
+  height = 7,
+  units = "in",
+  dpi = 600,
+  useDingbats = FALSE
+)
+```
+

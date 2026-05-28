@@ -1,0 +1,246 @@
+
+```{r}
+
+# =======================
+# PACKAGES
+# =======================
+library(readr)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(pracma)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(purrr)
+library(broom)
+```
+
+```{r}
+# =======================
+# PEPTIDE FILE: 22aa vs ctrl at Draxin 0 and 140
+# Input columns required:
+#   Draxin
+#   Absorbance
+#   Condition
+#   Experiment
+#   Replicate
+# =======================
+
+file_peptide <- "input_files/22aa_peptide.csv"
+out_dir_peptide <- "output/growth_assays/22aa_peptide"
+dir.create(out_dir_peptide, recursive = TRUE, showWarnings = FALSE)
+
+dfp_raw <- read_csv(file_peptide, show_col_types = FALSE)
+
+required_cols_peptide <- c("Draxin", "Absorbance", "Condition", "Experiment", "Replicate")
+missing_cols_peptide <- setdiff(required_cols_peptide, names(dfp_raw))
+
+if (length(missing_cols_peptide) > 0) {
+  stop(
+    paste("Missing required columns in 22aa_peptide.csv:",
+          paste(missing_cols_peptide, collapse = ", "))
+  )
+}
+
+dfp <- dfp_raw %>%
+  mutate(
+    Experiment = factor(Experiment),
+    Replicate  = factor(Replicate),
+    Draxin     = str_trim(as.character(Draxin)),
+    Condition  = str_trim(as.character(Condition)),
+    Absorbance = as.numeric(Absorbance)
+  ) %>%
+  filter(
+    !is.na(Experiment),
+    !is.na(Replicate),
+    !is.na(Draxin),
+    !is.na(Condition),
+    !is.na(Absorbance)
+  )
+
+# Keep only expected levels
+dfp <- dfp %>%
+  filter(Draxin %in% c("0", "140"),
+         Condition %in% c("ctrl", "22aa"))
+
+# Factor ordering
+dfp <- dfp %>%
+  mutate(
+    Draxin = factor(Draxin, levels = c("0", "140")),
+    Condition = factor(Condition, levels = c("ctrl", "22aa"))
+  )
+
+if (!all(c("0", "140") %in% levels(dfp$Draxin))) {
+  warning("Expected Draxin levels 0 and 140 were not both present after filtering.")
+}
+
+if (!all(c("ctrl", "22aa") %in% levels(dfp$Condition))) {
+  warning("Expected Condition levels ctrl and 22aa were not both present after filtering.")
+}
+
+write.csv(
+  dfp,
+  file.path(out_dir_peptide, "peptide_input_cleaned.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+# =======================
+# BASIC QC
+# =======================
+
+qc_counts <- dfp %>%
+  count(Experiment, Replicate, Draxin, Condition)
+
+write.csv(
+  qc_counts,
+  file.path(out_dir_peptide, "peptide_qc_counts.csv"),
+  row.names = FALSE
+)
+
+qc_summary <- dfp %>%
+  group_by(Draxin, Condition) %>%
+  summarise(
+    n = n(),
+    mean_abs = mean(Absorbance, na.rm = TRUE),
+    sd_abs = sd(Absorbance, na.rm = TRUE),
+    sem_abs = sd_abs / sqrt(n),
+    .groups = "drop"
+  )
+
+write.csv(
+  qc_summary,
+  file.path(out_dir_peptide, "peptide_group_summary.csv"),
+  row.names = FALSE
+)
+```
+
+
+```{r}
+
+# =======================
+# PLOT
+# =======================
+
+p_peptide <- ggplot(dfp, aes(x = Draxin, y = Absorbance, color = Condition)) +
+  geom_jitter(
+    position = position_jitterdodge(jitter.width = 0.08, dodge.width = 0.45),
+    size = 2,
+    alpha = 0.8
+  ) +
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    position = position_dodge(width = 0.45),
+    size = 3
+  ) +
+  stat_summary(
+    fun.data = mean_se,
+    geom = "errorbar",
+    position = position_dodge(width = 0.45),
+    width = 0.18
+  ) +
+  labs(
+    title = "22aa peptide effect at Draxin 0 and 140",
+    x = "Draxin",
+    y = "Absorbance (raw)",
+    color = "Condition"
+  ) +
+  theme_classic(base_size = 13)
+
+ggsave(
+  file.path(out_dir_peptide, "22aa_peptide_absorbance_plot.png"),
+  p_peptide,
+  width = 6,
+  height = 5,
+  dpi = 300
+)
+
+ggsave(
+  file.path(out_dir_peptide, "22aa_peptide_absorbance_plot.pdf"),
+  p_peptide,
+  width = 6,
+  height = 5
+)
+```
+
+```{r}
+# =======================
+# MIXED MODEL
+# tests:
+# 1) does 22aa differ from ctrl at Draxin 0?
+# 2) does 22aa differ from ctrl at Draxin 140?
+# 3) is the 22aa effect different at 140 than at 0? (interaction)
+# =======================
+
+if (nrow(dfp) >= 4 &&
+    dplyr::n_distinct(dfp$Draxin) >= 2 &&
+    dplyr::n_distinct(dfp$Condition) >= 2) {
+  
+  m_peptide <- lmer(
+    Absorbance ~ Draxin * Condition + (1 | Experiment),
+    data = dfp
+  )
+  
+  anova_peptide <- anova(m_peptide)
+  
+  write.csv(
+    as.data.frame(anova_peptide),
+    file.path(out_dir_peptide, "peptide_mixed_model_anova.csv"),
+    row.names = TRUE
+  )
+  
+  # Estimated means for each Draxin x Condition combination
+  emm_peptide <- emmeans(m_peptide, ~ Condition | Draxin)
+  
+  write.csv(
+    as.data.frame(emm_peptide),
+    file.path(out_dir_peptide, "peptide_emmeans_condition_within_draxin.csv"),
+    row.names = FALSE
+  )
+  
+  # 22aa vs ctrl within each Draxin level
+  cond_within_draxin <- contrast(
+    emm_peptide,
+    method = "trt.vs.ctrl",
+    ref = which(levels(dfp$Condition) == "ctrl"),
+    adjust = "holm"
+  )
+  
+  write.csv(
+    as.data.frame(cond_within_draxin),
+    file.path(out_dir_peptide, "peptide_22aa_vs_ctrl_within_each_draxin.csv"),
+    row.names = FALSE
+  )
+  
+  # Interaction-style test:
+  # does the effect of 22aa differ between Draxin 0 and Draxin 140?
+  emm_interaction <- emmeans(m_peptide, ~ Draxin * Condition)
+  interaction_contrast <- contrast(
+    emm_interaction,
+    interaction = c("pairwise", "pairwise"),
+    adjust = "holm"
+  )
+  
+  write.csv(
+    as.data.frame(interaction_contrast),
+    file.path(out_dir_peptide, "peptide_interaction_pairwise_contrasts.csv"),
+    row.names = FALSE
+  )
+  
+  # More direct extraction of the 22aa effect at each Draxin
+  peptide_effect_by_draxin <- emmeans(m_peptide, ~ Condition | Draxin)
+  peptide_effect_diff <- pairs(peptide_effect_by_draxin, adjust = "holm")
+  
+  write.csv(
+    as.data.frame(peptide_effect_diff),
+    file.path(out_dir_peptide, "peptide_condition_pairs_by_draxin.csv"),
+    row.names = FALSE
+  )
+  
+} else {
+  message("Skipping peptide mixed model: not enough data.")
+}
+```

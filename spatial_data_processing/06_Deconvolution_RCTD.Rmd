@@ -1,0 +1,370 @@
+# Robust Cell Type Decomposition (RCTD) 
+For this part we want to deconvolute the spatial data using a scRNA + snRNA seq reference dataset.
+
+```{r}
+library(spacexr)
+library(readxl)
+library(stringr)
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(S4Vectors)
+library(SpatialExperiment)
+library(SummarizedExperiment)
+library(scuttle)
+library(scran)
+library(scater)
+library(ggspavis)
+library(dplyr)
+library(ggrepel)
+library(batchelor)
+library(reshape2)
+library(Matrix)
+library(scatterpie)
+library(tidyr)
+library(pheatmap)
+library(tidyverse)
+library(purrr)
+library(grid)
+library(zellkonverter)
+
+c25 <- c(
+  "dodgerblue2", "#E31A1C", # red
+"green4",
+"#6A3D9A", # purple
+"#FF7F00", # orange
+"black", "gold1",
+"skyblue2", "#FB9A99", # lt pink
+"palegreen2",
+"#CAB2D6", # lt purple
+"#FDBF6F", # lt orange
+"gray70", "khaki2",
+"maroon", "orchid1", "deeppink1", "blue1", "steelblue4",
+"darkturquoise", "green1", "yellow4", "yellow3",
+"darkorange4", "brown"
+)
+
+
+merged_obj <-readRDS("../data/Deconvolution/sc_sn_merged_obj.Rds")
+spe <- readRDS("../data/SPE/Integrated_NMF.rds")
+colData(spe) <- DataFrame(read.csv("../data/coldata/DE_SPE_annotaion.csv"))
+colnames(spe) <- spe$barcode
+
+```
+
+First, we need to set the reference data (scRNA &snRNA seq)
+```{r}
+# extract information to pass to the RCTD Reference function
+counts <- merged_obj[["RNA"]]$counts
+cluster <- as.factor(merged_obj$cell_type_refined) # to characterize tumor 
+names(cluster) <- colnames(merged_obj)
+nUMI <- merged_obj$nCount_RNA
+names(nUMI) <- colnames(merged_obj)
+reference <- Reference(counts, cluster, nUMI)
+saveRDS(reference,"../data/Deconvolution/reference.Rds")
+```
+
+```{r}
+counts <- spe@assays@data@listData[["counts"]]
+
+image_names <- as.list(unique(spe$sample_id))
+sample_ids <- colData(spe)$sample_id
+coordinates_list <- lapply(image_names, function(image_name) {
+  pos <- spatialCoords(spe)[sample_ids == image_name, ]
+  colnames(pos) <- c('x','y')
+  return(pos)
+})
+
+coords <- do.call(rbind, coordinates_list)
+coords[is.na(colnames(coords))] <- NULL
+coords_df<-as.data.frame(coords)
+
+query <- SpatialRNA(coords_df, counts, colSums(counts))
+saveRDS(query,"../data/Deconvolution/query.Rds")
+```
+
+**This part was run in Euler (high-performance computing (HPC) clusters)**
+```{r}
+RCTD <- create.RCTD(query, reference, max_cores = 8)
+RCTD <- run.RCTD(RCTD, doublet_mode = "doublet")
+```
+
+```{r}
+RCTD <- readRDS("../data/Deconvolution/RCTD.Rds")
+
+#After the run we need to normalize the weights so then each pixel represents cell type proportions
+weights <- RCTD@results$weights
+normalized_weights <- normalize_weights(weights)
+```
+
+Now we want to see the spot composition, from the RCTD results
+```{r}
+
+W <- Diagonal(x = 1 / rowSums(weights)) %*% weights   # row-normalize without densifying
+
+barcodes <- weights@Dimnames[[1]]
+
+W_df <- as.data.frame(as.matrix(W))  
+W_df$barcode <- barcodes
+W_df <- dplyr::relocate(W_df, barcode)
+
+W_df$barcode <- as.character(W_df$barcode)
+
+names(W_df)[names(W_df) == "B"] <- "B_cells"
+names(W_df)[names(W_df) == "CD4T"] <- "Lymphocyte(CD4)"
+names(W_df)[names(W_df) == "CD8T"] <- "Lymphocyte(CD8)"
+names(W_df)[names(W_df) == "NK"] <- "Lymphocyte(NK)"
+names(W_df)[names(W_df) == "Plasma"] <- "B_cells_(Plasma_cells)"
+
+saveRDS(W_df, "../data/Deconvolution/RCTD_weights.Rds")
+```
+We map the colors for deconvolution and NMF to match the similar cell types.
+```{r}
+
+color_maping <- c( "Acinar" = "gold1",
+                   "B_cells" = "maroon",
+                   "Lymphocyte(CD4)" = "green4",
+                   "Lymphocytes" = "green4",
+                   "Myeloid(Macrophages)" = "#6A3D9A",
+                   "Endothelial" = "#FF7F00",
+                   "Endocrine" = "yellow4",
+                   "Stellate" = "khaki2",
+                   "CAF" = "skyblue2",
+                   "Adipocytes" = "steelblue4",
+                   "Lymphocyte(NK)" = "green2",
+                   "Lymphocyte(CD8)" = "palegreen2",
+                   "Myeloid" = "#CAB2D6",
+                   "Schwann" = "#FDBF6F",
+                   "Myeloid(C1q_macrophages)" = "#CAB2D6",
+                   "Nerve" = "#FDBF6F",
+                   "Muscle" = "orchid1",
+                   "Ductal_malignant" = "gray70",
+                   "Ductal_normal" = "black",
+                   "B_cells_(Plasma cells)"  = "brown1")
+
+```
+# Per nerve average composition
+Since we have so many good nerves, it is important to see the per nerve composition to see possible differences. The aim to see how similar the nerves are. 
+
+```{r}
+# Pseudobulking
+nerve_ids <- DataFrame(
+  barcode = spe$barcode,
+  id=spe$NerveID,
+  invasion = spe$Invaded,
+  patient = spe$patient_id
+)
+
+W_nerve <-W_df
+W_nerve$ID <- plyr::mapvalues(W_nerve$barcode, from = nerve_ids$barcode, to=nerve_ids$id)
+W_nerve<- W_nerve %>% drop_na()
+rownames(W_nerve) <- W_nerve$barcode
+W_nerve$barcode <- NULL
+
+cell_cols <- setdiff(names(W_nerve), "ID")
+
+nerve_decon_w <- W_nerve %>%
+  group_by(ID) %>%
+  summarise(
+    across(all_of(cell_cols), ~ mean(as.numeric(.x), na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+nerve_decon_w_long <- nerve_decon_w %>%
+  pivot_longer(cols = all_of(cell_cols), names_to = "CellType", values_to = "mean_score") %>%
+  group_by(ID) %>%
+  mutate(pct = if (sum(mean_score, na.rm = TRUE) == 0) 0 else 100 * mean_score / sum(mean_score, na.rm = TRUE)) %>%
+  ungroup()
+
+
+nerve_decon_w_long$invasion <- plyr::mapvalues(nerve_decon_w_long$ID, from = nerve_ids$id, to=nerve_ids$invasion, warn_missing = FALSE)
+nerve_decon_w_long$patient_id <- plyr::mapvalues(nerve_decon_w_long$ID, from = nerve_ids$id, to=nerve_ids$patient, warn_missing = FALSE)
+```
+
+```{r}
+p1 <- ggplot(nerve_decon_w_long[nerve_decon_w_long$invasion == 'Invaded',], aes(x = ID, y = pct, fill = CellType)) +
+  geom_bar(width = 0.5, stat="identity",color = NA) +
+  scale_fill_manual(values = color_maping) +
+  ggtitle("Invaded nerves deconvolution composition")+
+  labs(x = "Nerve ID",
+       y = "Composition") +
+  facet_grid(~ patient_id, scales = "free_x", space = "free_x", labeller = as_labeller(c(
+               "70865" = "Patient 3",
+               "6249" = "Patient 2",
+               "54703" = "Patient 1"))) +
+  theme_minimal()+
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+ggsave("../figures/Invaded_nerves_composition.pdf", p1, width = 14, height = 10)
+p1
+```
+```{r}
+p2 <- ggplot(nerve_decon_w_long[nerve_decon_w_long$invasion == 'NonInvaded',], aes(x = ID, y = pct, fill = CellType)) +
+  geom_bar(width = 0.5, stat="identity",color = NA) +
+  scale_fill_manual(values = color_maping) +
+  ggtitle("Non-invaded nerves deconvolution composition")+
+  labs(x = "Nerve ID",
+       y = "Composition") +
+  facet_grid(~ patient_id, scales = "free_x", space = "free_x", labeller = as_labeller(c(
+               "70865" = "Patient 3",
+               "6249" = "Patient 2",
+               "54703" = "Patient 1"))) +
+  theme_minimal()+
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+ggsave("../figures/Noninvaded_nerves_composition.pdf", p2, width = 14, height = 10)
+p2
+```
+
+# Visualization of composition
+Now that we have the weights, we want to visualize the composition of the important categories that we care about. 
+```{r}
+inv_nerve_barcodes <- spe[, !is.na(colData(spe)$Invaded) & colData(spe)$Invaded == "Invaded"]$barcode
+non_inv_nerve_barcodes <- spe[, !is.na(colData(spe)$Invaded) & colData(spe)$Invaded == "NonInvaded"]$barcode
+surr_inv_nerve_barcodes <- spe[, !is.na(colData(spe)$invasion) & colData(spe)$invasion == "Surr_Invaded"]$barcode
+surr_non_inv_nerve_barcodes <- spe[, !is.na(colData(spe)$invasion) & colData(spe)$invasion == "Surr_NonInvaded"]$barcode
+
+
+Avrg_inv <- W_df |> 
+  filter(barcode %in% inv_nerve_barcodes) |> 
+  select(-barcode) |> 
+  summarise(across(everything(), mean, na.rm = TRUE)) |> 
+  as.data.frame() |> 
+  tibble::as_tibble() |> 
+  pivot_longer(everything(), names_to = "cell_type", values_to = "mean") |> 
+  filter(mean > 0) |> 
+  arrange(desc(mean)) |> 
+  mutate(pct = mean / sum(mean),
+         Categ = "Invaded", location = "Inside")
+
+Avrg_non_inv <- W_df |> 
+  filter(barcode %in% non_inv_nerve_barcodes) |> 
+  select(-barcode) |> 
+  summarise(across(everything(), mean, na.rm = TRUE)) |> 
+  as.data.frame() |> 
+  tibble::as_tibble() |> 
+  pivot_longer(everything(), names_to = "cell_type", values_to = "mean") |> 
+  filter(mean > 0) |> 
+  arrange(desc(mean)) |> 
+  mutate(pct = mean / sum(mean),
+         Categ = "NonInvaded", location = "Inside")
+
+Avrg_surr_inv <- W_df |> 
+  filter(barcode %in% surr_inv_nerve_barcodes) |> 
+  select(-barcode) |> 
+  summarise(across(everything(), mean, na.rm = TRUE)) |> 
+  as.data.frame() |> 
+  tibble::as_tibble() |> 
+  pivot_longer(everything(), names_to = "cell_type", values_to = "mean") |> 
+  filter(mean > 0) |> 
+  arrange(desc(mean)) |> 
+  mutate(pct = mean / sum(mean),
+         Categ = "Invaded", location = "Proximal")
+
+Avrg_surr_non_inv <- W_df |> 
+  filter(barcode %in% surr_non_inv_nerve_barcodes) |> 
+  select(-barcode) |> 
+  summarise(across(everything(), mean, na.rm = TRUE)) |> 
+  as.data.frame() |> 
+  tibble::as_tibble() |> 
+  pivot_longer(everything(), names_to = "cell_type", values_to = "mean") |> 
+  filter(mean > 0) |> 
+  arrange(desc(mean)) |> 
+  mutate(pct = mean / sum(mean),
+         Categ = "NonInvaded", location = "Proximal")
+
+compos <- rbind(Avrg_inv,Avrg_non_inv,Avrg_surr_inv,Avrg_surr_non_inv)
+```
+
+
+```{r}
+p3 <- ggplot(compos, aes(y = location, x = pct, fill = cell_type)) +
+  geom_bar(stat = "identity", width = 0.7, color = NA) +
+  scale_x_continuous(
+    labels = function(x) x * 100,
+    expand = c(0, 0),
+    limits = c(0, 1)
+  ) +
+  scale_y_discrete(position = "right") +   
+  scale_fill_manual("Cell type", values = color_maping) +
+  facet_grid(Categ ~ ., switch = "y") +    
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.title = element_blank(),
+    axis.text.x = element_text(size = 10),
+    axis.text.y.right = element_text(size = 10),  
+    axis.text.y.left  = element_text(size = 10),        
+    axis.ticks.y.left = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text.y = element_text(angle = 0),
+    strip.placement = "outside",
+    legend.position = "bottom",
+    plot.margin = margin(10, 10, 20, 10)
+  )
+ggsave("../figures/F2_C.pdf", p3, width = 8, height = 4)
+p3
+```
+
+# Heatmap with z-scores
+Now that we have the cell type information, we want to see the contribution of the different cell types in our categories.
+```{r}
+sub_spe <- spe[, colData(spe)$invasion != "other" ] #to have more clear results 
+
+rownames(W_df) <- W_df$barcode
+W_df$barcode <-NULL
+
+sub_w <- W_df[rownames(W_df) %in% sub_spe$barcode, , drop = TRUE]
+
+categories <- data.frame(
+  barcodes = as.character(colData(sub_spe)[, "barcode"]),
+  category = as.character(colData(sub_spe)[, "invasion"]))
+cats <- unique(categories$category)
+cell_types <- colnames(W_df)
+
+# ---- Function for enrichment z-score ----
+enrichment_z <- function(vec, group, target_cat) {
+  bcs_in  <- group$barcodes[group$category == target_cat]
+  x_in  <- vec[bcs_in]
+  mu_in <- mean(x_in,  na.rm = TRUE)
+  mu_all<- mean(vec, na.rm = TRUE)
+  (mu_in - mu_all) / sd(vec)
+}
+
+```
+
+```{r}
+z_mat <- sapply(cell_types, function(ct) {
+ v <- setNames(sub_w[, ct], rownames(sub_w))
+  sapply(cats, function(ca) enrichment_z(v, categories, ca))
+})
+rownames(z_mat) <- cats
+rownames(z_mat) <- dplyr::recode(rownames(z_mat),
+                                 "Surr_Invaded" = "Invaded nerve proximal",
+                                 "Nerve" = "Non-invaded nerve",
+                                 "Surr_NonInvaded" = "Non-invaded nerve proximal",
+                                 "InvadedNerve" = "Invaded nerve",
+                                 "TumorDistal" = "Tumor Distal")
+colnames(z_mat) <- gsub("_", " ", colnames(z_mat))
+
+p4 <- pheatmap(z_mat,
+         cluster_rows = TRUE, cluster_cols = TRUE,
+         scale = "none",
+         color = colorRampPalette(c(c25[1], "white", c25[2]))(100),
+         fontsize_number = 10)
+
+ggsave("../figures/heatmap_deconvolution.pdf", p4, width = 12, height = 6)
+p4
+```
+Saving the SPE object for python analysis.
+```{r}
+writeH5AD(spe,"../data/SPE/clean_adata.h5ad",X_name="logcounts",verbose=TRUE)
+```
+

@@ -1,0 +1,117 @@
+```{r}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+```
+
+```{r}
+input_file <- "input_files/wound_closure_gradient_Draxin.csv"
+output_dir <- "output/wound_closure/gradient"
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+df_dose <- read.csv(input_file)
+
+df_dose <- df_dose %>%
+  mutate(
+    Experiment = factor(Experiment),
+    Concentration_nM = as.numeric(Concentration_nM),
+    Concentration_factor = factor(
+      Concentration_nM,
+      levels = sort(unique(Concentration_nM))
+    )
+  )
+
+# ensure 0 is reference
+df_dose$Concentration_factor <- relevel(df_dose$Concentration_factor, ref = "0")
+
+stopifnot("0" %in% levels(df_dose$Concentration_factor))
+```
+
+```{r}
+model_dose <- lm(
+  Cell_front_velocity ~ Concentration_factor + Experiment,
+  data = df_dose
+)
+
+model_summary <- summary(model_dose)
+model_anova <- anova(model_dose)
+
+emm <- emmeans(model_dose, ~ Concentration_factor)
+
+levs <- levels(df_dose$Concentration_factor)
+print(levs)
+
+ctrl_index <- which(levs == "0")
+
+if (length(ctrl_index) != 1) {
+  stop("Control level '0' was not found exactly once in Concentration_factor levels.")
+}
+
+dose_contrasts <- as.data.frame(
+  contrast(emm, method = "trt.vs.ctrl", ref = ctrl_index, adjust = "BH")
+)
+
+# save outputs
+capture.output(model_summary,
+               file = file.path(output_dir, "dose_model_summary.txt"))
+
+capture.output(model_anova,
+               file = file.path(output_dir, "dose_model_anova.txt"))
+
+write.csv(dose_contrasts,
+          file.path(output_dir, "dose_vs_0nM_BH.csv"),
+          row.names = FALSE)
+```
+
+
+```{r}
+df_dose$log10_conc_plus1 <- log10(df_dose$Concentration_nM + 1)
+
+model_trend <- lm(
+  Cell_front_velocity ~ log10_conc_plus1 + Experiment,
+  data = df_dose
+)
+
+capture.output(summary(model_trend),
+               file = file.path(output_dir, "dose_trend_summary.txt"))
+
+capture.output(anova(model_trend),
+               file = file.path(output_dir, "dose_trend_anova.txt"))
+```
+
+```{r}
+p_raw <- ggplot(df_dose,
+                aes(x = Concentration_factor, y = Cell_front_velocity)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(color = Experiment),
+              width = 0.15, alpha = 0.8, size = 2) +
+  theme_classic() +
+  labs(
+    title = "DRAXIN dose response",
+    x = "DRAXIN concentration (nM)",
+    y = "Cell front velocity"
+  )
+
+ggsave(file.path(output_dir, "dose_boxplot.pdf"), p_raw, width = 6, height = 5)
+ggsave(file.path(output_dir, "dose_boxplot.png"), p_raw, width = 6, height = 5, dpi = 300)
+```
+
+```{r}
+summary_dose <- df_dose %>%
+  group_by(Concentration_nM) %>%
+  summarise(
+    n = n(),
+    n_experiments = n_distinct(Experiment),
+    mean_velocity = mean(Cell_front_velocity, na.rm = TRUE),
+    sd_velocity = sd(Cell_front_velocity, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write.csv(summary_dose,
+          file.path(output_dir, "dose_summary.csv"),
+          row.names = FALSE)
+
+```
+

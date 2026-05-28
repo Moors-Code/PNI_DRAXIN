@@ -1,0 +1,618 @@
+#========================================
+# Gene Expression Profiles Across Nerve Categories
+#========================================
+#
+# This script analyses gene expression across three nerve states:
+# NonInvaded_Adjacent, NonInvaded_Diseased, and Invaded nerves
+# in a spatial transcriptomic dataset.
+#
+# Gene expression is averaged per patient and nerve category,
+# then aggregated across patients to obtain robust category-level
+# profiles. Values are z-scored per gene to highlight relative
+# differences between nerve states.
+#
+# Three gene panels are evaluated:
+# 1. Curated immune and stromal-response genes
+# 2. Invasion-associated genes from differential analysis
+# 3. Tumour/NMF-correlated genes
+#
+# The script generates both heatmaps (category-level trends)
+# and violin plots (spot-level distributions).
+#
+# Output:
+# - Figure2E_heatmap.pdf
+# - Violin_gene_plots_figure2.pdf
+# - Heatmap_genes_3_categories_figure2.pdf
+# - Figure3_invasion_gene_heatmap.pdf
+# - Figure3_tumorNMF_correlated_gene_heatmap.pdf
+
+Here, we want to see the average gene expression across the different categories.
+```{r}
+#========================================
+# 1. Load libraries and input data
+#========================================
+#
+# This section loads all required R packages, defines the color palette,
+# imports the integrated SpatialExperiment object, and replaces its column
+# metadata with the annotated table used for downstream analysis.
+#
+library(ggplot2)
+library(patchwork)
+library(rlang)
+library(SpatialExperiment)
+library(SummarizedExperiment)
+library(scuttle)
+library(scran)
+library(scater)
+library(dplyr)
+library(tidyr)
+library(ggsc)
+
+c25 <- c(
+  "dodgerblue2", "#E31A1C", # red
+"green4",
+"#6A3D9A", # purple
+"#FF7F00", # orange
+"black", "gold1",
+"skyblue2", "#FB9A99", # lt pink
+"palegreen2",
+"#CAB2D6", # lt purple
+"#FDBF6F", # lt orange
+"gray70", "khaki2",
+"maroon", "orchid1", "deeppink1", "blue1", "steelblue4",
+"darkturquoise", "green1", "yellow4", "yellow3",
+"darkorange4", "brown"
+)
+
+spe <- readRDS("../data/SPE/Integrated_NMF.rds")
+colData(spe) <- DataFrame(read.csv("../data/coldata/DE_SPE_annotaion.csv"))
+colnames(spe) <- spe$barcode
+
+```
+
+
+```{r}
+#========================================
+# 2. Subset nerve spots and define nerve categories
+#========================================
+#
+# This section subsets the dataset to nerve spots only and defines the
+# comparison groups used throughout the analysis. Non-invaded nerves are
+# relabelled as either Adjacent or Diseased depending on tissue context,
+# while invaded nerves remain as Invaded.
+#
+
+nerve_spe <- spe[, colData(spe)$is.nerve == TRUE]
+nerve_spe$types <- nerve_spe$type
+colData(nerve_spe)$types[!colData(nerve_spe)$types == "noPNI"] <- "Diseased"
+colData(nerve_spe)$types[colData(nerve_spe)$types == "noPNI"] <- "Adjacent"
+
+colData(nerve_spe)$nerve_types <- nerve_spe$Invaded
+colData(nerve_spe)$nerve_types <- ifelse(
+  colData(nerve_spe)$Invaded == "NonInvaded",
+  paste0(colData(nerve_spe)$Invaded, "_", colData(nerve_spe)$types),
+  colData(nerve_spe)$nerve_types
+)
+nerve_spe <- nerve_spe[, !is.na(colData(nerve_spe)$nerve_types)]
+```
+
+```{r}
+#========================================
+# 3. Define gene sets and prepare averaged expression matrix
+#========================================
+#
+# This section defines biologically selected gene sets of interest (selected from GSEA results, genes listed as driving enrichment), keeps # # only genes present in the dataset, extracts the log-normalized expression matrix,
+# and computes mean expression first per patient and nerve category, and then
+# across patients for each nerve category.
+#
+# Expression values are subsequently z-scored per gene to highlight relative
+# enrichment patterns across categories.
+
+keep_genes <- function(x) intersect(x, rownames(nerve_spe))
+
+gene_sets <- list(
+  "Endothelial_activation_transport" = keep_genes(c("VCAM1","SELP","JAM2","ACKR1","PLVAP","CLDN5")),
+  "Lymphoid_chemokine_axis" = keep_genes(c("CCL21","CXCL12","CCL19","SELL", "CCL5")),
+  "Tcells/NKcells" = keep_genes(c("CD8A","TRAC","ZAP70","IL7R","KLRK1")),
+  "Plasma_humoral" = keep_genes(c("XBP1","JCHAIN","BCL6","POU2F2","IKZF1","CD52")),
+  "Myeloid_macrophage" = keep_genes(c("CD14","C5AR1","CSF1R","CD163","HMOX1","APOE","C1QA","C1QC","FOLR2","MRC1","STAB1")),
+  "Complement" = keep_genes(c("C3","CFD","CR1","C1R","C1S","SERPING1","C7")),
+  "IFN_inflammation" = keep_genes(c("IFIT2","IFITM3","DHX58","IFI16","BATF2")),
+  "Immunoregulation" = keep_genes(c("THBS1","FGL2","FCGR2B","IL10RA","VSIR","CD200")),
+  "IL6_STAT3_axis" = keep_genes(c("IL6","OSMR","SOCS3","NAMPT","IL1R1")),
+  "Prostaglandin" = keep_genes(c("PTGER4","PTGDS","PTGER3", "P2RY6"))
+ # "Stromal remodeling" = keep_genes(c("ADAMTS9","ADAMTS4","FBN1", "DCN", "TNXB", "EFEMP1", "FSTL1"))
+)
+
+gene_map <- stack(gene_sets)
+colnames(gene_map) <- c("gene","category")
+gene_map$category <- factor(gene_map$category, levels = names(gene_sets))
+
+assay_name <- "logcounts"
+expr <- as.matrix(assay(nerve_spe, assay_name))  # genes x spots
+
+meta <- as.data.frame(colData(nerve_spe))[, c("patient_id","nerve_types")]
+
+genes <- unique(gene_map$gene)
+expr <- expr[genes, , drop=FALSE]
+
+# ---- force nerve_types order ----
+# ---- force nerve_types order (match your constructed labels) ----
+nerve_order <- c("NonInvaded_Adjacent", "NonInvaded_Diseased", "Invaded")
+meta$nerve_types <- factor(meta$nerve_types, levels = nerve_order)
+
+# (optional) sanity check:
+# table(meta$nerve_types, useNA = "ifany")
+
+
+# mean per patient x nerve_type
+grp <- paste(meta$patient_id, meta$nerve_types, sep="___")
+levs <- unique(grp)
+
+expr_patient_type <- sapply(levs, function(g) {
+  cols <- which(grp == g)
+  Matrix::rowMeans(expr[, cols, drop=FALSE])
+})
+colnames(expr_patient_type) <- levs
+
+# mean across patients (collapse to nerve_types)
+# mean across patients (collapse to nerve_types) in forced order
+nerve_types <- sub("^.*___", "", colnames(expr_patient_type))
+
+nerve_order_present <- nerve_order[nerve_order %in% nerve_types]
+
+expr_type <- sapply(nerve_order_present, function(nt) {
+  Matrix::rowMeans(expr_patient_type[, nerve_types == nt, drop=FALSE])
+})
+expr_type <- as.matrix(expr_type)  # genes x nerve_types
+
+# z-score per gene (like center+scale)
+expr_z <- t(scale(t(expr_type)))
+expr_z[is.na(expr_z)] <- 0
+
+df <- as.data.frame(expr_z) %>%
+  tibble::rownames_to_column("gene") %>%
+  pivot_longer(-gene, names_to="nerve_type", values_to="z") %>%
+  left_join(gene_map, by="gene") %>%
+  filter(!is.na(category))
+
+# order genes within category (optional): keep your gene_sets order
+gene_order <- unlist(gene_sets, use.names = FALSE)
+gene_order <- gene_order[gene_order %in% unique(df$gene)]
+df$gene <- factor(df$gene, levels = rev(gene_order))  # rev so top-to-bottom reads nicely
+df$nerve_type <- factor(df$nerve_type, levels = nerve_order_present)
+```
+
+```{r}
+#========================================
+# 4. Plot scaled heatmap of selected genes
+#========================================
+#
+# This section generates a heatmap of scaled average gene expression across
+# nerve categories. Genes are grouped by biological category, and expression
+# is shown as z-scores to emphasize relative up- and downregulation.
+
+p <- ggplot(df, aes(x = nerve_type, y = gene, fill = z)) +
+  geom_tile() +
+  facet_grid(rows = vars(category), scales = "free_y", space = "free_y") +
+  scale_fill_distiller(
+  palette = "RdBu",
+  direction = -1
+) +
+theme_bw() +
+  theme(
+    panel.spacing.y = unit(0.6, "lines"),
+    strip.text.y = element_text(angle = 0),
+    axis.text.y = element_text(size = 7)
+  ) +
+  labs(x = NULL, y = NULL)
+
+p
+```
+
+```{r}
+#========================================
+# 5. Save category-level heatmap
+#========================================
+#
+# This section saves the scaled heatmap of selected genes across nerve
+# categories as a publication-quality PDF.
+#
+
+ ggsave(
+  filename = "Figure2E_heatmap.pdf",
+  plot = p,
+  width = 5,
+  height = 10,
+  units = "in",
+  dpi = 600
+)
+```
+
+```{r}
+#========================================
+# 6. Define gene groups and generate violin plots
+#========================================
+#
+# This section defines all curated gene groups of interest, generates violin
+# plots for each group using a reusable helper function, combines all plots
+# into a single figure, and reuses the same gene list for the grouped heatmap.
+
+
+# Define all gene groups in one place
+gene_groups <- list(
+  "C3 Fibroblasts" = c("C3", "CFH", "SPARCL1", "CXCL12", "APOD", "APOE"),
+  "Lymphocyte Recruitment" = c("VCAM1", "SELL", "JAM2", "CCL21"),
+  "Agprocessing" = c("FCGR2B", "THBS1", "FGL2"),
+  "B cell" = c("BCL6", "XBP1", "CR1"),
+  "Complement" = c("C1QA", "CFD", "C1QC", "RGCC"),
+  "PGE2" = c("SFRP1", "PTGER4", "P2RY6"),
+  "IFNgamma" = c("STAT4", "IFIT2", "IFITM3", "SOCS3"),
+  "IL6" = c("IL6", "OSMR", "HMOX1", "CD36"),
+  "Inflammatory" = c("CX3CL1", "C5AR1", "IL1R1", "IL10RA", "IL18R1", "CCL2", "CD14"),
+  "ERK1_ERK2" = c("CSF1R", "BRAF", "DNAJC27", "NRP1")
+)
+
+# Set grouping labels for plotting
+colLabels(nerve_spe) <- colData(nerve_spe)$nerve_types
+
+# Helper function to generate one violin plot panel
+make_violin_plot <- function(spe_obj, genes, plot_title, slot_name = "logcounts", ncol = 3) {
+  
+  # keep only genes present in the object
+  genes <- intersect(genes, rownames(spe_obj))
+  
+  p <- sc_violin(
+    spe_obj,
+    features = genes,
+    slot = slot_name,
+    ncol = ncol
+  ) +
+    ggplot2::theme_bw() +
+    labs(title = plot_title) +
+    xlab("Category") +
+    ylab("Gene expression")
+  
+  facet_var <- as_name(p$facet$params$facets[[1]])
+  p + facet_wrap(vars(!!sym(facet_var)), scales = "free_y")
+}
+
+# Generate all violin plots automatically
+violin_plots <- lapply(names(gene_groups), function(group_name) {
+  make_violin_plot(
+    spe_obj = nerve_spe,
+    genes = gene_groups[[group_name]],
+    plot_title = group_name,
+    ncol = if (group_name == "C3 Fibroblasts") 2 else 3
+  )
+})
+
+names(violin_plots) <- names(gene_groups)
+
+# Combine plots into one figure
+combined_plots <- wrap_plots(violin_plots, ncol = 1)
+
+# Save combined violin plot figure
+ggsave(
+  filename = "../figures/Violin_gene_plots_figure2.pdf",
+  plot = combined_plots,
+  width = 16,
+  height = 30,
+  units = "in"
+)
+
+combined_plots
+```
+
+```{r}
+#========================================
+# 7. Reuse the same gene groups for grouped heatmap
+#========================================
+#
+# This section combines all genes from the curated gene groups and visualizes
+# them in a grouped heatmap across nerve categories, with patient-level blocking.
+#
+
+Genes_of_interest <- unique(unlist(gene_groups))
+
+Genes_of_interest <- Genes_of_interest[Genes_of_interest %in% rownames(nerve_spe)]
+
+p11 <- plotGroupedHeatmap(
+  nerve_spe,
+  group = "nerve_types",
+  features = Genes_of_interest,
+  block = "patient_id",
+  center = TRUE,
+  scale = TRUE,
+  fontsize = 14
+)
+```
+
+```{r}
+#========================================
+# 8. Save category-level heatmap
+#========================================
+#
+# This section saves the scaled heatmap of selected genes across nerve
+# categories as a publication-quality PDF.
+#
+
+ggsave(
+  filename = "../figures/Heatmap_genes_3_categories_figure2.pdf",
+  plot = p11,
+  width = 8,
+  height = 16
+)
+
+p11
+```
+
+```{r}
+#========================================
+# 9. Plot selected invasion-associated genes across nerve categories
+#========================================
+#
+# This section visualises a second curated gene panel derived from the
+# 342 genes identified across the two invasion-related contrasts.
+# These genes were selected to represent invasion-associated programs such as
+# nerve injury, synaptic-like signalling, extracellular matrix remodeling,
+# vasculature association, axon guidance, myelin debris clearance, and
+# Schwann cell niche signalling.
+#
+# As above, expression is averaged first within each patient and nerve
+# category, then across patients for each nerve category, and finally
+# z-scored per gene to highlight relative enrichment patterns.
+
+keep_genes <- function(x) intersect(x, rownames(nerve_spe))
+
+gene_sets_invasion <- list(
+  "Nerve_injury" = keep_genes(c("GAP43", "GLI3", "GFRA2", "NRCAM", "NES", "SOX2")),
+
+  "Synaptic/Glutamatergic" = keep_genes(c("SYT11", "DLGAP1", "SYNGAP1", "SYNPO", "CNIH3")),
+
+  "Extracellular_Matrix" = keep_genes(c("ITGAV", "ITGA1", "DAG1", "MMP17", "MMP28", "PLOD3")),
+
+  "Vasculature_associated" = keep_genes(c("ESM1", "EDIL3", "VEZF1", "ENTPD1", "THSD7B")),
+
+  "Axon_guidance" = keep_genes(c("NAV2", "EPHB2", "UNC5C", "PLXNC1", "DRAXIN", "SEMA3C")),
+
+  "Myelin_debris_clearance" = keep_genes(c("GAL3ST1", "SCD", "LPIN1", "AXL", "FABP5", "CLCN7")),
+
+  "SC_niche_signaling" = keep_genes(c("CLCF1", "CRLF1", "IL11", "CCN3", "FGF5", "BTC"))
+)
+```
+
+```{r}
+
+#========================================
+# 10. Prepare averaged expression matrix for invasion-associated genes
+#========================================
+#
+# This section reshapes the selected invasion-associated genes into a grouped
+# expression matrix, computes mean expression per patient and nerve category,
+# then collapses these values across patients to obtain category-level averages.
+# Expression values are then z-scored per gene for heatmap visualisation.
+
+gene_map_invasion <- stack(gene_sets_invasion)
+colnames(gene_map_invasion) <- c("gene","category")
+gene_map_invasion$category <- factor(gene_map_invasion$category, levels = names(gene_sets_invasion))
+
+assay_name <- "logcounts"
+expr <- as.matrix(assay(nerve_spe, assay_name))
+
+meta <- as.data.frame(colData(nerve_spe))[, c("patient_id","nerve_types")]
+
+genes <- unique(gene_map_invasion$gene)
+expr <- expr[genes, , drop = FALSE]
+
+grp <- paste(meta$patient_id, meta$nerve_types, sep = "___")
+levs <- unique(grp)
+
+expr_patient_type <- sapply(levs, function(g) {
+  cols <- which(grp == g)
+  Matrix::rowMeans(expr[, cols, drop = FALSE])
+})
+colnames(expr_patient_type) <- levs
+
+nerve_types <- sub("^.*___", "", colnames(expr_patient_type))
+nerve_order <- c("NonInvaded_Adjacent", "NonInvaded_Diseased", "Invaded")
+nerve_order_present <- nerve_order[nerve_order %in% nerve_types]
+
+expr_type <- sapply(nerve_order_present, function(nt) {
+  Matrix::rowMeans(expr_patient_type[, nerve_types == nt, drop = FALSE])
+})
+expr_type <- as.matrix(expr_type)
+
+expr_z <- t(scale(t(expr_type)))
+expr_z[is.na(expr_z)] <- 0
+
+df_invasion <- as.data.frame(expr_z) %>%
+  tibble::rownames_to_column("gene") %>%
+  pivot_longer(-gene, names_to = "nerve_type", values_to = "z") %>%
+  left_join(gene_map_invasion, by = "gene") %>%
+  filter(!is.na(category))
+
+gene_order_invasion <- unlist(gene_sets_invasion, use.names = FALSE)
+gene_order_invasion <- gene_order_invasion[gene_order_invasion %in% unique(df_invasion$gene)]
+
+df_invasion$gene <- factor(df_invasion$gene, levels = rev(gene_order_invasion))
+df_invasion$nerve_type <- factor(df_invasion$nerve_type, levels = nerve_order_present)
+```
+
+```{r}
+#========================================
+# 11. Plot heatmap of invasion-associated genes
+#========================================
+#
+# This section generates a heatmap of scaled average expression for the
+# selected invasion-associated genes across the three nerve categories.
+# Genes are grouped by biological program, and values are displayed as
+# z-scores to emphasise relative enrichment between categories.
+
+p_invasion <- ggplot(df_invasion, aes(x = nerve_type, y = gene, fill = z)) +
+  geom_tile() +
+  facet_grid(rows = vars(category), scales = "free_y", space = "free_y") +
+  scale_fill_distiller(
+    palette = "RdBu",
+    direction = -1
+  ) +
+  theme_bw() +
+  theme(
+    panel.spacing.y = unit(0.6, "lines"),
+    strip.text.y = element_text(angle = 0),
+    axis.text.y = element_text(size = 7)
+  ) +
+  labs(x = NULL, y = NULL)
+
+p_invasion
+```
+
+```{r}
+#========================================
+# 12. Save invasion-associated gene heatmap
+#========================================
+#
+# This section saves the heatmap of scaled average expression for the selected
+# invasion-associated genes as a publication-quality PDF.
+
+
+ggsave(
+  filename = "../figures/Figure3_invasion_gene_heatmap.pdf",
+  plot = p_invasion,
+  width = 5,
+  height = 10,
+  units = "in",
+  dpi = 600
+)
+```
+
+```{r}
+#========================================
+# 13. Define tumour/NMF-correlated gene set
+#========================================
+#
+# This section defines a focused set of genes associated with
+# tumour-derived NMF programs.
+#
+
+keep_genes2 <- function(x) intersect(x, rownames(nerve_spe))
+
+gene_sets2 <- list(
+  "Tumor_NMF_correlated" = keep_genes2(c(
+    "PDGFA","PDGFB","AXIN2","SEMA3C","EPHB2","EXOC8","WHAMM","CDC42BPA","SQSTM1","WIPI2","CHST11"
+  ))
+)
+
+```
+
+```{r}
+#========================================
+# 14. Prepare averaged expression matrix (NMF genes)
+#========================================
+#
+# This section computes mean expression per patient and nerve
+# category, then aggregates across patients and z-scores per gene.
+#
+
+gene_map2 <- stack(gene_sets2)
+colnames(gene_map2) <- c("gene","category")
+gene_map2$category <- factor(gene_map2$category, levels = names(gene_sets2))
+
+assay_name2 <- "logcounts"
+expr2 <- as.matrix(assay(nerve_spe, assay_name2))  # genes x spots
+
+meta2 <- as.data.frame(colData(nerve_spe))[, c("patient_id","nerve_types")]
+stopifnot(all(c("patient_id","nerve_types") %in% colnames(meta2)))
+
+## subset to the genes you want
+genes2 <- unique(gene_map2$gene)
+expr2 <- expr2[genes2, , drop = FALSE]
+
+## group spots by patient x nerve_type
+grp2  <- paste(meta2$patient_id, meta2$nerve_types, sep="___")
+levs2 <- unique(grp2)
+
+## mean per (patient x nerve_type)
+expr_patient_type2 <- sapply(levs2, function(g) {
+  cols <- which(grp2 == g)
+  Matrix::rowMeans(expr2[, cols, drop = FALSE])
+})
+expr_patient_type2 <- as.matrix(expr_patient_type2)
+colnames(expr_patient_type2) <- levs2
+
+## collapse to nerve_types by averaging across patients
+nerve_types2 <- sub("^.*___", "", colnames(expr_patient_type2))
+nt_levels2   <- unique(meta2$nerve_types)  # preserves your original ordering in metadata
+
+expr_type2 <- sapply(nt_levels2, function(nt) {
+  cols <- which(nerve_types2 == nt)
+  if (length(cols) == 0) return(rep(NA_real_, nrow(expr_patient_type2)))
+  Matrix::rowMeans(expr_patient_type2[, cols, drop = FALSE])
+})
+expr_type2 <- as.matrix(expr_type2)
+rownames(expr_type2) <- rownames(expr_patient_type2)
+colnames(expr_type2) <- nt_levels2
+
+## z-score per gene
+expr_z2 <- t(scale(t(expr_type2)))
+expr_z2[is.na(expr_z2)] <- 0
+
+## build plotting dataframe (IMPORTANT: join with gene_map2, not gene_map)
+df2 <- as.data.frame(expr_z2) |>
+  tibble::rownames_to_column("gene") |>
+  tidyr::pivot_longer(-gene, names_to="nerve_type", values_to="z") |>
+  dplyr::left_join(gene_map2, by="gene") |>
+  dplyr::filter(!is.na(category))
+
+## order genes within category following gene_sets2
+gene_order2 <- unlist(gene_sets2, use.names = FALSE)
+gene_order2 <- gene_order2[gene_order2 %in% unique(df2$gene)]
+df2$gene <- factor(df2$gene, levels = rev(gene_order2))
+df2$nerve_type <- factor(df2$nerve_type, levels = colnames(expr_z2))
+df2$category <- factor(df2$category, levels = names(gene_sets2))
+
+```
+
+```{r}
+#========================================
+# 15. Plot heatmap of tumour/NMF-correlated genes
+#========================================
+#
+# This section visualises scaled expression of NMF-correlated genes
+# across nerve categories.
+#
+
+class(nerve_spe)
+p2 <- ggplot(df2, aes(x = nerve_type, y = gene, fill = z)) +
+  geom_tile() +
+  facet_grid(rows = vars(category), scales = "free_y", space = "free_y") +
+  scale_fill_distiller(palette = "RdBu", direction = -1) +
+  theme_bw() +
+  theme(
+    panel.spacing.y = grid::unit(0.6, "lines"),
+    strip.text.y = element_text(angle = 0),
+    axis.text.y = element_text(size = 7)
+  ) +
+  labs(x = NULL, y = NULL)
+
+p2
+```
+
+```{r}
+#========================================
+# 16. Save tumour/NMF-correlated gene heatmap
+#========================================
+#
+# This section exports the heatmap as a publication-quality PDF.
+#
+
+
+ggsave(
+  filename = "../figures/Figure3_tumorNMF_correlated_gene_heatmap.pdf",
+  plot = p2,
+  width = 5,
+  height = 10,
+  units = "in",
+  dpi = 600
+)
+```

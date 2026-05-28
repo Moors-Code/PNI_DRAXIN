@@ -1,0 +1,748 @@
+```{r}
+# =======================
+# PACKAGES
+# =======================
+library(readr)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(pracma)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(purrr)
+library(broom)
+```
+
+```{r}
+# =======================
+# INPUT / OUTPUT
+# =======================
+file <- "input_files/timing_of_Draxin_addition.csv"
+out_dir <- "output/growth_assays/timing"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# =======================
+# READ DATA
+# Required columns:
+#   Experiment
+#   Replicate
+#   Draxin   (used here as treatment/timing condition)
+#   Hr  (or Hour)
+#   Count
+# =======================
+df_raw <- read_csv(file, show_col_types = FALSE)
+
+# Allow either Hr or Hour in input
+if ("Hr" %in% names(df_raw) && !("Hour" %in% names(df_raw))) {
+  df_raw <- df_raw %>% rename(Hour = Hr)
+}
+
+required_cols <- c("Experiment", "Replicate", "Draxin", "Hour", "Count")
+missing_cols <- setdiff(required_cols, names(df_raw))
+
+if (length(missing_cols) > 0) {
+  stop(paste("Missing required columns:", paste(missing_cols, collapse = ", ")))
+}
+
+# Rename Draxin column internally to Treatment for clarity
+df <- df_raw %>%
+  rename(Treatment = Draxin) %>%
+  mutate(
+    Experiment = factor(Experiment),
+    Replicate  = factor(Replicate),
+    Treatment  = str_trim(as.character(Treatment)),
+    Hour       = as.numeric(Hour),
+    Count      = as.numeric(Count)
+  ) %>%
+  filter(
+    !is.na(Experiment),
+    !is.na(Replicate),
+    !is.na(Treatment),
+    !is.na(Hour),
+    !is.na(Count)
+  )
+
+# Optional manual order
+treatment_order <- c("ctrl", "all_the_time", "after_24hr", "only_24hr")
+treatment_order_present <- treatment_order[treatment_order %in% unique(df$Treatment)]
+
+if (length(treatment_order_present) == 0) {
+  treatment_order_present <- sort(unique(df$Treatment))
+}
+
+df <- df %>%
+  mutate(Treatment = factor(Treatment, levels = treatment_order_present))
+
+if (!("ctrl" %in% levels(df$Treatment))) {
+  stop("Control level 'ctrl' was not found in Treatment column.")
+}
+```
+
+```{r}
+# =======================
+# INPUT SANITY CHECKS
+# =======================
+
+# 1) Save column names
+colnames_df <- data.frame(
+  column_name = names(df)
+)
+
+write.csv(
+  colnames_df,
+  file.path(out_dir, "input_column_names.csv"),
+  row.names = FALSE
+)
+
+# 2) Number of unique values in each column
+column_uniques <- data.frame(
+  column_name = names(df),
+  n_unique = sapply(df, function(x) dplyr::n_distinct(x))
+)
+
+write.csv(
+  column_uniques,
+  file.path(out_dir, "input_n_unique_per_column.csv"),
+  row.names = FALSE
+)
+
+# 3) Unique values for key columns
+unique_experiment <- data.frame(Experiment = sort(unique(as.character(df$Experiment))))
+unique_replicate  <- data.frame(Replicate = sort(unique(as.character(df$Replicate))))
+unique_treatment  <- data.frame(Treatment = levels(df$Treatment))
+unique_hour       <- data.frame(Hour = sort(unique(df$Hour)))
+
+write.csv(
+  unique_experiment,
+  file.path(out_dir, "unique_Experiment_values.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  unique_replicate,
+  file.path(out_dir, "unique_Replicate_values.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  unique_treatment,
+  file.path(out_dir, "unique_Treatment_values.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  unique_hour,
+  file.path(out_dir, "unique_Hour_values.csv"),
+  row.names = FALSE
+)
+
+# 4) Number of rows per Experiment × Replicate × Treatment
+curve_sizes <- df %>%
+  count(Experiment, Replicate, Treatment, name = "n_rows") %>%
+  arrange(Experiment, Replicate, Treatment)
+
+write.csv(
+  curve_sizes,
+  file.path(out_dir, "rows_per_curve.csv"),
+  row.names = FALSE
+)
+
+# 5) Basic Count summary per curve
+curve_count_summary <- df %>%
+  group_by(Experiment, Replicate, Treatment) %>%
+  summarise(
+    n_timepoints = n(),
+    min_hour = min(Hour, na.rm = TRUE),
+    max_hour = max(Hour, na.rm = TRUE),
+    mean_count = mean(Count, na.rm = TRUE),
+    median_count = median(Count, na.rm = TRUE),
+    sd_count = sd(Count, na.rm = TRUE),
+    min_count = min(Count, na.rm = TRUE),
+    max_count = max(Count, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(Experiment, Replicate, Treatment)
+
+write.csv(
+  curve_count_summary,
+  file.path(out_dir, "count_summary_per_curve.csv"),
+  row.names = FALSE
+)
+
+# 6) Timepoint coverage per curve as a compact string
+timepoint_coverage <- df %>%
+  group_by(Experiment, Replicate, Treatment) %>%
+  summarise(
+    timepoints = paste(sort(unique(Hour)), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  arrange(Experiment, Replicate, Treatment)
+
+write.csv(
+  timepoint_coverage,
+  file.path(out_dir, "timepoint_coverage_per_curve.csv"),
+  row.names = FALSE
+)
+
+# 7) Quick overview in console
+cat("\n=======================\n")
+cat("INPUT DATA SUMMARY\n")
+cat("=======================\n")
+cat("Rows:", nrow(df), "\n")
+cat("Columns:", ncol(df), "\n\n")
+
+cat("Experiments:", paste(sort(unique(as.character(df$Experiment))), collapse = ", "), "\n")
+cat("Replicates:", paste(sort(unique(as.character(df$Replicate))), collapse = ", "), "\n")
+cat("Treatments:", paste(levels(df$Treatment), collapse = ", "), "\n")
+cat("Hours:", paste(sort(unique(df$Hour)), collapse = ", "), "\n\n")
+
+cat("Rows per Treatment:\n")
+print(df %>% count(Treatment))
+
+cat("\nRows per Experiment x Treatment:\n")
+print(df %>% count(Experiment, Treatment))
+
+cat("\nDone with input sanity checks.\n\n")
+```
+
+```{r}
+# =======================
+# BASIC QC
+# =======================
+dup_check <- df %>%
+  count(Experiment, Replicate, Treatment, Hour) %>%
+  filter(n > 1)
+
+write.csv(
+  dup_check,
+  file.path(out_dir, "duplicate_timepoints_check.csv"),
+  row.names = FALSE
+)
+
+baseline_check <- df %>%
+  group_by(Experiment, Replicate, Treatment) %>%
+  arrange(Hour, .by_group = TRUE) %>%
+  summarise(
+    n_timepoints = n(),
+    baseline_hr = first(Hour),
+    baseline_count = first(Count),
+    .groups = "drop"
+  )
+
+write.csv(
+  baseline_check,
+  file.path(out_dir, "baseline_check.csv"),
+  row.names = FALSE
+)
+
+bad_baseline <- baseline_check %>%
+  filter(is.na(baseline_count) | baseline_count <= 0)
+
+write.csv(
+  bad_baseline,
+  file.path(out_dir, "bad_baseline_curves.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+# =======================
+# NORMALIZE TO BASELINE
+# within each Experiment × Replicate × Treatment
+# =======================
+df_norm <- df %>%
+  group_by(Experiment, Replicate, Treatment) %>%
+  arrange(Hour, .by_group = TRUE) %>%
+  mutate(
+    baseline_hr = first(Hour),
+    baseline_count = first(Count),
+    Count_norm = Count / baseline_count
+  ) %>%
+  ungroup() %>%
+  filter(
+    !is.na(Count_norm),
+    is.finite(Count_norm),
+    !is.na(baseline_count),
+    baseline_count > 0
+  )
+
+write.csv(
+  df_norm,
+  file.path(out_dir, "normalized_timecourse.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+# =======================
+# SUMMARY FOR PLOTTING
+# =======================
+df_plot <- df_norm %>%
+  group_by(Treatment, Hour) %>%
+  summarise(
+    n = n(),
+    mean_norm = mean(Count_norm, na.rm = TRUE),
+    sd_norm = sd(Count_norm, na.rm = TRUE),
+    sem_norm = sd_norm / sqrt(n),
+    .groups = "drop"
+  )
+
+write.csv(
+  df_plot,
+  file.path(out_dir, "normalized_timecourse_summary.csv"),
+  row.names = FALSE
+)
+
+# =======================
+# PLOT: normalized growth curves
+# =======================
+p_norm <- ggplot(df_plot, aes(x = Hour, y = mean_norm, color = Treatment, group = Treatment)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_errorbar(
+    aes(ymin = mean_norm - sem_norm, ymax = mean_norm + sem_norm),
+    width = 2
+  ) +
+  labs(
+    title = "Normalized growth curves",
+    x = "Time (h)",
+    y = "Cell count normalized to baseline",
+    color = "Treatment"
+  ) +
+  theme_classic(base_size = 13)
+
+ggsave(
+  filename = file.path(out_dir, "normalized_growth_curves_mean_sem.png"),
+  plot = p_norm,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(out_dir, "normalized_growth_curves_mean_sem.pdf"),
+  plot = p_norm,
+  width = 8,
+  height = 5
+)
+```
+
+```{r}
+# =======================
+# CALCULATE AUC
+# one AUC per replicate curve
+# =======================
+df_auc <- df_norm %>%
+  arrange(Experiment, Replicate, Treatment, Hour) %>%
+  group_by(Experiment, Replicate, Treatment) %>%
+  summarise(
+    baseline_hr = first(baseline_hr),
+    n_timepoints = n(),
+    AUC_norm = if (n() >= 2) trapz(Hour, Count_norm) else NA_real_,
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(AUC_norm))
+
+write.csv(
+  df_auc,
+  file.path(out_dir, "auc_normalized_by_replicate.csv"),
+  row.names = FALSE
+)
+
+# =======================
+# CALCULATE TREND (SLOPE)
+# =======================
+df_slope <- df_norm %>%
+  group_by(Experiment, Replicate, Treatment) %>%
+  arrange(Hour, .by_group = TRUE) %>%
+  summarise(
+    n_timepoints = n(),
+    slope = if (n() >= 2) coef(lm(Count_norm ~ Hour))[2] else NA_real_,
+    intercept = if (n() >= 2) coef(lm(Count_norm ~ Hour))[1] else NA_real_,
+    r_squared = if (n() >= 2) summary(lm(Count_norm ~ Hour))$r.squared else NA_real_,
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(slope))
+
+write.csv(
+  df_slope,
+  file.path(out_dir, "trend_slope_by_replicate.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+# =======================
+# MIXED MODEL: AUC
+# =======================
+if (nrow(df_auc) >= 3 && dplyr::n_distinct(df_auc$Treatment) >= 2) {
+  
+  m_auc <- lmer(AUC_norm ~ Treatment + (1 | Experiment), data = df_auc)
+  anova_auc <- anova(m_auc)
+  emm_auc <- emmeans(m_auc, ~ Treatment)
+  
+  posthoc_auc <- contrast(
+    emm_auc,
+    method = "trt.vs.ctrl",
+    ref = which(levels(df_auc$Treatment) == "ctrl"),
+    adjust = "dunnett"
+  )
+  
+  write.csv(
+    as.data.frame(anova_auc),
+    file.path(out_dir, "auc_mixed_model_anova.csv"),
+    row.names = TRUE
+  )
+  
+  write.csv(
+    as.data.frame(emm_auc),
+    file.path(out_dir, "auc_emmeans.csv"),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    as.data.frame(posthoc_auc),
+    file.path(out_dir, "auc_treatment_vs_ctrl_dunnett.csv"),
+    row.names = FALSE
+  )
+  
+} else {
+  message("Skipping AUC mixed model: not enough data.")
+}
+```
+
+```{r}
+# =======================
+# MIXED MODEL: TREND / SLOPE
+# =======================
+if (nrow(df_slope) >= 3 && dplyr::n_distinct(df_slope$Treatment) >= 2) {
+  
+  m_slope <- lmer(slope ~ Treatment + (1 | Experiment), data = df_slope)
+  anova_slope <- anova(m_slope)
+  emm_slope <- emmeans(m_slope, ~ Treatment)
+  
+  posthoc_slope <- contrast(
+    emm_slope,
+    method = "trt.vs.ctrl",
+    ref = which(levels(df_slope$Treatment) == "ctrl"),
+    adjust = "dunnett"
+  )
+  
+  write.csv(
+    as.data.frame(anova_slope),
+    file.path(out_dir, "slope_mixed_model_anova.csv"),
+    row.names = TRUE
+  )
+  
+  write.csv(
+    as.data.frame(emm_slope),
+    file.path(out_dir, "slope_emmeans.csv"),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    as.data.frame(posthoc_slope),
+    file.path(out_dir, "slope_treatment_vs_ctrl_dunnett.csv"),
+    row.names = FALSE
+  )
+  
+} else {
+  message("Skipping slope mixed model: not enough data.")
+}
+```
+
+```{r}
+# =======================
+# FULL TIMECOURSE MODEL
+# =======================
+if (nrow(df_norm) >= 4 && dplyr::n_distinct(df_norm$Treatment) >= 2) {
+  
+  m_time <- lmer(
+    Count_norm ~ Hour * Treatment + (1 | Experiment) + (1 | Experiment:Replicate),
+    data = df_norm
+  )
+  
+  anova_time <- anova(m_time)
+  
+  write.csv(
+    as.data.frame(anova_time),
+    file.path(out_dir, "timecourse_mixed_model_anova.csv"),
+    row.names = TRUE
+  )
+  
+  emtr <- emtrends(m_time, ~ Treatment, var = "Hour")
+  posthoc_trend <- contrast(
+    emtr,
+    method = "trt.vs.ctrl",
+    ref = which(levels(df_norm$Treatment) == "ctrl"),
+    adjust = "dunnett"
+  )
+  
+  write.csv(
+    as.data.frame(emtr),
+    file.path(out_dir, "timecourse_emtrends.csv"),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    as.data.frame(posthoc_trend),
+    file.path(out_dir, "timecourse_trend_vs_ctrl_dunnett.csv"),
+    row.names = FALSE
+  )
+  
+} else {
+  message("Skipping full timecourse mixed model: not enough data.")
+}
+```
+
+```{r}
+# =======================
+# TIMEPOINT-SPECIFIC STATS
+# treatment vs ctrl at each hour
+# Hour treated as factor
+# =======================
+df_norm_tp <- df_norm %>%
+  mutate(Hour_f = factor(Hour, levels = sort(unique(Hour))))
+
+if (nrow(df_norm_tp) >= 4 && dplyr::n_distinct(df_norm_tp$Treatment) >= 2) {
+  
+  m_time_tp <- lmer(
+    Count_norm ~ Treatment * Hour_f + (1 | Experiment) + (1 | Experiment:Replicate),
+    data = df_norm_tp
+  )
+  
+  emm_time_by_hour <- emmeans(m_time_tp, ~ Treatment | Hour_f)
+  
+  contrast_time_vs_ctrl <- contrast(
+    emm_time_by_hour,
+    method = "trt.vs.ctrl",
+    ref = which(levels(df_norm_tp$Treatment) == "ctrl"),
+    adjust = "BH"
+  )
+  
+  results_time <- as.data.frame(contrast_time_vs_ctrl) %>%
+    mutate(Hour = as.numeric(as.character(Hour_f)))
+  
+  write.csv(
+    results_time,
+    file.path(out_dir, "timepoint_specific_vs_ctrl_BH.csv"),
+    row.names = FALSE
+  )
+  
+} else {
+  message("Skipping timepoint-specific stats: not enough data.")
+}
+```
+
+```{r}
+# =======================
+# FIRST SIGNIFICANT TIMEPOINT PER TREATMENT
+# =======================
+if (exists("results_time") && nrow(results_time) > 0) {
+  
+  first_sig_time <- results_time %>%
+    mutate(
+      contrast = as.character(contrast),
+      Hour = as.numeric(Hour),
+      p.value = as.numeric(p.value)
+    ) %>%
+    mutate(
+      Treatment_test = str_trim(str_remove(contrast, "\\s*-\\s*ctrl$"))
+    ) %>%
+    group_by(Treatment_test) %>%
+    arrange(Hour, .by_group = TRUE) %>%
+    summarise(
+      first_sig_hour = if (any(p.value < 0.05, na.rm = TRUE)) {
+        min(Hour[p.value < 0.05], na.rm = TRUE)
+      } else {
+        NA_real_
+      },
+      first_sig_p = if (any(p.value < 0.05, na.rm = TRUE)) {
+        p.value[match(first_sig_hour, Hour)]
+      } else {
+        NA_real_
+      },
+      .groups = "drop"
+    )
+  
+  write.csv(
+    first_sig_time,
+    file.path(out_dir, "first_significant_timepoint_per_treatment.csv"),
+    row.names = FALSE
+  )
+  
+} else {
+  message("No timepoint-specific contrast results found for first-significant-time extraction.")
+}
+```
+
+```{r}
+# =======================
+# ENDPOINT DATASET
+# last available timepoint per curve
+# =======================
+df_endpoint <- df_norm %>%
+  group_by(Experiment, Replicate, Treatment) %>%
+  filter(Hour == max(Hour)) %>%
+  ungroup()
+
+write.csv(
+  df_endpoint,
+  file.path(out_dir, "endpoint_last_timepoint_per_curve.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+# =======================
+# 24 h RAW VALUES
+# normalized to ctrl mean within each experiment
+# =======================
+df_24 <- df %>%
+  filter(Hour == 24)
+
+ctrl_24_check <- df_24 %>%
+  filter(Treatment == "ctrl") %>%
+  group_by(Experiment) %>%
+  summarise(
+    n_ctrl = n(),
+    ctrl_mean_24 = mean(Count, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write.csv(
+  ctrl_24_check,
+  file.path(out_dir, "ctrl_24h_check.csv"),
+  row.names = FALSE
+)
+
+missing_ctrl_experiments <- setdiff(unique(df_24$Experiment), unique(ctrl_24_check$Experiment))
+if (length(missing_ctrl_experiments) > 0) {
+  warning(
+    paste(
+      "Some experiments have no 24 h ctrl and will produce NA normalization:",
+      paste(missing_ctrl_experiments, collapse = ", ")
+    )
+  )
+}
+
+df_24_norm_ctrl <- df_24 %>%
+  group_by(Experiment) %>%
+  mutate(
+    ctrl_mean_24 = mean(Count[Treatment == "ctrl"], na.rm = TRUE),
+    Count_24_norm_to_ctrl = Count / ctrl_mean_24
+  ) %>%
+  ungroup() %>%
+  filter(
+    !is.na(ctrl_mean_24),
+    is.finite(ctrl_mean_24),
+    ctrl_mean_24 > 0,
+    is.finite(Count_24_norm_to_ctrl)
+  )
+
+write.csv(
+  df_24_norm_ctrl,
+  file.path(out_dir, "raw_24h_normalized_to_ctrl_by_experiment.csv"),
+  row.names = FALSE
+)
+
+df_24_plot <- df_24_norm_ctrl %>%
+  group_by(Treatment) %>%
+  summarise(
+    n = n(),
+    mean_norm = mean(Count_24_norm_to_ctrl, na.rm = TRUE),
+    sd_norm = sd(Count_24_norm_to_ctrl, na.rm = TRUE),
+    sem_norm = sd_norm / sqrt(n),
+    .groups = "drop"
+  )
+
+write.csv(
+  df_24_plot,
+  file.path(out_dir, "raw_24h_normalized_to_ctrl_summary.csv"),
+  row.names = FALSE
+)
+
+p_24 <- ggplot(df_24_norm_ctrl, aes(x = Treatment, y = Count_24_norm_to_ctrl)) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  geom_jitter(width = 0.12, height = 0, size = 2, alpha = 0.75) +
+  geom_point(
+    data = df_24_plot,
+    aes(x = Treatment, y = mean_norm),
+    inherit.aes = FALSE,
+    size = 3
+  ) +
+  geom_errorbar(
+    data = df_24_plot,
+    aes(x = Treatment, ymin = mean_norm - sem_norm, ymax = mean_norm + sem_norm),
+    inherit.aes = FALSE,
+    width = 0.2
+  ) +
+  labs(
+    title = "24 h raw cell count normalized to experiment-matched ctrl",
+    x = "Treatment",
+    y = "Cell count at 24 h / ctrl at 24 h"
+  ) +
+  theme_classic(base_size = 13)
+
+ggsave(
+  file.path(out_dir, "raw_24h_normalized_to_ctrl.png"),
+  p_24,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+ggsave(
+  file.path(out_dir, "raw_24h_normalized_to_ctrl.pdf"),
+  p_24,
+  width = 8,
+  height = 5
+)
+```
+
+```{r}
+# =======================
+# MIXED MODEL: 24 h DATA
+# =======================
+if (nrow(df_24_norm_ctrl) >= 3 && dplyr::n_distinct(df_24_norm_ctrl$Treatment) >= 2) {
+  
+  m_24 <- lmer(
+    Count_24_norm_to_ctrl ~ Treatment + (1 | Experiment),
+    data = df_24_norm_ctrl
+  )
+  
+  anova_24 <- anova(m_24)
+  emm_24 <- emmeans(m_24, ~ Treatment)
+  
+  posthoc_24 <- contrast(
+    emm_24,
+    method = "trt.vs.ctrl",
+    ref = which(levels(df_24_norm_ctrl$Treatment) == "ctrl"),
+    adjust = "dunnett"
+  )
+  
+  write.csv(
+    as.data.frame(anova_24),
+    file.path(out_dir, "24h_mixed_model_anova.csv"),
+    row.names = TRUE
+  )
+  
+  write.csv(
+    as.data.frame(emm_24),
+    file.path(out_dir, "24h_emmeans.csv"),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    as.data.frame(posthoc_24),
+    file.path(out_dir, "24h_vs_ctrl_dunnett.csv"),
+    row.names = FALSE
+  )
+  
+} else {
+  message("Skipping 24 h mixed model: not enough data.")
+}
+
+cat("Done.\n")
+```

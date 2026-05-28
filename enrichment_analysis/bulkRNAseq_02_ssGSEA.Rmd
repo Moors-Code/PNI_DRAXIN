@@ -1,0 +1,1073 @@
+```{r}
+# ============================================================
+# ssGSEA pathway scoring and condition comparison across
+# 0 nM / 17 nM / 68 nM DRAXIN
+# ============================================================
+#
+# This script:
+#   1) loads precomputed GSEA results from three pairwise comparisons,
+#   2) inspects and selects full pathway gene sets of interest,
+#   3) computes per-sample ssGSEA scores from batch-corrected logCPM data,
+#   4) exports raw and standardized pathway score tables,
+#   5) visualizes pathway activity across conditions,
+#   6) tests pathway score differences across conditions using limma,
+#   7) compares ssGSEA scores with mean pathway expression.
+#
+# IMPORTANT ABOUT STANDARDIZATION:
+#   A) score_sd_all:
+#      - z-score of raw ssGSEA values across ALL samples for each pathway
+#      - useful for general visualization
+#      - does NOT mean "relative to ctrl"
+#
+#   B) score_sd_ctrl:
+#      - (sample score - ctrl mean) / ctrl SD for each pathway
+#      - expresses each sample relative to the ctrl group only
+#      - useful for ctrl-referenced plots
+#
+# STATISTICS:
+#   - limma is fit on RAW ssGSEA scores, not on SD-scaled values
+#
+# GENE SET CONTENT:
+#   - ssGSEA uses FULL pathway gene sets (not leading-edge subsets),
+#     restricted to genes present in the processed expression matrix
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+  library(stringr)
+  library(tidyr)
+  library(ggplot2)
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+  library(limma)
+  library(GSVA)
+  library(matrixStats)
+  library(msigdbr)
+  library(GO.db)
+  library(grid)
+})
+```
+
+```{r}
+# ============================================================
+# 0) Define input/output paths and verify required files
+# ============================================================
+
+run_label <- "2026_03_23_GSEA_edgeR_3comparisons_signedlogP"
+
+comparisons <- c("DRAXIN_vs_ctrl", "diluted_vs_ctrl", "DRAXIN_vs_diluted")
+
+base_dir <- file.path(getwd(), "bulkRNAseq", run_label)
+
+out_dir <- file.path(getwd(), "bulkRNAseq", "PATHWAY_GSVA_SCORE_PANEL")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+expr_path <- file.path(getwd(), "bulkRNAseq", "Heatmaps_input", "expr_logCPM_TMM.rds")
+meta_path <- file.path(getwd(), "bulkRNAseq", "Heatmaps_input", "meta2.csv")
+stopifnot(file.exists(expr_path), file.exists(meta_path))
+
+gsea_paths <- lapply(comparisons, function(comp) {
+  list(
+    GO_BP  = file.path(base_dir, comp, "GO",     paste0(run_label, "__", comp, "__gseGO_BP.rds")),
+    GO_MF  = file.path(base_dir, comp, "GO",     paste0(run_label, "__", comp, "__gseGO_MF.rds")),
+    MSIG_H = file.path(base_dir, comp, "MSigDB", paste0(run_label, "__", comp, "__msig_H.rds")),
+    KEGG   = file.path(base_dir, comp, "KEGG",   paste0(run_label, "__", comp, "__gseKEGG.rds"))
+  )
+})
+names(gsea_paths) <- comparisons
+
+missing <- unlist(lapply(names(gsea_paths), function(comp) {
+  p <- unlist(gsea_paths[[comp]])
+  p[!file.exists(p)]
+}))
+if (length(missing) > 0) {
+  stop("Missing GSEA files:\n", paste(missing, collapse = "\n"))
+}
+```
+
+```{r}
+# ============================================================
+# 1) Load normalized expression matrix and sample metadata
+# ============================================================
+
+expr_mat <- readRDS(expr_path)
+
+meta <- readr::read_csv(meta_path, show_col_types = FALSE) |> as.data.frame()
+stopifnot("sample" %in% colnames(meta))
+rownames(meta) <- meta$sample
+meta$sample <- NULL
+
+stopifnot(all(colnames(expr_mat) %in% rownames(meta)))
+meta <- meta[colnames(expr_mat), , drop = FALSE]
+stopifnot(all(colnames(expr_mat) == rownames(meta)))
+
+# Remove Ensembl version suffix
+rownames(expr_mat) <- sub("\\.\\d+$", "", rownames(expr_mat))
+```
+
+```{r}
+# ============================================================
+# 2) Define treatment labels, batch variable, and plotting colors
+# ============================================================
+
+meta$condition <- factor(meta$condition, levels = c("ctrl", "diluted_DRAXIN", "DRAXIN"))
+
+cond_map <- c(ctrl = "0nM", diluted_DRAXIN = "17nM", DRAXIN = "68nM")
+meta$condition_nm <- factor(cond_map[as.character(meta$condition)],
+                            levels = c("0nM", "17nM", "68nM"))
+
+batch_var <- "batch3"
+if (!batch_var %in% colnames(meta)) {
+  stop("batch_var not in meta: ", batch_var,
+       "\nAvailable columns: ", paste(colnames(meta), collapse = ", "))
+}
+meta[[batch_var]] <- factor(meta[[batch_var]],
+                            levels = c("exp1_altprep", "exp1_main", "exp2_main"))
+
+cond_cols <- c("0nM" = "#4E79A7", "17nM" = "#59A14F", "68nM" = "#E15759")
+```
+
+```{r}
+# ============================================================
+# 3) Load GSEA result objects from all comparisons
+# ============================================================
+
+read_gsea_multi <- function(paths_by_comp,
+                            slot_name = c("GO_BP", "GO_MF", "MSIG_H", "KEGG")) {
+  slot_name <- match.arg(slot_name)
+  out <- lapply(names(paths_by_comp), function(comp) {
+    readRDS(paths_by_comp[[comp]][[slot_name]])
+  })
+  names(out) <- names(paths_by_comp)
+  out
+}
+
+gsea_GO_BP_list  <- read_gsea_multi(gsea_paths, "GO_BP")
+gsea_GO_MF_list  <- read_gsea_multi(gsea_paths, "GO_MF")
+gsea_MSIG_H_list <- read_gsea_multi(gsea_paths, "MSIG_H")
+gsea_KEGG_list   <- read_gsea_multi(gsea_paths, "KEGG")
+```
+
+```{r}
+# ============================================================
+# 4) Define helper functions for pathway lookup and gene mapping
+# ============================================================
+
+map_entrez_to_symbol <- function(entrez) {
+  entrez <- unique(as.character(entrez))
+  mp <- AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys = entrez,
+    keytype = "ENTREZID",
+    columns = "SYMBOL"
+  ) |>
+    tibble::as_tibble()
+
+  unique(mp$SYMBOL[!is.na(mp$SYMBOL) & mp$SYMBOL != ""])
+}
+
+show_gsea_terms_all <- function(gsea_list, pattern = NULL, n = 50) {
+  combined <- lapply(names(gsea_list), function(comp) {
+    tb <- tibble::as_tibble(gsea_list[[comp]]@result)
+    tb$comparison <- comp
+    tb
+  }) |>
+    dplyr::bind_rows()
+
+  keep <- intersect(c("comparison", "ID", "Description", "NES", "p.adjust"),
+                    names(combined))
+  combined <- combined |>
+    dplyr::select(dplyr::all_of(keep))
+
+  if (!is.null(pattern)) {
+    combined <- combined |>
+      dplyr::filter(stringr::str_detect(
+        tolower(paste(ID, Description)),
+        tolower(pattern)
+      ))
+  }
+
+  combined |>
+    dplyr::arrange(p.adjust) |>
+    dplyr::slice_head(n = n)
+}
+
+show_kegg_all_with_sizes <- function(gsea_kegg_list, pattern = NULL, n = 50) {
+  gs <- gsea_kegg_list[[1]]@geneSets
+  gs_n <- tibble::tibble(ID = names(gs), n_genes = vapply(gs, length, integer(1)))
+
+  combined <- lapply(names(gsea_kegg_list), function(comp) {
+    tb <- tibble::as_tibble(gsea_kegg_list[[comp]]@result)
+    tb$comparison <- comp
+    tb
+  }) |>
+    dplyr::bind_rows()
+
+  out <- combined |>
+    dplyr::left_join(gs_n, by = "ID") |>
+    dplyr::select(comparison, ID, Description, NES, p.adjust, n_genes) |>
+    dplyr::distinct()
+
+  if (!is.null(pattern)) {
+    out <- out |>
+      dplyr::filter(stringr::str_detect(
+        tolower(paste(ID, Description)),
+        tolower(pattern)
+      ))
+  }
+
+  out |>
+    dplyr::arrange(p.adjust) |>
+    dplyr::slice_head(n = n)
+}
+
+kegg_symbols_from_gse_fullset_by_id <- function(gsea_kegg_list, kegg_id) {
+  gse <- gsea_kegg_list[[1]]
+  gs_list <- gse@geneSets
+
+  if (!kegg_id %in% names(gs_list)) {
+    stop("KEGG ID not found in geneSets: ", kegg_id,
+         "\nExample available IDs: ",
+         paste(head(names(gs_list), 5), collapse = ", "))
+  }
+
+  entrez <- gs_list[[kegg_id]]
+  map_entrez_to_symbol(entrez)
+}
+
+show_hallmark_msigdbr <- function(pattern = NULL, n = 50) {
+  hm <- msigdbr::msigdbr(species = "Homo sapiens", collection = "H") |>
+    dplyr::group_by(gs_name, gs_description) |>
+    dplyr::summarise(n_genes = dplyr::n_distinct(gene_symbol), .groups = "drop")
+
+  if (!is.null(pattern)) {
+    hm <- hm |>
+      dplyr::filter(
+        stringr::str_detect(tolower(gs_name), tolower(pattern)) |
+          stringr::str_detect(tolower(gs_description), tolower(pattern))
+      )
+  }
+
+  hm |>
+    dplyr::arrange(dplyr::desc(n_genes), gs_name) |>
+    dplyr::slice_head(n = n)
+}
+
+hallmark_symbols <- function(set_name) {
+  msigdbr::msigdbr(species = "Homo sapiens", collection = "H") |>
+    dplyr::filter(gs_name == set_name) |>
+    dplyr::pull(gene_symbol) |>
+    unique()
+}
+
+show_go_terms <- function(ontology = c("BP", "MF"), pattern = NULL, n = 50) {
+  ontology <- match.arg(ontology)
+
+  tt <- AnnotationDbi::select(
+    GO.db,
+    keys = AnnotationDbi::keys(GO.db, keytype = "GOID"),
+    keytype = "GOID",
+    columns = c("TERM", "ONTOLOGY")
+  ) |>
+    tibble::as_tibble() |>
+    dplyr::filter(!is.na(TERM), ONTOLOGY == ontology) |>
+    dplyr::distinct(GOID, TERM, ONTOLOGY)
+
+  if (!is.null(pattern)) {
+    tt <- tt |>
+      dplyr::filter(stringr::str_detect(tolower(TERM), tolower(pattern)))
+  }
+
+  tt |>
+    dplyr::arrange(TERM) |>
+    dplyr::slice_head(n = n)
+}
+
+goid_to_symbols <- function(go_id) {
+  entrez <- AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys = go_id,
+    keytype = "GOALL",
+    columns = "ENTREZID"
+  ) |>
+    tibble::as_tibble() |>
+    dplyr::filter(!is.na(ENTREZID)) |>
+    dplyr::pull(ENTREZID) |>
+    unique()
+
+  map_entrez_to_symbol(entrez)
+}
+
+pick_go_by_text <- function(ontology = c("BP", "MF"), pattern, prefer_short = TRUE) {
+  ontology <- match.arg(ontology)
+  pat <- tolower(pattern)
+
+  tt <- AnnotationDbi::select(
+    GO.db,
+    keys = AnnotationDbi::keys(GO.db, keytype = "GOID"),
+    keytype = "GOID",
+    columns = c("TERM", "ONTOLOGY")
+  ) |>
+    tibble::as_tibble() |>
+    dplyr::filter(!is.na(TERM), ONTOLOGY == ontology)
+
+  hit <- tt |>
+    dplyr::filter(stringr::str_detect(tolower(TERM), pat))
+
+  if (nrow(hit) == 0) {
+    stop("No GO ", ontology, " term matched: ", pattern)
+  }
+
+  if (prefer_short) {
+    hit <- hit |>
+      dplyr::mutate(nchar_term = nchar(TERM)) |>
+      dplyr::arrange(nchar_term)
+  }
+
+  hit[1, , drop = FALSE]
+}
+
+make_pathway_label <- function(x, wrap_width = 32) {
+  x2 <- x |>
+    stringr::str_replace("\\s*\\(n=\\d+\\)\\s*$", "") |>
+    stringr::str_replace("^HALLMARK__", "HM: ") |>
+    stringr::str_replace("^GOBP__", "BP: ") |>
+    stringr::str_replace("^GOMF__", "MF: ") |>
+    stringr::str_replace("^KEGG__", "KEGG: ") |>
+    stringr::str_replace_all("__", ": ")
+  stringr::str_wrap(x2, width = wrap_width)
+}
+
+std_limma_cols <- function(df) {
+  df <- as.data.frame(df)
+  n0 <- colnames(df)
+  n1 <- tolower(n0)
+  n1 <- gsub("[^a-z0-9]+", "_", n1)
+  n1 <- gsub("^_+|_+$", "", n1)
+  n1 <- sub("^adj_p_val$", "fdr", n1)
+  n1 <- sub("^logfc$", "logFC", n1)
+  colnames(df) <- n1
+  df
+}
+
+p_to_stars <- function(p) {
+  ifelse(is.na(p), "",
+         ifelse(p < 0.001, "***",
+                ifelse(p < 0.01, "**",
+                       ifelse(p < 0.05, "*", "ns"))))
+}
+```
+
+```{r}
+# ============================================================
+# 5) Inspect enriched pathways across comparisons
+# ============================================================
+
+cat("\n--- KEGG across ALL comparisons (includes full-set sizes) ---\n")
+print(show_kegg_all_with_sizes(gsea_KEGG_list, n = 25), n = 25)
+
+cat("\n--- KEGG search across ALL comparisons: 'ferroptosis' ---\n")
+print(show_kegg_all_with_sizes(gsea_KEGG_list, "ferroptosis", n = 25), n = 25)
+
+cat("\n--- GO BP terms enriched across ALL comparisons (top by q) ---\n")
+print(show_gsea_terms_all(gsea_GO_BP_list, n = 25), n = 25)
+
+cat("\n--- GO MF terms enriched across ALL comparisons (top by q) ---\n")
+print(show_gsea_terms_all(gsea_GO_MF_list, n = 25), n = 25)
+
+cat("\n--- Hallmark terms enriched across ALL comparisons (top by q) ---\n")
+print(show_gsea_terms_all(gsea_MSIG_H_list, n = 25), n = 25)
+
+cat("\n--- Hallmark universe (msigdbr) top by size ---\n")
+print(show_hallmark_msigdbr(n = 25), n = 25)
+
+cat("\n--- GO BP browse: 'cell adhesion' ---\n")
+print(show_go_terms("BP", "cell adhesion", n = 25), n = 25)
+```
+
+```{r}
+# ============================================================
+# 6) Define final full gene sets to score
+# ============================================================
+
+hallmark_terms <- c(
+  OXPHOS = "HALLMARK_OXIDATIVE_PHOSPHORYLATION",
+  E2F_TARGETS = "HALLMARK_E2F_TARGETS",
+  MYC = "HALLMARK_MYC_TARGETS_V1",
+  DNA_REPAIR = "HALLMARK_DNA_REPAIR",
+  G2M = "HALLMARK_G2M_CHECKPOINT",
+  CHOLESTEROL_HOMEOSTASIS = "HALLMARK_CHOLESTEROL_HOMEOSTASIS",
+  UNFOLDED ="HALLMARK_UNFOLDED_PROTEIN_RESPONSE"
+)
+
+go_bp_1 <- pick_go_by_text("BP", "cell adhesion mediated by integrin")
+go_bp_2 <- pick_go_by_text("BP", "regulation of cell adhesion")
+go_bp_3 <- pick_go_by_text("BP", "SULFUR COMPOUND METABOLIC PROCESS")
+
+go_mf_1 <- pick_go_by_text("MF", "oxidoreduction-driven active transmembrane transporter activity")
+go_mf_2 <- pick_go_by_text("MF", "NADH dehydrogenase activity")
+go_mf_3 <- pick_go_by_text("MF", "iron ion binding")
+go_mf_4 <- pick_go_by_text("MF", "cell adhesion molecule binding")
+
+gene_sets <- list()
+
+for (nm in names(hallmark_terms)) {
+  gene_sets[[paste0("HALLMARK__", nm)]] <- hallmark_symbols(hallmark_terms[[nm]])
+}
+
+gene_sets[[paste0("GOBP__", go_bp_1$GOID, "__", make.names(go_bp_1$TERM))]] <- goid_to_symbols(go_bp_1$GOID)
+gene_sets[[paste0("GOBP__", go_bp_2$GOID, "__", make.names(go_bp_2$TERM))]] <- goid_to_symbols(go_bp_2$GOID)
+gene_sets[[paste0("GOBP__", go_bp_3$GOID, "__", make.names(go_bp_3$TERM))]] <- goid_to_symbols(go_bp_3$GOID)
+gene_sets[[paste0("GOMF__", go_mf_1$GOID, "__", make.names(go_mf_1$TERM))]] <- goid_to_symbols(go_mf_1$GOID)
+gene_sets[[paste0("GOMF__", go_mf_2$GOID, "__", make.names(go_mf_2$TERM))]] <- goid_to_symbols(go_mf_2$GOID)
+gene_sets[[paste0("GOMF__", go_mf_3$GOID, "__", make.names(go_mf_3$TERM))]] <- goid_to_symbols(go_mf_3$GOID)
+gene_sets[[paste0("GOMF__", go_mf_4$GOID, "__", make.names(go_mf_4$TERM))]] <- goid_to_symbols(go_mf_4$GOID)
+
+gene_sets[["KEGG__hsa04216__Ferroptosis"]] <-
+  kegg_symbols_from_gse_fullset_by_id(gsea_KEGG_list, "hsa04216")
+
+names(gene_sets) <- paste0(names(gene_sets), " (n=", sapply(gene_sets, length), ")")
+
+gene_sets <- gene_sets[sapply(gene_sets, length) >= 10]
+stopifnot(length(gene_sets) >= 2)
+
+cat("\nSelected gene sets (PRE-intersection sizes):\n")
+print(sort(sapply(gene_sets, length)))
+```
+
+```{r}
+# ============================================================
+# 7) Prepare batch-corrected expression matrix for ssGSEA
+# ============================================================
+
+design3 <- model.matrix(~ condition, data = meta)
+expr_bc <- limma::removeBatchEffect(expr_mat,
+                                    batch = meta[[batch_var]],
+                                    design = design3)
+
+ensg <- rownames(expr_bc)
+mp <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = ensg,
+  keytype = "ENSEMBL",
+  columns = "SYMBOL"
+) |>
+  tibble::as_tibble() |>
+  dplyr::filter(!is.na(SYMBOL) & SYMBOL != "") |>
+  dplyr::distinct(ENSEMBL, .keep_all = TRUE)
+
+expr_bc_sym <- expr_bc[mp$ENSEMBL, , drop = FALSE]
+rownames(expr_bc_sym) <- mp$SYMBOL
+
+expr_bc_sym <- expr_bc_sym[order(rowMeans(expr_bc_sym), decreasing = TRUE), , drop = FALSE]
+expr_bc_sym <- expr_bc_sym[!duplicated(rownames(expr_bc_sym)), , drop = FALSE]
+
+expr_for_gsva <- as.matrix(expr_bc_sym)
+
+v <- matrixStats::rowVars(expr_for_gsva)
+expr_for_gsva <- expr_for_gsva[v > 0, , drop = FALSE]
+
+gene_sets_use <- lapply(gene_sets, function(gs) intersect(gs, rownames(expr_for_gsva)))
+gene_sets_use <- gene_sets_use[sapply(gene_sets_use, length) >= 10]
+stopifnot(length(gene_sets_use) >= 2)
+
+cat("\nSelected gene sets (POST-intersection sizes actually used in ssGSEA):\n")
+print(sort(sapply(gene_sets_use, length)))
+```
+
+```{r}
+# ============================================================
+# 8) Compute raw ssGSEA scores
+# ============================================================
+
+gsva_mat <- GSVA::gsva(
+  expr = expr_for_gsva,
+  gset.idx.list = gene_sets_use,
+  method = "ssgsea",
+  kcdf = "Gaussian",
+  abs.ranking = FALSE,
+  min.sz = 10,
+  max.sz = 5000
+)
+
+scores_raw <- as.data.frame(t(gsva_mat))
+scores_raw$sample <- rownames(scores_raw)
+scores_raw$condition_nm <- meta[scores_raw$sample, "condition_nm"]
+
+df_long_raw <- scores_raw |>
+  tidyr::pivot_longer(
+    cols = -c(sample, condition_nm),
+    names_to = "pathway",
+    values_to = "ssgsea_score"
+  ) |>
+  dplyr::mutate(
+    condition_nm = factor(condition_nm, levels = c("0nM", "17nM", "68nM")),
+    pathway_label = make_pathway_label(pathway, wrap_width = 34)
+  )
+```
+
+```{r}
+
+# ============================================================
+# 9) Create two standardized versions of the raw ssGSEA scores
+# ============================================================
+#
+# score_sd_all:
+#   z-score across ALL samples within each pathway
+#
+# score_sd_ctrl:
+#   (sample score - ctrl mean) / ctrl SD within each pathway
+#   ctrl samples therefore center around 0 by definition
+# ============================================================
+
+sd_floor <- 1e-6
+
+df_long <- df_long_raw |>
+  dplyr::group_by(pathway) |>
+  dplyr::mutate(
+    score_sd_all = as.numeric(scale(ssgsea_score)),
+    ctrl_mean = mean(ssgsea_score[condition_nm == "0nM"], na.rm = TRUE),
+    ctrl_sd = sd(ssgsea_score[condition_nm == "0nM"], na.rm = TRUE),
+    ctrl_sd = ifelse(is.na(ctrl_sd) | ctrl_sd < sd_floor, NA_real_, ctrl_sd),
+    score_sd_ctrl = (ssgsea_score - ctrl_mean) / ctrl_sd
+  ) |>
+  dplyr::ungroup()
+
+readr::write_csv(
+  df_long |>
+    dplyr::select(sample, condition_nm, pathway, pathway_label,
+                  ssgsea_score, score_sd_all, ctrl_mean, ctrl_sd, score_sd_ctrl),
+  file.path(out_dir, "PATHWAY_SCORES_GSVA_ssGSEA_raw_allSD_and_ctrlSD.csv")
+)
+```
+
+```{r}
+# ============================================================
+# 10) Plot overview panel using score_sd_all
+# ============================================================
+#
+# IMPORTANT:
+#   This plot uses score_sd_all:
+#   pathway-wise z-score across ALL samples
+#   It is not ctrl-referenced.
+# ============================================================
+
+p_overview <- ggplot(df_long, aes(x = condition_nm, y = score_sd_all)) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(aes(color = condition_nm),
+             position = position_jitter(width = 0.12),
+             size = 2) +
+  scale_color_manual(values = cond_cols) +
+  facet_wrap(~ pathway_label, scales = "free_y", ncol = 2) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_blank(),
+    strip.text = element_text(size = 9),
+    axis.text.x = element_text(size = 9)
+  ) +
+  labs(y = "Pathway activity (ssGSEA; z-score across all samples)")
+
+out_pdf <- file.path(out_dir, "PATHWAY_SCORE_PANEL_GSVA_allSampleSD.pdf")
+ggsave(out_pdf, p_overview, width = 11, height = 8)
+```
+
+```{r}
+
+# ============================================================
+# 11) Build selected publication panel using score_sd_all
+# ============================================================
+#
+# IMPORTANT:
+#   This publication panel also uses score_sd_all
+#   so the y-axis is based on ALL-sample standardization
+# ============================================================
+
+main_order <- c(
+  "HM: OXPHOS",
+  "HM: E2F_TARGETS",
+  "HM: CHOLESTEROL_HOMEOSTASIS",
+  "HM: MYC",
+  "HM: DNA_REPAIR",
+  "HM: G2M",
+  "HM: UNFOLDED"
+)
+
+ferro_label <- "KEGG: hsa04216: Ferroptosis"
+iron_label  <- "MF: GO:0005506: iron.ion.binding"
+order8 <- c(main_order, ferro_label, iron_label)
+
+avail <- sort(unique(df_long$pathway_label))
+
+cat("\n--- AVAILABLE pathway labels ---\n")
+print(avail)
+
+cat("\n--- EXPECTED selected labels ---\n")
+print(order8)
+
+cat("\n--- MISSING selected labels ---\n")
+print(setdiff(order8, avail))
+
+cat("\n--- EXTRA available labels ---\n")
+print(setdiff(avail, order8))
+
+order8 <- order8[order8 %in% unique(df_long$pathway_label)]
+stopifnot(length(order8) == 9)
+
+df_plot <- df_long |>
+  dplyr::filter(pathway_label %in% order8) |>
+  dplyr::mutate(
+    pathway_label = factor(pathway_label, levels = order8),
+    condition_nm  = factor(condition_nm, levels = c("0nM", "17nM", "68nM"))
+  )
+
+use_fixed_y <- TRUE
+use_ylim <- TRUE
+ylim_vals <- c(-3, 3)
+
+p_all <- ggplot(df_plot, aes(x = condition_nm, y = score_sd_all)) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  geom_boxplot(outlier.shape = NA, linewidth = 0.3) +
+  geom_point(aes(color = condition_nm),
+             position = position_jitter(width = 0.12),
+             size = 2.0, alpha = 1) +
+  scale_color_manual(values = cond_cols) +
+  facet_wrap(
+    ~ pathway_label,
+    ncol = 2,
+    scales = if (use_fixed_y) "fixed" else "free_y"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_blank(),
+    axis.text.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    strip.text = element_text(size = 16),
+    panel.grid.minor = element_blank(),
+    panel.spacing = unit(0.8, "lines")
+  ) +
+  labs(y = "Pathway activity (ssGSEA; z-score across all samples)")
+
+if (use_ylim) {
+  p_all <- p_all + coord_cartesian(ylim = ylim_vals)
+}
+
+out_pdf <- file.path(out_dir, "PATHWAY_PANEL_ALL8_2col_allSampleSD.pdf")
+ggsave(out_pdf, p_all, width = 8, height = 17, units = "in", limitsize = FALSE)
+
+base_size_pts <- 8
+p_all_pub <- p_all +
+  theme_bw(base_size = base_size_pts) +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_blank(),
+    axis.title.y = element_text(size = base_size_pts + 8),
+    axis.text.x  = element_text(size = base_size_pts + 4),
+    axis.text.y  = element_text(size = base_size_pts + 4),
+    strip.text   = element_text(size = base_size_pts + 4),
+    panel.spacing = unit(0.6, "lines")
+  )
+
+fig_width <- 6
+fig_height <- fig_width * 2
+
+out_pdf <- file.path(out_dir, "PATHWAY_PANEL_ALL8_publication_allSampleSD.pdf")
+ggsave(out_pdf, p_all_pub,
+       width = fig_width, height = fig_height, units = "in",
+       device = cairo_pdf)
+
+out_svg <- file.path(out_dir, "PATHWAY_PANEL_ALL8_publication_allSampleSD.svg")
+ggsave(out_svg, p_all_pub,
+       width = fig_width, height = fig_height, units = "in",
+       device = svglite::svglite)
+```
+
+```{r}
+# ============================================================
+# 12) Test pathway score differences with limma on RAW ssGSEA scores
+# ============================================================
+#
+# IMPORTANT:
+#   limma is fit on RAW ssGSEA scores (ssgsea_score), not on score_sd_all
+#   and not on score_sd_ctrl
+# ============================================================
+
+Y <- gsva_mat
+meta_fit <- meta[colnames(Y), , drop = FALSE]
+stopifnot(all(colnames(Y) == rownames(meta_fit)))
+
+meta_fit$condition_nm <- factor(meta_fit$condition_nm, levels = c("0nM", "17nM", "68nM"))
+meta_fit$condition_safe <- factor(
+  meta_fit$condition_nm,
+  levels = c("0nM", "17nM", "68nM"),
+  labels = c("nM0", "nM17", "nM68")
+)
+
+design <- model.matrix(~0 + condition_safe, data = meta_fit)
+colnames(design) <- levels(meta_fit$condition_safe)
+
+fit <- limma::lmFit(Y, design)
+cont <- limma::makeContrasts(
+  `17vs0`  = nM17 - nM0,
+  `68vs0`  = nM68 - nM0,
+  `68vs17` = nM68 - nM17,
+  levels = design
+)
+
+fit2 <- limma::eBayes(limma::contrasts.fit(fit, cont))
+fitF <- limma::eBayes(fit)
+
+tt_F <- limma::topTable(fitF, coef = NULL, number = Inf, sort.by = "F") |>
+  tibble::rownames_to_column("pathway") |>
+  std_limma_cols()
+
+tt_17vs0 <- limma::topTable(fit2, coef = "17vs0", number = Inf, sort.by = "P") |>
+  tibble::rownames_to_column("pathway") |>
+  std_limma_cols()
+
+tt_68vs0 <- limma::topTable(fit2, coef = "68vs0", number = Inf, sort.by = "P") |>
+  tibble::rownames_to_column("pathway") |>
+  std_limma_cols()
+
+tt_68vs17 <- limma::topTable(fit2, coef = "68vs17", number = Inf, sort.by = "P") |>
+  tibble::rownames_to_column("pathway") |>
+  std_limma_cols()
+
+stats_tbl <- tt_F |>
+  dplyr::select(pathway, f, p_value, fdr) |>
+  dplyr::rename(F_overall = f, P_overall = p_value, FDR_overall = fdr) |>
+  dplyr::left_join(
+    tt_17vs0 |>
+      dplyr::select(pathway, logFC, p_value, fdr) |>
+      dplyr::rename(logFC_17vs0 = logFC, P_17vs0 = p_value, FDR_17vs0 = fdr),
+    by = "pathway"
+  ) |>
+  dplyr::left_join(
+    tt_68vs0 |>
+      dplyr::select(pathway, logFC, p_value, fdr) |>
+      dplyr::rename(logFC_68vs0 = logFC, P_68vs0 = p_value, FDR_68vs0 = fdr),
+    by = "pathway"
+  ) |>
+  dplyr::left_join(
+    tt_68vs17 |>
+      dplyr::select(pathway, logFC, p_value, fdr) |>
+      dplyr::rename(logFC_68vs17 = logFC, P_68vs17 = p_value, FDR_68vs17 = fdr),
+    by = "pathway"
+  )
+
+readr::write_csv(
+  stats_tbl,
+  file.path(out_dir, "PATHWAY_STATS_limma_rawssGSEA.csv")
+)
+```
+
+```{r}
+# ============================================================
+# 13) Plot ctrl-referenced panel with significance annotations
+# ============================================================
+#
+# IMPORTANT:
+#   This plot uses score_sd_ctrl:
+#   (sample score - ctrl mean) / ctrl SD
+#   so all y-values are explicitly relative to the ctrl group
+# ============================================================
+
+ann <- stats_tbl |>
+  dplyr::mutate(
+    star_17vs0 = p_to_stars(FDR_17vs0),
+    star_68vs0 = p_to_stars(FDR_68vs0)
+  ) |>
+  dplyr::select(pathway, star_17vs0, star_68vs0)
+
+ypos <- df_long |>
+  dplyr::group_by(pathway) |>
+  dplyr::summarise(
+    y_max = max(score_sd_ctrl, na.rm = TRUE),
+    y_min = min(score_sd_ctrl, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    span = pmax(1, y_max - y_min),
+    y1 = y_max + 0.10 * span,
+    y2 = y_max + 0.22 * span
+  )
+
+ann_plot <- ypos |>
+  dplyr::left_join(ann, by = "pathway") |>
+  dplyr::left_join(
+    df_long |>
+      dplyr::distinct(pathway, pathway_label),
+    by = "pathway"
+  ) |>
+  dplyr::mutate(
+    x1 = "0nM",
+    x2 = "17nM",
+    x3 = "68nM"
+  )
+
+p_ctrl <- ggplot(df_long, aes(x = condition_nm, y = score_sd_ctrl)) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(aes(color = condition_nm),
+             position = position_jitter(width = 0.12),
+             size = 2) +
+  scale_color_manual(values = cond_cols) +
+  facet_wrap(~ pathway_label, scales = "fixed", ncol = 2) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_blank(),
+    strip.text = element_text(size = 9),
+    axis.text.x = element_text(size = 9)
+  ) +
+  labs(y = "Pathway activity (ssGSEA; SD relative to ctrl)")
+
+p_ctrl <- p_ctrl +
+  geom_segment(
+    data = ann_plot,
+    aes(x = x1, xend = x2, y = y1, yend = y1),
+    inherit.aes = FALSE, linewidth = 0.3
+  ) +
+  geom_segment(
+    data = ann_plot,
+    aes(x = x1, xend = x1, y = y1, yend = y1 - 0.03 * span),
+    inherit.aes = FALSE, linewidth = 0.3
+  ) +
+  geom_segment(
+    data = ann_plot,
+    aes(x = x2, xend = x2, y = y1, yend = y1 - 0.03 * span),
+    inherit.aes = FALSE, linewidth = 0.3
+  ) +
+  geom_text(
+    data = ann_plot,
+    aes(x = 1.5, y = y1 + 0.03 * span, label = star_17vs0),
+    inherit.aes = FALSE, size = 3
+  ) +
+  geom_segment(
+    data = ann_plot,
+    aes(x = x1, xend = x3, y = y2, yend = y2),
+    inherit.aes = FALSE, linewidth = 0.3
+  ) +
+  geom_segment(
+    data = ann_plot,
+    aes(x = x1, xend = x1, y = y2, yend = y2 - 0.03 * span),
+    inherit.aes = FALSE, linewidth = 0.3
+  ) +
+  geom_segment(
+    data = ann_plot,
+    aes(x = x3, xend = x3, y = y2, yend = y2 - 0.03 * span),
+    inherit.aes = FALSE, linewidth = 0.3
+  ) +
+  geom_text(
+    data = ann_plot,
+    aes(x = 2.0, y = y2 + 0.03 * span, label = star_68vs0),
+    inherit.aes = FALSE, size = 3
+  )
+
+out_pdf <- file.path(out_dir, "PATHWAY_SCORE_PANEL_GSVA_ctrlSD_withStats_limmaFDR.pdf")
+ggsave(out_pdf, p_ctrl, width = 11, height = 8)
+```
+
+```{r}
+# ============================================================
+# 14) Diagnostic: compare ssGSEA score vs mean pathway expression
+# ============================================================
+#
+# This diagnostic computes per-sample mean pathway expression using the
+# same genes that entered ssGSEA and compares those values to raw ssGSEA.
+#
+# Standardization used here:
+#   - ssgsea_z: z-score of raw ssGSEA across all samples within pathway
+#   - mean_expr_z: z-score of mean pathway expression across all samples
+# ============================================================
+
+scores_raw_diag <- as.data.frame(t(gsva_mat))
+scores_raw_diag$sample <- rownames(scores_raw_diag)
+scores_raw_diag$condition_nm <- meta[scores_raw_diag$sample, "condition_nm"]
+
+ssgsea_long_diag <- scores_raw_diag |>
+  tidyr::pivot_longer(
+    cols = -c(sample, condition_nm),
+    names_to = "pathway",
+    values_to = "ssgsea_score"
+  )
+
+mean_expr_long <- lapply(names(gene_sets_use), function(pw) {
+  genes <- gene_sets_use[[pw]]
+  submat <- expr_for_gsva[genes, , drop = FALSE]
+
+  data.frame(
+    sample = colnames(submat),
+    pathway = pw,
+    pathway_mean_expr = colMeans(submat, na.rm = TRUE),
+    pathway_median_expr = apply(submat, 2, median, na.rm = TRUE),
+    n_genes_used = nrow(submat),
+    stringsAsFactors = FALSE
+  )
+}) |>
+  dplyr::bind_rows()
+
+diag_long <- ssgsea_long_diag |>
+  dplyr::left_join(mean_expr_long, by = c("sample", "pathway")) |>
+  dplyr::mutate(
+    pathway_label = make_pathway_label(pathway, wrap_width = 34),
+    condition_nm = factor(condition_nm, levels = c("0nM", "17nM", "68nM"))
+  ) |>
+  dplyr::group_by(pathway) |>
+  dplyr::mutate(
+    ssgsea_z = as.numeric(scale(ssgsea_score)),
+    mean_expr_z = as.numeric(scale(pathway_mean_expr))
+  ) |>
+  dplyr::ungroup()
+
+readr::write_csv(
+  diag_long |>
+    dplyr::select(
+      sample, condition_nm, pathway, pathway_label,
+      ssgsea_score, ssgsea_z,
+      pathway_mean_expr, pathway_median_expr, mean_expr_z,
+      n_genes_used
+    ),
+  file.path(out_dir, "DIAGNOSTIC_ssGSEA_vs_meanExpression_perSample.csv")
+)
+
+cor_tbl <- diag_long |>
+  dplyr::group_by(pathway, pathway_label) |>
+  dplyr::summarise(
+    n_samples = sum(complete.cases(ssgsea_score, pathway_mean_expr)),
+    pearson_r = suppressWarnings(cor(
+      ssgsea_score, pathway_mean_expr,
+      use = "pairwise.complete.obs",
+      method = "pearson"
+    )),
+    spearman_rho = suppressWarnings(cor(
+      ssgsea_score, pathway_mean_expr,
+      use = "pairwise.complete.obs",
+      method = "spearman"
+    )),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(dplyr::desc(spearman_rho))
+
+readr::write_csv(
+  cor_tbl,
+  file.path(out_dir, "DIAGNOSTIC_ssGSEA_vs_meanExpression_correlations.csv")
+)
+
+p_scatter <- ggplot(
+  diag_long,
+  aes(x = pathway_mean_expr, y = ssgsea_score, color = condition_nm)
+) +
+  geom_point(size = 2) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.4) +
+  scale_color_manual(values = cond_cols) +
+  facet_wrap(~ pathway_label, scales = "free", ncol = 2) +
+  theme_bw() +
+  theme(
+    legend.position = "top",
+    strip.text = element_text(size = 9),
+    axis.text = element_text(size = 8)
+  ) +
+  labs(
+    x = "Mean pathway gene expression",
+    y = "Raw ssGSEA score",
+    color = "Condition",
+    title = "Per-sample ssGSEA score vs mean pathway expression"
+  )
+
+ggsave(
+  file.path(out_dir, "DIAGNOSTIC_ssGSEA_vs_meanExpression_scatter.pdf"),
+  p_scatter,
+  width = 11,
+  height = 8.5
+)
+
+p_mean_box <- ggplot(
+  diag_long,
+  aes(x = condition_nm, y = pathway_mean_expr, color = condition_nm)
+) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.12), size = 2) +
+  scale_color_manual(values = cond_cols) +
+  facet_wrap(~ pathway_label, scales = "free_y", ncol = 2) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(size = 9),
+    axis.text.x = element_text(size = 9)
+  ) +
+  labs(
+    x = NULL,
+    y = "Mean pathway gene expression",
+    title = "Mean pathway expression across conditions"
+  )
+
+ggsave(
+  file.path(out_dir, "DIAGNOSTIC_meanExpression_byCondition.pdf"),
+  p_mean_box,
+  width = 11,
+  height = 8.5
+)
+
+diag_long_z <- diag_long |>
+  dplyr::select(sample, condition_nm, pathway, pathway_label, ssgsea_z, mean_expr_z) |>
+  tidyr::pivot_longer(
+    cols = c(ssgsea_z, mean_expr_z),
+    names_to = "metric",
+    values_to = "value"
+  ) |>
+  dplyr::mutate(
+    metric = dplyr::recode(
+      metric,
+      ssgsea_z = "ssGSEA",
+      mean_expr_z = "Mean expression"
+    )
+  )
+
+p_compare <- ggplot(
+  diag_long_z,
+  aes(x = condition_nm, y = value, color = condition_nm)
+) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.12), size = 1.8) +
+  scale_color_manual(values = cond_cols) +
+  facet_grid(metric ~ pathway_label, scales = "free_y") +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(size = 8),
+    axis.text.x = element_text(size = 8)
+  ) +
+  labs(
+    x = NULL,
+    y = "Within-pathway z-score across all samples",
+    title = "ssGSEA vs mean pathway expression"
+  )
+
+ggsave(
+  file.path(out_dir, "DIAGNOSTIC_ssGSEA_vs_meanExpression_zscoreCompare.pdf"),
+  p_compare,
+  width = 14,
+  height = 8.5,
+  limitsize = FALSE
+)
+
+cat(
+  "Wrote:\n",
+  file.path(out_dir, "PATHWAY_SCORES_GSVA_ssGSEA_raw_allSD_and_ctrlSD.csv"), "\n",
+  file.path(out_dir, "PATHWAY_SCORE_PANEL_GSVA_allSampleSD.pdf"), "\n",
+  file.path(out_dir, "PATHWAY_PANEL_ALL8_publication_allSampleSD.pdf"), "\n",
+  file.path(out_dir, "PATHWAY_PANEL_ALL8_publication_allSampleSD.svg"), "\n",
+  file.path(out_dir, "PATHWAY_STATS_limma_rawssGSEA.csv"), "\n",
+  file.path(out_dir, "PATHWAY_SCORE_PANEL_GSVA_ctrlSD_withStats_limmaFDR.pdf"), "\n",
+  file.path(out_dir, "DIAGNOSTIC_ssGSEA_vs_meanExpression_perSample.csv"), "\n",
+  file.path(out_dir, "DIAGNOSTIC_ssGSEA_vs_meanExpression_correlations.csv"), "\n",
+  file.path(out_dir, "DIAGNOSTIC_ssGSEA_vs_meanExpression_scatter.pdf"), "\n",
+  file.path(out_dir, "DIAGNOSTIC_meanExpression_byCondition.pdf"), "\n",
+  file.path(out_dir, "DIAGNOSTIC_ssGSEA_vs_meanExpression_zscoreCompare.pdf"), "\n"
+)
+```

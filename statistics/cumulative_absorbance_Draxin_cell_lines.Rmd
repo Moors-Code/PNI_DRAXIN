@@ -1,0 +1,322 @@
+
+````{r}
+# =======================
+# LIBRARIES
+# =======================
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(purrr)
+
+# =======================
+# INPUT / OUTPUT
+# =======================
+file <- "input_files/cell_lines_absorbance.csv"
+out_dir <- "output/growth_assays/cell_lines_absorbance"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# =======================
+# READ DATA
+# Expected columns:
+#   Draxin (or Drain)
+#   Absorbance
+#   Experiment
+#   Cell_line
+# =======================
+df <- read_csv(file, show_col_types = FALSE)
+
+# If the file uses "Drain" instead of "Draxin", rename it
+if ("Drain" %in% names(df) && !"Draxin" %in% names(df)) {
+  df <- df %>% rename(Draxin = Drain)
+}
+
+df <- df %>%
+  mutate(
+    Draxin     = factor(as.character(Draxin), levels = c("0", "68")),
+    Experiment = factor(Experiment),
+    Cell_line  = factor(Cell_line),
+    Absorbance = as.numeric(Absorbance)
+  ) %>%
+  filter(
+    !is.na(Draxin),
+    !is.na(Absorbance),
+    !is.na(Cell_line)
+  )
+
+# Optional quick check
+print("Column names:")
+print(names(df))
+
+print("Levels of Cell_line:")
+print(levels(df$Cell_line))
+
+print("Counts per Cell_line and Draxin:")
+print(df %>% count(Cell_line, Draxin))
+```
+
+```{r}
+# =======================
+# NORMALIZATION
+# Normalize each value to the mean of Draxin = 0
+# within the same Cell_line and Experiment
+# =======================
+df_norm <- df %>%
+  group_by(Cell_line, Experiment) %>%
+  mutate(
+    ctrl_mean = mean(Absorbance[Draxin == "0"], na.rm = TRUE),
+    Absorbance_norm = Absorbance / ctrl_mean
+  ) %>%
+  ungroup()
+
+write_csv(df_norm, file.path(out_dir, "cell_lines_absorbance_with_normalization.csv"))
+
+# =======================
+# FUNCTION FOR STATS
+# Per Cell_line: compare 68 vs 0
+# Uses lm if only 1 experiment
+# Uses lmer if >1 experiments
+# =======================
+analyze_one_cell_line <- function(dat, response_var) {
+  
+  n_exp <- n_distinct(dat$Experiment)
+  
+  formula_txt <- paste0(response_var, " ~ Draxin")
+  
+  if (n_exp > 1) {
+    model_formula <- as.formula(paste0(formula_txt, " + (1 | Experiment)"))
+    m <- lmer(model_formula, data = dat)
+  } else {
+    model_formula <- as.formula(formula_txt)
+    m <- lm(model_formula, data = dat)
+  }
+  
+  emm <- emmeans(m, ~ Draxin)
+  contr <- pairs(emm) %>%
+    as.data.frame()
+  
+  means_tbl <- emm %>%
+    as.data.frame()
+  
+  list(
+    model = m,
+    emmeans = means_tbl,
+    contrast = contr
+  )
+}
+
+# =======================
+# RUN STATS PER CELL_LINE
+# RAW ABSORBANCE
+# =======================
+raw_results <- df_norm %>%
+  group_split(Cell_line) %>%
+  setNames(levels(df_norm$Cell_line)) %>%
+  map(~ analyze_one_cell_line(.x, "Absorbance"))
+
+raw_emmeans <- map2_dfr(
+  raw_results,
+  names(raw_results),
+  ~ .x$emmeans %>% mutate(Cell_line = .y, Data = "raw")
+)
+
+raw_contrasts <- map2_dfr(
+  raw_results,
+  names(raw_results),
+  ~ .x$contrast %>% mutate(Cell_line = .y, Data = "raw")
+)
+
+# =======================
+# RUN STATS PER CELL_LINE
+# NORMALIZED ABSORBANCE
+# =======================
+norm_results <- df_norm %>%
+  group_split(Cell_line) %>%
+  setNames(levels(df_norm$Cell_line)) %>%
+  map(~ analyze_one_cell_line(.x, "Absorbance_norm"))
+
+norm_emmeans <- map2_dfr(
+  norm_results,
+  names(norm_results),
+  ~ .x$emmeans %>% mutate(Cell_line = .y, Data = "normalized")
+)
+
+norm_contrasts <- map2_dfr(
+  norm_results,
+  names(norm_results),
+  ~ .x$contrast %>% mutate(Cell_line = .y, Data = "normalized")
+)
+
+# =======================
+# COMBINED MODEL (ADAPTIVE)
+# If >1 experiment: lmer
+# If 1 experiment: lm
+# =======================
+
+n_exp <- n_distinct(df_norm$Experiment)
+
+if (n_exp > 1) {
+  m_combined <- lmer(
+    Absorbance ~ Draxin * Cell_line + (1 | Experiment),
+    data = df_norm
+  )
+} else {
+  m_combined <- lm(
+    Absorbance ~ Draxin * Cell_line,
+    data = df_norm
+  )
+}
+
+# EMMs: compare Draxin within each cell line
+emm_combined <- emmeans(m_combined, ~ Draxin | Cell_line)
+
+# Since you have only 0 and 68, pairwise is enough
+contr_combined <- contrast(
+  emm_combined,
+  method = "revpairwise",
+  adjust = "sidak"
+)
+
+emm_combined_df <- as.data.frame(emm_combined)
+contr_combined_df <- as.data.frame(contr_combined) %>%
+  mutate(
+    p_label = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      TRUE ~ "ns"
+    )
+  )
+
+# =======================
+# EXPORT STATS
+# =======================
+write_csv(raw_emmeans,   file.path(out_dir, "emmeans_raw_absorbance.csv"))
+write_csv(raw_contrasts, file.path(out_dir, "stats_raw_absorbance_68_vs_0_by_cell_line.csv"))
+
+write_csv(norm_emmeans,   file.path(out_dir, "emmeans_normalized_absorbance.csv"))
+write_csv(norm_contrasts, file.path(out_dir, "stats_normalized_absorbance_68_vs_0_by_cell_line.csv"))
+
+write_csv(
+  emm_combined_df,
+  file.path(out_dir, "emmeans_combined_model.csv")
+)
+
+write_csv(
+  contr_combined_df,
+  file.path(out_dir, "stats_combined_model_68_vs_0_sidak.csv")
+)
+
+# =======================
+# SUMMARY TABLES FOR PLOTTING
+# =======================
+plot_raw <- df_norm %>%
+  group_by(Cell_line, Draxin) %>%
+  summarise(
+    mean = mean(Absorbance, na.rm = TRUE),
+    sd   = sd(Absorbance, na.rm = TRUE),
+    n    = n(),
+    sem  = sd / sqrt(n),
+    .groups = "drop"
+  )
+
+plot_norm <- df_norm %>%
+  group_by(Cell_line, Draxin) %>%
+  summarise(
+    mean = mean(Absorbance_norm, na.rm = TRUE),
+    sd   = sd(Absorbance_norm, na.rm = TRUE),
+    n    = n(),
+    sem  = sd / sqrt(n),
+    .groups = "drop"
+  )
+
+write_csv(plot_raw,  file.path(out_dir, "plot_summary_raw.csv"))
+write_csv(plot_norm, file.path(out_dir, "plot_summary_normalized.csv"))
+
+# =======================
+# PLOT RAW ABSORBANCE
+# =======================
+p_raw <- ggplot(df_norm, aes(x = Draxin, y = Absorbance)) +
+  geom_jitter(width = 0.08, height = 0, size = 2, alpha = 0.8) +
+  stat_summary(fun = mean, geom = "point", size = 3) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.15) +
+  facet_wrap(~ Cell_line, scales = "free_y") +
+  labs(
+    title = "Raw absorbance by cell line",
+    x = "Draxin (nM)",
+    y = "Absorbance"
+  ) +
+  theme_bw(base_size = 12)
+
+ggsave(
+  filename = file.path(out_dir, "plot_raw_absorbance_by_cell_line.pdf"),
+  plot = p_raw,
+  width = 8,
+  height = 6
+)
+
+# =======================
+# PLOT NORMALIZED ABSORBANCE
+# =======================
+p_norm <- ggplot(df_norm, aes(x = Draxin, y = Absorbance_norm)) +
+  geom_jitter(width = 0.08, height = 0, size = 2, alpha = 0.8) +
+  stat_summary(fun = mean, geom = "point", size = 3) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.15) +
+  facet_wrap(~ Cell_line, scales = "free_y") +
+  labs(
+    title = "Normalized absorbance by cell line",
+    x = "Draxin (nM)",
+    y = "Normalized absorbance (relative to Draxin 0)"
+  ) +
+  theme_bw(base_size = 12)
+
+ggsave(
+  filename = file.path(out_dir, "plot_normalized_absorbance_by_cell_line.pdf"),
+  plot = p_norm,
+  width = 8,
+  height = 6
+)
+
+# =======================
+# OPTIONAL BAR PLOTS
+# =======================
+p_raw_bar <- ggplot(plot_raw, aes(x = Draxin, y = mean)) +
+  geom_col(width = 0.7) +
+  geom_errorbar(aes(ymin = mean - sem, ymax = mean + sem), width = 0.15) +
+  facet_wrap(~ Cell_line, scales = "free_y") +
+  labs(
+    title = "Raw absorbance summary",
+    x = "Draxin (nM)",
+    y = "Mean absorbance ± SEM"
+  ) +
+  theme_bw(base_size = 12)
+
+ggsave(
+  filename = file.path(out_dir, "barplot_raw_absorbance_by_cell_line.pdf"),
+  plot = p_raw_bar,
+  width = 8,
+  height = 6
+)
+
+p_norm_bar <- ggplot(plot_norm, aes(x = Draxin, y = mean)) +
+  geom_col(width = 0.7) +
+  geom_errorbar(aes(ymin = mean - sem, ymax = mean + sem), width = 0.15) +
+  facet_wrap(~ Cell_line, scales = "free_y") +
+  labs(
+    title = "Normalized absorbance summary",
+    x = "Draxin (nM)",
+    y = "Mean normalized absorbance ± SEM"
+  ) +
+  theme_bw(base_size = 12)
+
+ggsave(
+  filename = file.path(out_dir, "barplot_normalized_absorbance_by_cell_line.pdf"),
+  plot = p_norm_bar,
+  width = 8,
+  height = 6
+)
+
+print("Done.")
+```

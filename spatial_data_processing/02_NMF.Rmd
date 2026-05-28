@@ -1,0 +1,441 @@
+# ============================================================
+# NMF decomposition, visualization, and spot-level annotation
+# ============================================================
+#
+# This script performs non-negative matrix factorization (NMF) on the
+# spatial transcriptomics dataset and uses the resulting factors to
+# describe spot-level transcriptional programs in a reference-free manner.
+# NMF was selected as an unsupervised approach to capture major biological
+# patterns without relying on predefined marker sets or reference atlases.
+#
+# Different NMF settings were evaluated, and the final workflow was based
+# on sparse NMF with L1 regularization = 0.5 and K = 30 factors. The
+# initial model fitting was run on the Euler high-performance computing
+# cluster, whereas downstream visualization, interpretation, and export
+# of results were performed locally.
+#
+# This script generates the following outputs:
+#   (i) the fitted NMF model object,
+#   (ii) representation plots of NMF factors across tissue blocks
+#   (iii) top-gene loading plots for all and selected factors,
+#   (iv) a similarity heatmap between NMF factors (Figure S2A vs March_2026),
+#   (v) spot-level collapsed NMF compositions and spatial maps (Figure S2C vs March_2026),
+#   (vi) an updated SpatialExperiment object containing NMF-derived labels.
+
+**The first part was run in Euler (high-performance computing (HPC) clusters)**
+#This section performs the initial NMF fitting on the spatial transcriptomics dataset. Highly variable genes are selected across samples by combining per-sample variance models, and the resulting expression matrix is used as input for sparse NMF. The final model was fit with K = 30 factors and L1 = 0.5, and the fitted object was saved for downstream analysis and figure generation.
+
+```{r}
+# ============================================================
+# 1. Select highly variable genes and fit the sparse NMF model
+# ============================================================
+
+library(scater)
+library(scran)
+library(RcppML)
+
+spe <- readRDS("../data/SPE/PNI_SPE_QC.rds")
+colnames(spe) <- spe$barcode
+
+# ---- Accross Sample HVGs ----
+
+set.seed(42) # RND seed
+# Per Sample Var Dec
+smps <- unique(spe$sample_id)
+vars <- lapply(smps, function(SMP) {
+                 out <- modelGeneVar(spe[,spe$sample_id==SMP], lowess=FALSE)
+                 return(out)
+})
+
+library(batchelor)
+combVar <- combineVar(vars)
+hvgs <- getTopHVGs(combVar, n=5000)
+m <- logcounts(spe)[hvgs,]
+
+#--- Run NMF --- 
+nmfout <- nmf(m,k=30,tol=1e-6,seed=1:3,L1=0.5)
+saveRDS(nmfout,"../data/coldata/PNI_NMF_L105-k30.rds")
+```
+
+#This section loads the packages required for downstream visualization and interpretation of the fitted NMF model. It also defines the color palettes used for the biological composition plots and reloads the processed SpatialExperiment object so that the NMF-derived outputs can be mapped back to the original spatial coordinates and metadata.
+
+```{r}
+# ============================================================
+# 2. Load packages, define colour schemes, and re-import the data
+# ============================================================
+
+library(patchwork)
+library(SpatialExperiment)
+library(scuttle)
+library(batchelor)
+library(scran)
+library(scater)
+library(bluster)
+library(ggspavis)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(RcppML)
+library(ggrepel)
+theme_set(theme_minimal(base_size=14))
+library(irlba)
+library(coop)
+source("../scripts/general_functions.R")
+
+c25 <- c(
+  "dodgerblue2", "#E31A1C", # red
+"green4",
+"#6A3D9A", # purple
+"#FF7F00", # orange
+"black", "gold1",
+"skyblue2", "#FB9A99", # lt pink
+"palegreen2",
+"#CAB2D6", # lt purple
+"#FDBF6F", # lt orange
+"gray70", "khaki2",
+"maroon", "orchid1", "deeppink1", "blue1", "steelblue4",
+"darkturquoise", "green1", "yellow4", "yellow3",
+"darkorange4", "brown"
+)
+
+color_maping <- c( "Acinar" = "gold1",
+                   "B_cells" = "maroon",
+                   "Lymphocytes" = "green4",
+                   "Endocrine" = "yellow4",
+                   "Myeloid(Macrophages)" = "#6A3D9A",
+                   "Endothelial" = "#FF7F00",
+                   "CAF" = "skyblue2",
+                   "Adipocytes" = "steelblue4",
+                   "Ductal_normal" = "black",
+                   "Myeloid(C1q_macrophages)" = "#CAB2D6",
+                   "Nerve" = "#FDBF6F",
+                   "Muscle" = "orchid1",
+                   "Ductal_malignant" = "gray70")
+
+spe <- readRDS("../data/SPE/PNI_SPE_QC.rds")
+colnames(spe) <- spe$barcode
+```
+
+#This section defines helper functions used in the visualization workflow. These include a small utility for min–max scaling of values for plotting, a function to display top gene loadings for each factor, and a summary function for aggregating NMF activity across predefined groups. Together, these functions simplify repeated plotting and improve consistency across figures.
+
+```{r}
+# ============================================================
+# 3. Define helper functions for scaling, loadings plots, and summaries
+# ============================================================
+
+# Scale the values for VIZ in each matrix as the absolute values vary by sample
+minmaxscale <- function(x, ...) {
+    return((x - min(x, ...)) /(max(x, ...) - min(x, ...)))
+}
+
+plotLoadings <- function(amp,n=10,bs=7) {
+  require(viridis)
+  require(ggplot2)
+  if (nrow(amp) < ncol(amp)) {
+    amp <- t(amp)
+  }
+  if (is.null(colnames(amp))) {
+    colnames(amp) <- paste0("Factor ",1:ncol(amp))
+  }
+  if (is.null(rownames(amp))) {
+    error("Supply gene names as rownames")
+  }
+
+  plist <- list()
+  for (k in 1:ncol(amp)) {
+    nm <- colnames(amp)[k]
+    ord <- minmaxscale(amp[,k])
+    ord <- ord[order(-abs(ord))][1:n]
+    fp <- data.frame("Gene"=names(ord),
+                     "Value"=ord
+    )
+    fp$Gene <- factor(fp$Gene,levels=rev(fp$Gene))
+    plist[[k]] <- ggplot(fp, aes(x=Gene, y=Value)) +
+      geom_segment(aes(xend=Gene, x=Gene,y=0,yend=Value)) +
+      geom_point(size=4,pch=21,aes(fill=Value)) +
+      theme_minimal(base_size=bs) +
+      theme(legend.position ="none") +
+      scale_y_continuous(limits = c(0, 1.1), breaks = c(0, 1)) +
+      scale_fill_viridis_b() +
+      xlab("") +
+      ylab("") +
+      coord_flip() +
+      ggtitle(nm)
+  }
+  cowplot::plot_grid(plotlist=plist)
+}
+
+calcSummary <- function(h,group_by,stat) {
+  bins <- list()
+    if (length(group_by) == ncol(h)) {
+      for (group in levels(group_by)) {
+        if (stat == "sum") {
+          bins[[group]] <- rowSums(h[, which(group_by == group)])
+        } else {
+          bins[[group]] <- rowMeans(h[, which(group_by == group)])
+        }
+      }
+    }
+    bins <- do.call(cbind, bins)
+    bins <- apply(bins, 1, function(x) x)
+    result <- list()
+    for (i in 1:ncol(bins))
+      result[[length(result) + 1]] <- data.frame("group" = rownames(bins), "factor" = colnames(bins)[i], "stat" = as.vector(bins[, i]))
+    result <- do.call(rbind, result)
+}
+```
+
+#This section loads the fitted NMF object, extracts the gene loading matrix (W) and the spot exposure matrix (H), and rescales the exposures using the model-specific diagonal scaling factor. Spot-level factor exposures are then summarized by sample, converted to proportions within each factor, and relabeled using the manuscript-specific tissue block names. The resulting table is used to visualize how each NMF factor is represented across the different tissue blocks.
+
+```{r}
+# ============================================================
+# 4. Load the fitted NMF model and summarize factor representation
+# ============================================================
+
+
+out <- readRDS("../data/coldata/PNI_NMF_L105-k30.rds")
+w30 <- out@w
+colnames(w30) <- paste0(colnames(w30),"_","K30")
+
+H <- out@h
+H <- sweep(H, 1, out@d, `*`)   # scale-aware exposures
+
+comp_names <- rownames(H)
+comp_names <- sub("^nmf(\\d+)$", "NMF_\\1", comp_names, perl = TRUE)
+rownames(H) <- comp_names
+
+df <- as.data.frame(t(H))
+df$group <- plyr::mapvalues(rownames(df), from = spe$barcode, to=spe$sample_id)
+
+# tidy and normalize to proportions within each component
+long <- df |>
+  pivot_longer(-group, names_to = "component", values_to = "value") |>
+  group_by(component, group) |>
+  summarise(value = sum(value), .groups = "drop")
+
+long <- long |>
+  group_by(component) |>
+  mutate(prop = value / sum(value)) |>
+  ungroup()
+
+rename_map <- c("70865bl15_highPNI" = "Patient 3 diseased",
+               "6249bl18_noPNIandhighPNI" = "Patient 2 diseased",
+               "70865bl5_noPNI" = "Patient 3 adjacent",
+               "54703bl38_noPNI" = "Patient 1 adjacent",
+               "54703bl28_highPNI" = "Patient 1 diseased",
+               "6249bl23_noPNI" = "Patient 2 adjacent")
+
+long$group <- rename_map[ long$group ]
+long$nmf_num <- as.numeric(sub("^NMF_", "", long$component))
+long <- long[order(long$nmf_num), ]
+ordered_levels <- unique(long$component)
+ordered_levels <- rev(ordered_levels)
+long$component <- factor(long$component, levels = ordered_levels)
+```
+
+#This plot provides a global overview of the relative representation of all 30 NMF factors across tissue blocks. For each factor, spot exposures are summed within each tissue block and normalized to proportions, allowing comparison of where each latent program is most strongly represented.
+
+```{r}
+# ============================================================
+# 5. Plot representation of selected manuscript-relevant NMF factors
+# ============================================================
+
+# ---- horizontal composition plot ----
+p1 <- ggplot(long, aes(x = component, y = prop, fill = group)) +
+  geom_col(width = 0.8) +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, 1.01), breaks = seq(0, 1, 0.25)) +
+  scale_fill_brewer(palette = "Paired")+
+  labs(title = "Representation in tissue block", x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(
+    axis.ticks.y = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.border = element_blank(),
+    legend.title = element_blank(),
+    plot.title = element_text(
+      hjust = 0.5,
+      size  = 14
+    )
+  )
+ggsave("../figures/S1_D.pdf", p1, width = 8, height = 10)
+p1
+```
+#This section focuses on a subset of NMF factors selected for the manuscript. These factors correspond to the components most relevant for the tumour- and nerve-associated biology described in the main text, and the plot shows their tissue block representation at larger text size for figure-ready display.
+
+```{r}
+# ============================================================
+# 5B. Plot representation of selected manuscript-relevant NMF factors
+# ============================================================
+
+
+keep <- c("NMF_27", "NMF_19", "NMF_14", "NMF_13", "NMF_4")
+long_2 <- long |> filter(component %in% keep)
+
+long_2$component <- factor(long_2$component, levels = keep)
+
+# ---- horizontal composition plot ----
+p2 <- ggplot(long_2, aes(x = component, y = prop, fill = group)) +
+  geom_col(width = 0.8) +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.25)) +
+  scale_fill_brewer(palette = "Paired")+
+  labs(title = "Representation in tissue block", x = NULL, y = NULL) +
+  theme_minimal(base_size = 22) +
+  theme(
+    axis.ticks.y = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.border = element_blank(),
+    legend.title = element_blank(),
+    plot.title = element_text(
+      hjust = 0.5,
+      size  = 24
+    )
+  )
+ggsave("../figures/F1_E.pdf", p2, width = 14, height = 4)
+p2
+```
+
+#This section exports the complete gene loading matrix and generates a multi-panel plot showing the top genes associated with each NMF factor. These loading plots are used to assign biological meaning to the factors and to provide a full overview of the decomposition in the supplementary material.
+
+```{r}
+# ============================================================
+# 6. Export gene loadings and plot top genes for all NMF factors
+# ============================================================
+
+w <- out@w              
+colnames(w) <- sub("^nmf", "NMF_", colnames(w))   
+write.csv(w,"../data/coldata/NMF_genes.csv")
+
+p3 <- plotLoadings(w, n = 15)   
+#ggsave("../figures/S1_A.pdf", p3, width = 12, height = 14)
+p3
+```
+
+#This section generates top-gene loading plots for a selected subset of tumour-associated NMF factors highlighted in the main figure. Restricting the display to these factors makes the biological interpretation more focused and allows cleaner visualization in a horizontal multi-panel layout.
+
+```{r}
+# ============================================================
+# 7. Plot top gene loadings for selected tumour-associated factors
+# ============================================================
+
+keep <- c("NMF_4", "NMF_13", "NMF_14", "NMF_19")
+
+plots <- lapply(keep, function(k) {
+  m <- w[, k, drop = FALSE]   
+  plotLoadings(m, n = 15) 
+})
+p4 <- wrap_plots(plots, nrow = 1)
+#ggsave("../figures/F1_C.pdf", p4, width = 10, height = 4)
+p4
+```
+
+#This section generates a dedicated loading plot for the nerve-associated NMF factor. Because this factor is discussed separately from the tumour-associated factors, it is shown as an individual panel to improve visibility of the defining genes.
+
+
+```{r}
+# ============================================================
+# 8. Plot top gene loadings for the nerve-associated NMF factor
+# ============================================================
+
+p5 <- plotLoadings(w[, "NMF_27", drop = FALSE], n = 15)   
+#ggsave("../figures/F1_D.pdf", p5, width = 4, height = 4)
+p5
+```
+
+#This section computes pairwise cosine similarity between the NMF factor loading vectors and visualizes the result as a clustered heatmap. The purpose is to assess redundancy or relatedness between factors and to determine whether certain components capture overlapping transcriptional programs.
+
+```{r}
+# ============================================================
+# 9. Compute similarity between NMF factors
+# ============================================================
+
+dd <- cosine(out@w)
+rownames(dd) <- colnames(dd) <- colnames(out@w)
+p6 <- pheatmap::pheatmap(dd,clustering_method="single",clustering_distance_rows ="correlation", clustering_distance_cols ="correlation")
+#ggsave("../figures/S1_B.pdf", p6, width = 16, height = 14)
+p6
+```
+
+#This section collapses the 30 NMF factors into broader biological classes by manually grouping factors with related transcriptional identities, such as malignant ductal, CAF, immune, endothelial, or nerve-associated programs. The resulting collapsed composition matrix is exported and used for downstream spot-level annotation and spatial visualization.
+
+
+```{r}
+# ============================================================
+# 10. Collapse NMF factors into broader biological composition classes
+# ============================================================
+
+h <- out@h
+hsc <- t(scale(t(h),center=FALSE, scale=apply(t(h), 2, sd, na.rm=TRUE)))
+hsc <- t(t(hsc)/colSums(hsc)) * 100
+hsc[is.na(hsc)] <- 0
+sub <- spe[,colnames(hsc)]
+composition <- list()
+composition[['CAF']] <- colSums(hsc[c(28,11,16,12,20,17,6,3,7,5),]) 
+composition[['Ductal_malignant']] <- colSums(hsc[c(13,14,4,19),]) 
+composition[['B_cells']] <- hsc[30,]
+composition[['Endocrine']] <- hsc[c(23),]
+composition[['Acinar']] <- colSums(hsc[c(1,8,26),]) 
+composition[['Ductal_normal']] <- hsc[c(9),] 
+composition[['Myeloid(Macrophages)']] <- hsc[22,]
+composition[['Myeloid(C1q_macrophages)']] <- hsc[2,]
+composition[['Lymphocytes']] <- hsc[15,]
+composition[['Adipocytes']] <- colSums(hsc[c(29,21,25),]) 
+composition[['Muscle']] <- colSums(hsc[c(10,24),])
+composition[['Endothelial']] <- hsc[18,]
+composition[['Nerve']] <- hsc[27,]
+comp <- Reduce(rbind,composition)
+rownames(comp) <- names(composition)
+compk30 <- t(comp)
+compk30 <- as.data.frame(compk30)
+compk30$barcode <- rownames(compk30)
+write.csv(compk30,"../data/coldata/NMFcomp.csv", row.names = FALSE)
+```
+
+#This section visualizes, for a representative sample, the dominant NMF-derived biological class at each spatial location. Each spot is colored according to the collapsed composition category with the highest score, allowing spatial inspection of the distribution of malignant, stromal, immune, and neural programs.
+
+```{r}
+# ============================================================
+# 11. Visualize the dominant NMF-derived class in spatial coordinates
+# ============================================================
+
+max_nmf <- apply(comp, 2, function(v) {
+  nmf_name <- rownames(comp)[which.max(v)]
+  return(nmf_name)
+})
+
+spe$max_nmf <- max_nmf[colnames(spe)]
+
+
+
+
+p7 <- ggcells(spe[, spe$sample_id %in% "54703bl28_highPNI"], aes(x=array_col, y=-array_row, color=max_nmf)) +
+  geom_point(size=0.8) +
+  theme_void() +
+  scale_color_manual("", values = color_maping)+
+  theme(legend.position ='right')
+
+ggsave("../figures/S1_C.pdf", p7, width = 8, height = 6)
+p7
+```
+
+
+#This final section stores the collapsed NMF compositions and the derived spot-level labels back into the SpatialExperiment object. This creates a reusable annotated object containing the NMF-based low-dimensional representation and categorical spot assignments for downstream analyses.
+
+```{r}
+# ============================================================
+# 12. Store NMF-derived compositions and labels in the SpatialExperiment object
+# ============================================================
+
+stopifnot(identical(colnames(spe),colnames(comp)))
+
+reducedDim(spe,"compk30") <-t(comp)
+
+whichk30 <- lapply(colnames(comp),function(COL) comp[,COL]>50)
+spe$k30label <- unlist(lapply(whichk30,function(X) ifelse(sum(X)==0,"Mixed",names(X)[X])))
+
+saveRDS(spe,"../data/SPE/Integrated_NMF.rds")
+```
+
+
+

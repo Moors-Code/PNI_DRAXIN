@@ -1,0 +1,96 @@
+# scRNAseq and snRNAseq pre-pocessing 
+This is the pre-processing and annotation of the sc/snRNA-seq data from: 
+"Chen, M. M., Gao, Q., Ning, H., Chen, K., Gao, Y., Yu, M., ... & Zhang, Z. (2025). Integrated single-cell and spatial transcriptomics uncover distinct cellular subtypes involved in neural invasion in pancreatic cancer. Cancer Cell."
+
+The annotated data will be used to deconvolve the ST data that we have.
+
+```{r}
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(readxl)
+
+
+scRNA.data <- Read10X(data.dir = "../data/Deconvolution/GEOdata/scRNAseq/")
+# Initialize the Seurat object with the raw (non-normalized data).
+scRNA <- CreateSeuratObject(counts = scRNA.data, project = "scRNA", min.cells = 3, min.features = 200)
+
+snRNA.data <- Read10X(data.dir = "../data/Deconvolution/GEOdata/snRNAseq/")
+# Initialize the Seurat object with the raw (non-normalized data).
+snRNA <- CreateSeuratObject(counts = snRNA.data, project = "snRNA", min.cells = 3, min.features = 200)
+
+```
+
+```{r}
+scRNA[["percent.mt"]] <- PercentageFeatureSet(scRNA, pattern = "^MT-")
+VlnPlot(scRNA, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+```{r}
+snRNA[["percent.mt"]] <- PercentageFeatureSet(snRNA, pattern = "^MT-")
+VlnPlot(snRNA, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+```{r}
+scRNA <- subset(scRNA, subset = nFeature_RNA > 200 & nFeature_RNA < 6000 & percent.mt < 25 & nCount_RNA < 25000)
+
+snRNA <- subset(snRNA, subset = nFeature_RNA > 200 & nFeature_RNA < 6000 & percent.mt < 25 & nCount_RNA < 25000)
+```
+
+Now we want to map the metadata provided by the authors in our Seurat object 
+```{r}
+scRNA_metadata <- read.csv("../data/Deconvolution/GEOdata/scRNAseq/metadata.csv")
+scRNA$barcode <-names(scRNA@active.ident)
+scRNA$cell_type <- plyr::mapvalues(scRNA$barcode, from = scRNA_metadata$X, to=scRNA_metadata$all_celltype)
+scRNA <- subset(scRNA, subset = !is.na(cell_type))
+scRNA$tissue <- plyr::mapvalues(scRNA$barcode, from = scRNA_metadata$X, to=scRNA_metadata$tissue)
+scRNA$patients <- plyr::mapvalues(scRNA$barcode, from = scRNA_metadata$X, to=scRNA_metadata$patients)
+```
+
+```{r}
+snRNA_metadata <- read.csv("../data/Deconvolution/GEOdata/snRNAseq/metadata.csv")
+snRNA$barcode <-names(snRNA@active.ident)
+snRNA$cell_type <- plyr::mapvalues(snRNA$barcode, from = snRNA_metadata$X, to=snRNA_metadata$all_celltype)
+snRNA <- subset(snRNA, subset = !is.na(cell_type))
+snRNA$tissue <- plyr::mapvalues(snRNA$barcode, from = snRNA_metadata$X, to=snRNA_metadata$tissue)
+snRNA$patients <- plyr::mapvalues(snRNA$barcode, from = snRNA_metadata$X, to=snRNA_metadata$patients)
+```
+
+```{r}
+merged_obj <- merge(x = scRNA, y = snRNA, add.cell.ids = c("scRNA", "snRNA"),)
+# For our analysis we don't need the PBMC data so we remove them 
+merged_obj <- subset(merged_obj, subset = !(merged_obj$tissue == "PBMC"))
+merged_obj <- NormalizeData(merged_obj)
+merged_obj <- FindVariableFeatures(merged_obj)
+merged_obj <- ScaleData(merged_obj)
+merged_obj <- RunPCA(merged_obj)
+```
+Then, according to the authors, we integrated the two datasets with the following parameters and function: 
+```{r}
+#devtools::install_github("ycli1995/bbknnR")
+library(bbknnR)
+merged_obj <- RunBBKNN(merged_obj, batch_key = 'orig.ident', n_pcs = 30,run_UMAP = TRUE)
+```
+```{r}
+merged_obj <- FindNeighbors(merged_obj, dims = 1:10)
+merged_obj <- FindClusters(merged_obj, resolution = 1)
+```
+
+```{r}
+merged_obj <- JoinLayers(merged_obj)
+DimPlot(merged_obj, reduction = "umap")
+```
+We can use their metadata to characterize the ductal malignant cells as follows: 
+```{r}
+# make a character copy so new labels are allowed
+merged_obj$cell_type_refined <- as.character(merged_obj$cell_type)
+
+merged_obj$cell_type_refined[merged_obj$cell_type == "Ductal" & merged_obj$tissue == "Tumor"]           <- "Ductal_malignant"
+merged_obj$cell_type_refined[merged_obj$cell_type == "Ductal" & merged_obj$tissue == "Adjacent_normal"] <- "Ductal_normal"
+merged_obj <- subset(merged_obj, subset = !(merged_obj$cell_type_refined == "Platelet")) # Because after removing PBMC samples only 2 cells left and that leads to errors when running RCTD
+```
+Now we can use this for the reference.
+```{r}
+saveRDS(merged_obj,"../data/Deconvolution/sc_sn_merged_obj.Rds")
+```
+
+
+

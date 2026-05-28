@@ -1,0 +1,300 @@
+# =========================================================
+# MAGeCK-oriented filtering strategies
+# =========================================================
+#
+# Goal:
+# Create filtered RAW count matrices for MAGeCK, where filtering is
+# decided using voom-normalized data from selected reference groups.
+#
+# Filtering strategies:
+# 1) library_input + T0
+# 2) T0 only
+# 3) T0 + control   <-- kept as in previous analysis for reproducibility
+#
+# Important:
+# - Filtering is based on mean voom logCPM in selected samples
+# - Saved output files are RAW counts (not normalized), suitable for MAGeCK
+# =========================================================
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(edgeR)
+  library(limma)
+  library(stringr)
+})
+```
+
+
+```{r}
+# =========================================================
+# 1. Paths
+# =========================================================
+input_file <- "input_files/Library_and_Screen.csv"
+outdir <- "output_files/mageck_filtering"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r}
+# =========================================================
+# 2. Read count matrix
+# Expected columns:
+#   sgRNA or sgRNAID | Gene | sample1 | sample2 | ...
+# =========================================================
+count_matrix <- read.csv(input_file, check.names = FALSE)
+
+if ("sgRNAID" %in% colnames(count_matrix) && !"sgRNA" %in% colnames(count_matrix)) {
+  colnames(count_matrix)[colnames(count_matrix) == "sgRNAID"] <- "sgRNA"
+}
+
+stopifnot(all(c("sgRNA", "Gene") %in% colnames(count_matrix)))
+
+meta_cols <- c("sgRNA", "Gene")
+sample_cols <- setdiff(colnames(count_matrix), meta_cols)
+
+meta_info <- count_matrix[, meta_cols, drop = FALSE]
+raw_counts <- count_matrix[, sample_cols, drop = FALSE]
+
+raw_counts[] <- lapply(raw_counts, as.numeric)
+
+if (any(is.na(raw_counts))) {
+  warning("Some count values are NA. Replacing NA with 0.")
+  raw_counts[is.na(raw_counts)] <- 0
+}
+
+raw_counts_mat <- as.matrix(raw_counts)
+rownames(raw_counts_mat) <- count_matrix$sgRNA
+```
+
+```{r}
+# =========================================================
+# 3. Define sample groups
+# Adjust patterns here if your sample names differ
+# =========================================================
+sample_group_df <- tibble(
+  Sample = sample_cols,
+  Group = case_when(
+    str_detect(sample_cols, "rep\\d*_counts") ~ "library_input",
+    str_detect(sample_cols, "^Draxin") ~ "draxin",
+    str_detect(sample_cols, "^Ctr") ~ "control",
+    str_detect(sample_cols, "^Before") ~ "T0",
+    TRUE ~ "unknown"
+  )
+)
+
+write.csv(
+  sample_group_df,
+  file.path(outdir, "sample_group_assignment.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+run_voom_filter <- function(raw_counts_mat,
+                            meta_info,
+                            sample_group_df,
+                            keep_groups,
+                            filter_label,
+                            outdir,
+                            mean_logcpm_cutoff = 2.5) {
+
+ selected_samples <- sample_group_df %>%
+  dplyr::filter(Group %in% keep_groups) %>%
+  dplyr::pull(Sample)
+
+selected_samples_label <- paste(selected_samples, collapse = "; ")
+n_reference_samples <- length(selected_samples)
+
+  if (length(selected_samples) < 1) {
+    warning(paste0("Skipping ", filter_label, ": no selected samples found."))
+    return(NULL)
+  }
+
+  missing_samples <- setdiff(selected_samples, colnames(raw_counts_mat))
+  if (length(missing_samples) > 0) {
+    stop(
+      "These selected samples are missing from raw_counts_mat: ",
+      paste(missing_samples, collapse = ", ")
+    )
+  }
+
+  sample_order <- colnames(raw_counts_mat)
+  count_data_sub <- raw_counts_mat[, selected_samples, drop = FALSE]
+
+  group_sub <- sample_group_df$Group[match(selected_samples, sample_group_df$Sample)]
+  group_sub <- factor(group_sub)
+
+  if (nlevels(group_sub) < 2) {
+    design_sub <- matrix(1, nrow = length(selected_samples), ncol = 1)
+    colnames(design_sub) <- "Intercept"
+    rownames(design_sub) <- selected_samples
+  } else {
+    design_sub <- model.matrix(~ group_sub)
+    rownames(design_sub) <- selected_samples
+  }
+
+  dge_sub <- edgeR::DGEList(counts = count_data_sub)
+  dge_sub <- edgeR::calcNormFactors(dge_sub)
+
+  v_sub <- limma::voom(dge_sub, design_sub, plot = FALSE)
+
+  mean_logcpm_sub <- rowMeans(v_sub$E, na.rm = TRUE)
+  keep_idx <- mean_logcpm_sub >= mean_logcpm_cutoff
+
+  filtered_raw_counts <- raw_counts_mat[keep_idx, , drop = FALSE]
+
+  filtered_raw_df <- filtered_raw_counts %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column(var = "sgRNA") %>%
+    dplyr::left_join(meta_info, by = "sgRNA") %>%
+    dplyr::select(sgRNA, Gene, dplyr::all_of(sample_order))
+
+  stats_df <- tibble::tibble(
+  filter_name = filter_label,
+  reference_groups = paste(keep_groups, collapse = " + "),
+  selected_samples = selected_samples_label,
+  n_reference_samples = n_reference_samples,
+  n_reference_groups = nlevels(group_sub),
+  mean_logcpm_cutoff = mean_logcpm_cutoff,
+  n_sgRNAs_before = nrow(raw_counts_mat),
+  n_sgRNAs_after = sum(keep_idx),
+  n_sgRNAs_removed = sum(!keep_idx)
+)
+  
+  keep_table <- tibble::tibble(
+    sgRNA = rownames(raw_counts_mat),
+    Gene = meta_info$Gene[match(rownames(raw_counts_mat), meta_info$sgRNA)],
+    mean_logCPM_reference = mean_logcpm_sub,
+    keep = keep_idx
+  )
+
+  write.csv(
+    filtered_raw_df,
+    file.path(outdir, paste0("MAGECK_input_", filter_label, "_RAW_COUNTS.csv")),
+    row.names = FALSE,
+    quote = FALSE
+  )
+
+  write.csv(
+    keep_table,
+    file.path(outdir, paste0("MAGECK_filter_decisions_", filter_label, ".csv")),
+    row.names = FALSE
+  )
+
+  write.csv(
+    stats_df,
+    file.path(outdir, paste0("MAGECK_filter_summary_", filter_label, ".csv")),
+    row.names = FALSE
+  )
+
+  return(list(
+    filter_name = filter_label,
+    selected_samples = selected_samples,
+    group_sub = group_sub,
+    design_sub = design_sub,
+    keep_idx = keep_idx,
+    stats = stats_df,
+    keep_table = keep_table,
+    filtered_raw_df = filtered_raw_df
+  ))
+}
+```
+
+```{r}
+# =========================================================
+# 5. Run filtering strategy 1:
+#    library_input + T0
+# =========================================================
+res_library_T0 <- run_voom_filter(
+  raw_counts_mat = raw_counts_mat,
+  meta_info = meta_info,
+  sample_group_df = sample_group_df,
+  keep_groups = c("library_input", "T0"),
+  filter_label = "voom_libraryInput_plus_T0",
+  outdir = outdir,
+  mean_logcpm_cutoff = 2.5
+)
+```
+
+```{r}
+# =========================================================
+# 6. Run filtering strategy 2:
+#    T0 only
+# =========================================================
+res_T0_only <- run_voom_filter(
+  raw_counts_mat = raw_counts_mat,
+  meta_info = meta_info,
+  sample_group_df = sample_group_df,
+  keep_groups = c("T0"),
+  filter_label = "voom_T0_only",
+  outdir = outdir,
+  mean_logcpm_cutoff = 2.5
+)
+```
+
+```{r}
+# =========================================================
+# 7. Run filtering strategy 3:
+#    T0 + control
+#    kept as before for reproducibility
+# =========================================================
+res_T0_control <- run_voom_filter(
+  raw_counts_mat = raw_counts_mat,
+  meta_info = meta_info,
+  sample_group_df = sample_group_df,
+  keep_groups = c("T0", "control"),
+  filter_label = "voom_T0_plus_control",
+  outdir = outdir,
+  mean_logcpm_cutoff = 2.5
+)
+```
+
+```{r}
+# =========================================================
+# 8. Collect all filter summaries
+# =========================================================
+all_stats <- list(
+  res_library_T0,
+  res_T0_only,
+  res_T0_control
+) %>%
+  purrr::compact() %>%
+  purrr::map("stats") %>%
+  bind_rows()
+
+if (nrow(all_stats) > 0) {
+  write.csv(
+    all_stats,
+    file.path(outdir, "MAGECK_filtering_overview.csv"),
+    row.names = FALSE
+  )
+}
+```
+
+```{r}
+# =========================================================
+# 9. Console summary
+# =========================================================
+cat("MAGeCK-oriented filtering complete.\n")
+cat("Input file:", input_file, "\n")
+cat("Total sgRNAs before filtering:", nrow(raw_counts_mat), "\n")
+cat("Outputs written to:", outdir, "\n\n")
+
+if (!is.null(res_library_T0)) {
+  cat("Strategy 1: library_input + T0\n")
+  print(res_library_T0$stats)
+  cat("\n")
+}
+
+if (!is.null(res_T0_only)) {
+  cat("Strategy 2: T0 only\n")
+  print(res_T0_only$stats)
+  cat("\n")
+}
+
+if (!is.null(res_T0_control)) {
+  cat("Strategy 3: T0 + control\n")
+  print(res_T0_control$stats)
+  cat("\n")
+}
+```

@@ -1,0 +1,1489 @@
+
+#Differential Expression Analysis
+#This script defines spatially resolved tissue categories around nerves and tumor regions, visualizes their distribution across samples, constructs pseudo-bulk units from spatial patches, and performs differential expression analysis between invaded nerves, non-invaded nerves, and tumor-associated regions. The overall aim is to identify transcriptional programs associated with nerve invasion while separating nerve-specific signals from surrounding tumor-derived expression.
+
+#===================================================================
+# Main outputs and figures generated in this script
+#===================================================================
+# Figure 1F: Spatial map of the four annotated categories across all
+# six tissue blocks, plus a patient-specific view for one representative
+# patient.
+#
+# Figure 1G: Quantification of spot numbers per spatial category,
+# stratified by patient and tissue context, with nerve counts shown
+# for nerve-containing groups.
+#
+# Figure 1H: Histology-based visualization of the four annotated
+# spatial categories on the full H&E image of a representative diseased
+# section, together with zoomed-in views of selected regions.
+#
+# Figure 2A: Differential expression between invaded and non-invaded
+# nerves shown as volcano plots, including alternative highlighting
+# strategies for selected biological programs.
+#
+# Figure 3A: Two-contrast prioritization plot identifying genes
+# selectively enriched in invaded nerves relative to both non-invaded
+# nerves and tumour-distal controls.
+#
+# Figure 3C: Correlation plot relating prioritized genes to tumour-like
+# versus nerve-like transcriptional programs within invaded nerve spots.
+
+# Figure S9A: Differential expression between nerve:proximal and nerve:distal 
+#tumor regions
+#
+# Figure 6E: Two contrat prioritization plot identifying genes
+# selectively enriched in nerve:proximal relative to nerve:distal
+# and non-invaded nerve.
+
+```{r}
+#===================================================================
+# 1. Load packages, define helper functions, and import data
+#===================================================================
+# This section loads required libraries, defines helper objects such as
+# scaling and color mappings, imports the integrated SpatialExperiment
+# object, and adds curated metadata used for downstream annotation,
+# visualization, and differential expression analysis.
+  
+library(patchwork)
+library(limma)
+library(SpatialExperiment)
+library(scuttle)
+library(batchelor)
+library(scran)
+library(scater)
+library(ggspavis)
+library(dplyr)
+library(ggrepel)
+theme_set(theme_minimal(base_size=14))
+source("../scripts/general_functions.R")
+# --------------
+
+minmaxscale <- function(x, ...) {
+    return((x - min(x, ...)) /(max(x, ...) - min(x, ...)))
+}
+c25 <- c(
+  "dodgerblue2", "#E31A1C", # red
+"green4",
+"#6A3D9A", # purple
+"#FF7F00", # orange
+"black", "gold1",
+"skyblue2", "#FB9A99", # lt pink
+"palegreen2",
+"#CAB2D6", # lt purple
+"#FDBF6F", # lt orange
+"gray70", "khaki2",
+"maroon", "orchid1", "deeppink1", "blue1", "steelblue4",
+"darkturquoise", "green1", "yellow4", "yellow3",
+"darkorange4", "brown"
+)
+
+color_maping <- c( "Acinar" = "gold1",
+                   "B_cells" = "maroon",
+                   "Lymphocytes" = "green4",
+                   "Endocrine" = "yellow4",
+                   "Myeloid(Macrophages)" = "#6A3D9A",
+                   "Endothelial" = "#FF7F00",
+                   "CAF" = "skyblue2",
+                   "Adipocytes" = "steelblue4",
+                   "Ductal_normal" = "black",
+                   "Myeloid(C1q_macrophages)" = "#CAB2D6",
+                   "Nerve" = "#FDBF6F",
+                   "Muscle" = "orchid1",
+                   "Ductal_malignant" = "gray70")
+
+spe <- readRDS("../data/SPE/Integrated_NMF.rds")
+colData(spe) <- DataFrame(read.csv("../data/coldata/nerveID.csv"))
+colnames(spe) <- spe$barcode
+```
+
+#Definition of groups
+**- InvadedNerve**
+  Spot where the maximum signal is nerve and spot is part of an invaded nerve
+
+**- Nerve**
+  Spot where the maximum signal is nerve and spot is part of a non-invaded nerve
+
+**- TumorProximal**
+  Tumor where the max is tumor and spot belongs to either a nerve-border that is classified as invaded
+
+**- TumorDistal**
+  Spot where the max is tumor and far (min 100 spots) away from the nerve
+
+**InvadedNerve & Nerve**
+```{r}
+#===================================================================
+# 2. Define invaded nerve, non-invaded nerve, and tumour-associated groups
+#===================================================================
+# This section assigns barcodes to the four spatial comparison groups
+# used throughout the analysis. Spots are classified as invaded nerve,
+# non-invaded nerve, nerve-adjacent tumour, or nerve-remote tumour
+# based on existing invasion annotations and dominant NMF-derived tissue
+# identity.
+
+cmp <- t(reducedDim(spe,"compk30"))
+nervmx <- names(which(apply(cmp,2,which.max)==(which(rownames(cmp)=="Nerve"))))
+def <- spe$Invaded=="Invaded" 
+def[is.na(def)] <- FALSE
+invadedNerveCells <- spe$barcode[def]
+names(invadedNerveCells) <- rep("InvadedNerve",length(invadedNerveCells))
+spe$InvadedNerve <- def
+
+def <- spe$Invaded=="NonInvaded" 
+def[is.na(def)] <- FALSE
+nerveCells <- spe$barcode[def]
+names(nerveCells) <- rep("Nerve",length(nerveCells))
+spe$Nerve <- def
+```
+
+**TumorProximal**
+```{r}
+# This section identifies malignant spots located at the border of
+# invaded nerves and stores them as the tumour-proximal comparison
+# group.
+
+tummx <- names(which(apply(cmp,2,which.max)==(which(rownames(cmp)=="Ductal_malignant"))))
+def <- spe$BorderInvaded=="Invaded" & spe$barcode %in% tummx
+def[is.na(def)] <- FALSE
+tumorProximalCells <- spe$barcode[def]
+names(tumorProximalCells) <- rep("TumorProximal",length(tumorProximalCells))
+spe$tumorProximalCells <- def
+```
+
+**TumorDistal**
+```{r}
+# This section identifies malignant spots that are far from nerves and
+# clusters adjacent distal tumour spots into patch IDs, which are later
+# used for pseudo-bulk aggregation.
+
+
+def <- is.na(spe$BorderID) & spe$barcode %in% tummx & !spe$NerveProximal & !spe$is.nerve
+def[is.na(def)] <- FALSE
+spe$TumorDistal <- def
+
+sub <- spe[,spe$TumorDistal]
+pos <- cbind(sub$row,sub$col)
+nn <- BayesSpace:::find_neighbors(pos,radius=2,method="manhattan") 
+dd <- dist(pos,method="manhattan")
+tree <- hclust(dd,method="single")
+sub$TumorDistalID <- cutree(tree,h=2)
+
+add <- data.frame(colData(sub)[,c("barcode","TumorDistalID")])
+colData(spe) <- DataFrame(dplyr::left_join(data.frame(colData(spe)),add))
+setna <- as.integer(names(which(table(spe$TumorDistalID)<4)))
+spe$TumorDistalID[spe$TumorDistalID %in% setna] <- NA
+spe$TumorDistal[is.na(spe$TumorDistalID)] <- FALSE
+tumorDistalCells <- spe$barcode[spe$TumorDistal]
+names(tumorDistalCells) <- rep("TumorDistal",length(tumorDistalCells))
+```
+
+Visual summary in space
+```{r}
+#===================================================================
+# 3. Build ordered sample metadata and combine region annotations
+#===================================================================
+# This section adds patient- and context-level metadata to each spot,
+# imposes a consistent ordering for plotting, and merges the previously
+# defined region labels into one unified 'Area' annotation used for all
+# downstream spatial visualizations.
+
+# ---- 1) Define ordering metadata for each sample_id ----
+sample_key <- data.frame(
+  sample_id = c(
+    "54703bl38_noPNI",             # P1 Adjacent
+    "54703bl28_highPNI",           # P1 Diseased
+    "6249bl23_noPNI",              # P2 Adjacent
+    "6249bl18_noPNIandhighPNI",    # P2 Diseased
+    "70865bl5_noPNI",              # P3 Adjacent
+    "70865bl15_highPNI"            # P3 Diseased
+  ),
+  patient = c("Patient 1","Patient 1","Patient 2","Patient 2","Patient 3","Patient 3"),
+  context = c("Adjacent","Diseased","Adjacent","Diseased","Adjacent","Diseased"),
+  stringsAsFactors = FALSE
+)
+
+# join onto spe (works for SpatialExperiment colData too)
+spe$patient <- sample_key$patient[match(spe$sample_id, sample_key$sample_id)]
+spe$context <- sample_key$context[match(spe$sample_id, sample_key$sample_id)]
+
+# force ordering
+spe$patient <- factor(spe$patient, levels = c("Patient 1","Patient 2","Patient 3"))
+spe$context <- factor(spe$context, levels = c("Adjacent","Diseased"))  # Adjacent on top
+
+# ---- 2) Your existing Area assignment (unchanged) ----
+frm <- c(invadedNerveCells, nerveCells, tumorProximalCells, tumorDistalCells)
+tpe <- plyr::mapvalues(spe$barcode, from = frm, to = names(frm))
+tpe[!spe$barcode %in% unname(frm)] <- NA
+spe$Area <- tpe
+spe$Area[is.na(spe$Area)] <- "other"
+
+#===================================================================
+# 4. Plot spatial distribution of the four annotated categories
+#===================================================================
+# This section visualizes the location of all four spatial categories
+# across the six tissue sections, arranged by tissue context and patient,
+# to provide a global overview of the annotation strategy.
+
+
+# ---- 3) Plot with facet_grid: rows=context, cols=patient ----
+p1 <- ggcells(spe, aes(x = array_col, y = -array_row)) +
+  geom_point(size = 0.5, aes(color = Area)) +
+  facet_grid(
+    context ~ patient,
+    labeller = labeller(
+      context = c("Adjacent" = "Adjacent", "Diseased" = "Diseased"),
+      patient  = c("Patient 1" = "Patient 1", "Patient 2" = "Patient 2", "Patient 3" = "Patient 3")
+    )
+  ) +
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal") +
+  guides(colour = guide_legend(override.aes = list(size = 2))) +
+  scale_color_manual(
+    name = "Type",
+    values = c(c25[1], c25[3], "grey90", c25[5], c25[2]),
+    labels = c(
+      "other"        = "Other",
+      "Nerve"        = "Non-invaded Nerve",
+      "TumorProximal"= "Tumor Proximal",
+      "InvadedNerve" = "Invaded Nerve",
+      "TumorDistal"  = "Tumor Distal"
+    )
+  ) +
+  theme_void()
+
+ggsave("../figures/F1_A_2.pdf", p1, width = 14, height = 10)
+p1
+```
+
+```{r}
+#===================================================================
+# 5. Plot a representative patient-level example of the spatial annotation
+#===================================================================
+# This section shows the same four-category annotation for one patient
+# only, allowing closer inspection of how non-invaded nerves, invaded
+# nerves, and the two tumour compartments are distributed within a
+# representative case.
+
+p2 <- ggcells(spe[, spe$patient_id %in% "54703"], aes(x=array_col, y=-array_row)) +
+  geom_point(size = 0.5, aes(color = Area)) +
+  facet_wrap(~sample_id,
+             labeller = as_labeller(c(
+              "54703bl38_noPNI" = "Patient 1 - Adjacent",
+               "54703bl28_highPNI" = "Patient 1 - Diseased"
+             ))) +
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal") +
+  guides(colour = guide_legend(override.aes = list(size = 2))) +
+  scale_color_manual(
+    name = "",
+    values = c(c25[1], c25[3], "grey90", c25[5], c25[2]), labels = c(
+    "other" = "Other",
+    "Nerve" = "Non-invaded Nerve",
+    "TumorProximal" = "Tumor Proximal",
+    "InvadedNerve" = "Invaded Nerve",
+    "TumorDistal" = "Tumor Distal"
+  )) +
+  theme_void()
+
+#ggsave("../figures/F1_F.pdf", p2, width = 10, height = 6)
+p2
+```
+
+```{r}
+
+#===================================================================
+# 6. Count spots and unique nerves per spatial category
+#===================================================================
+# This section summarizes how many spots and, where applicable, how many
+# unique nerves contribute to each spatial category across patients and
+# tissue contexts. These summaries help assess group balance before
+# pseudo-bulk DE analysis.
+
+meta <- as.data.frame(colData(spe))
+
+# Make sure you have these columns:
+# meta$patient   (e.g. "Patient 1", "Patient 2", "Patient 3")
+# meta$context   (e.g. "Adjacent", "Diseased")
+# meta$Area      (e.g. "InvadedNerve", "Nerve", "TumorProximal", "TumorDistal")
+# meta$NerveID   (nerve identifier per spot, NA if not applicable)
+
+meta <- meta %>%
+  mutate(
+    patient = factor(patient, levels = c("Patient 1","Patient 2","Patient 3")),
+    context = factor(context, levels = c("Diseased","Adjacent")),  # X order as you requested
+    group   = Area
+  )
+
+# ---- Spot counts ----
+spots_counts <- meta %>%
+  filter(!is.na(group)) %>%
+  dplyr::count(group, context, patient, name = "n") %>%
+  mutate(measure = "Spots")
+
+# ---- Nerve counts (unique nerves) ----
+nerves_counts <- meta %>%
+  filter(!is.na(group), !is.na(NerveID)) %>%
+  distinct(group, context, patient, NerveID) %>%
+  dplyr::count(group, context, patient, name = "n") %>%
+  mutate(measure = "Nerves")
+
+counts_long <- bind_rows(spots_counts, nerves_counts) %>%
+  mutate(
+    measure = factor(measure, levels = c("Spots","Nerves")) # Spots on top in facet_grid
+  )
+```
+
+```{r}
+library(tidyr)
+#===================================================================
+# 7. Plot per-category spot counts across patients and contexts
+#===================================================================
+# This section visualizes the number of spots assigned to each spatial
+# category, with patient identity shown by fill color and the number of
+# unique nerves overlaid for nerve-containing groups.
+
+# Force x-axis order everywhere
+counts_long <- counts_long %>%
+  mutate(context = factor(context, levels = c("Adjacent", "Diseased")))
+
+base_theme <- theme_classic(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    plot.title = element_text(hjust = 0.5),
+    axis.title.x = element_blank()
+  )
+
+
+plot_spots_only <- function(counts_long, grp, title = grp) {
+
+  df <- counts_long %>%
+    filter(group == grp, measure == "Spots")
+
+  ggplot(df, aes(x = context, y = n, fill = patient)) +
+    geom_col(width = 0.75) +
+    labs(title = title, y = "Spots", fill = "Patient") +
+    base_theme
+}
+
+plot_nerve_spots_with_N <- function(counts_long, grp, title = grp) {
+
+  df <- counts_long %>%
+    filter(group == grp) %>%
+    select(group, context, patient, measure, n) %>%
+    pivot_wider(names_from = measure, values_from = n, values_fill = 0)
+
+  ggplot(df, aes(x = context, y = Spots, fill = patient)) +
+    geom_col(width = 0.75) +
+    geom_text(
+      aes(label = ifelse(Nerves > 0, paste0("N=", Nerves), "")),
+      position = position_stack(vjust = 0.5),
+      size = 3,
+      color = "black"
+    ) +
+    labs(title = title, y = "Spots", fill = "Patient") +
+    base_theme
+}
+
+
+p_invaded <- plot_nerve_spots_with_N(counts_long, "InvadedNerve", "Invaded nerves")
+p_uninv   <- plot_nerve_spots_with_N(counts_long, "Nerve", "Non-invaded nerves")
+
+p_tprox   <- plot_spots_only(counts_long, "TumorProximal", "Nerve-adjacent tumor")
+p_tdist   <- plot_spots_only(counts_long, "TumorDistal", "Nerve-remote tumor")
+
+panel_2x2 <- (p_invaded | p_uninv) /
+             (p_tprox   | p_tdist) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+panel_2x2
+
+#ggsave("../figures/4_category_spots_per_patient.pdf", panel_2x2, width = 12, height = 10, dpi=600)
+
+```
+
+
+
+```{r}
+
+#===================================================================
+# 8. Overlay the four annotated categories on the histology image
+#===================================================================
+# This section projects the spatial categories onto the Visium H&E image
+# of a representative diseased section to confirm that the annotation is
+# anatomically coherent in tissue space.
+
+spe_use <- spe[, spe$Area != "other"]
+spe_p1d <- spe_use[, spe_use$sample_id %in% "54703bl28_highPNI"]
+
+p_base <- plotVisium(
+  spe_p1d,
+  y_coord = "pxl_row_in_fullres",
+  x_coord = "pxl_col_in_fullres",
+  spots   = TRUE,
+  image   = TRUE,
+  fill    = "Area",
+  y_reverse = TRUE
+) +
+  facet_wrap(~sample_id,
+             labeller = as_labeller(c("54703bl28_highPNI" = "Patient 1 - Diseased"))) +
+  scale_fill_manual(
+    values = c(
+      "InvadedNerve"  = c25[1],
+      "Nerve"         = c25[3],
+      "TumorDistal"   = c25[5],
+      "TumorProximal" = c25[2]
+    ),
+    labels = c(
+      "InvadedNerve"  = "Invaded Nerve",
+      "Nerve"         = "Non-invaded Nerve",
+      "TumorDistal"   = "Tumor Distal",
+      "TumorProximal" = "Tumor Proximal"
+    )
+  ) +
+  theme_void() +
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal")
+
+p_ref <- p_base +
+  theme_void() +
+  theme(
+    axis.title = element_blank(),
+    axis.text  = element_text(size = 8),
+    axis.ticks = element_line(linewidth = 0.2)
+  )
+
+p_ref
+```
+
+
+```{r}
+#===================================================================
+# 9. Generate zoomed histology panels for representative regions
+#===================================================================
+# This section creates paired zoom panels showing selected regions of
+# the H&E image alone and with the spatial category annotation overlaid,
+# allowing detailed visual inspection of invaded and non-invaded nerve
+# niches.
+
+
+make_zoom_pair <- function(spe_obj, zoom_xlim, zoom_ylim,
+                          title = NULL,
+                          y_rev = TRUE,
+                          spot_size = 2.5) 
+{
+   p_img <- plotVisium(spe_obj,
+    x_coord = "pxl_col_in_fullres",
+     y_coord = "pxl_row_in_fullres",
+     image = TRUE,
+    spots = FALSE,
+     y_reverse = y_rev
+   ) +
+     coord_fixed(ratio = 1, xlim = zoom_xlim, ylim = zoom_ylim,
+                 expand = FALSE, clip = "on") +
+     theme_void() +
+     theme(legend.position = "none",
+           plot.title = element_blank())
+   
+   p_img$layers <- Filter(function(l) !inherits(l$geom, "GeomPoint"), p_img$layers)
+   
+   p_spots <- plotVisium(
+     spe_obj,
+     x_coord = "pxl_col_in_fullres",
+     y_coord = "pxl_row_in_fullres",
+     image = TRUE,
+     spots = TRUE,
+     fill  = "Area",
+    y_reverse = y_rev
+) +
+     scale_fill_manual(
+       values = c(
+         "InvadedNerve"  = c25[1],
+         "Nerve"         = c25[3],
+        "TumorDistal"   = c25[5],
+         "TumorProximal" = c25[2]
+),
+       labels = c(
+         "InvadedNerve"  = "Invaded Nerve",
+         "Nerve"         = "Non-invaded Nerve",
+         "TumorDistal"   = "Tumor Distal",
+         "TumorProximal" = "Tumor Proximal"
+)
+     ) +
+     coord_fixed(ratio = 1, xlim = zoom_xlim, ylim = zoom_ylim,
+                 expand = FALSE, clip = "on") +
+     theme_void() +
+     theme(
+       legend.position = "bottom",
+       legend.direction = "horizontal",
+       plot.title = element_blank()
+)
+   # ---- Enlarge ONLY point layers in p_spots ----
+   is_point_layer <- vapply(p_spots$layers, function(l) inherits(l$geom, "GeomPoint"), logical(1))
+   if (any(is_point_layer)) {
+     for (i in which(is_point_layer)) {
+       p_spots$layers[[i]]$aes_params$size   <- spot_size
+       p_spots$layers[[i]]$aes_params$alpha  <- 1
+       p_spots$layers[[i]]$aes_params$stroke <- 0
+     }
+}
+   p_img / p_spots
+}
+
+ # ---- your data ----
+spe_use <- spe[, spe$Area != "other"]
+spe_p1d <- spe_use[, spe_use$sample_id %in% "54703bl28_highPNI"]
+ # ---- your zoom windows ----
+zoom1_xlim <- c(1050, 1350)
+zoom1_ylim <- c( 650, 950)
+zoom2_xlim <- c( 1450,  1750)
+zoom2_ylim <- c(1050, 1350)
+zoom3_xlim <- c( 350,  650)
+zoom3_ylim <- c(360, 660)
+p_pair1 <- make_zoom_pair(spe_p1d, zoom1_xlim, zoom1_ylim, y_rev = TRUE, spot_size = 2)
+p_pair2 <- make_zoom_pair(spe_p1d, zoom2_xlim, zoom2_ylim, y_rev = TRUE, spot_size = 2)
+p_pair3 <- make_zoom_pair(spe_p1d, zoom3_xlim, zoom3_ylim, y_rev = TRUE, spot_size = 2)
+
+final2 <- (p_pair1 | (p_pair2 + theme(legend.position = "none")) | (p_pair3 + theme(legend.position = "none"))) +
+plot_layout(guides = "collect") &
+  theme(legend.position = "bottom",
+         legend.direction = "horizontal")
+
+final2
+```
+
+```{r}
+#===================================================================
+# 10. Export zoomed spatial panels for figure assembly
+#===================================================================
+# This section saves the full multi-panel zoom figure and individual
+# zoom panels in publication-ready raster and vector formats.
+
+ggsave("zoom_panels.pdf", final2, width = 12, height = 6, units = "in")
+# best: ragg renders clean points and avoids weird rings
+library(ragg)
+
+ggsave("zoom1.png", p_pair1, width = 3.2, height = 6.0, units = "in",
+       dpi = 600, device = ragg::agg_png, bg = "white")
+
+ggsave("zoom2.png", p_pair2, width = 3.2, height = 6.0, units = "in",
+       dpi = 600, device = ragg::agg_png, bg = "white")
+
+ggsave("zoom3.png", p_pair3, width = 3.2, height = 6.0, units = "in",
+       dpi = 600, device = ragg::agg_png, bg = "white")
+
+ggsave("final2_zoom_panels.pdf", final2,
+       device = cairo_pdf,
+       width = 12, height = 6, units = "in")
+```
+
+
+```{r}
+#===================================================================
+# 11. Export barcode-level region annotations for each sample
+#===================================================================
+# This section writes per-sample annotation tables containing the final
+# region labels and key metadata so that the same spatial assignments
+# can be reused in downstream analyses and figure preparation.
+
+smps <- unique(spe$sample_id)
+for (smp in smps) {
+  expr <- data.frame(colData(spe)[spe$sample_id==smp,])
+  keep <- c("barcode","Area","is.nerve","k30label","Invaded")
+  expr <- expr[,keep]
+  expr$barcode <- gsub(paste0(smp,"_"),"",expr$barcode)
+  write.csv(expr,paste0("../data/annotations/",smp,"_annotation.csv"),row.names=FALSE,quote=FALSE)
+}
+```
+
+```{r}
+#===================================================================
+# 12. Tabulate spatial category assignments across samples
+#===================================================================
+# This section provides a simple summary table showing how the four
+# spatial categories are distributed across sample labels.
+
+knitr::kable(table(spe$Area,spe$sample_label))
+```
+
+
+#===================================================================
+# Differential expression analysis strategy
+#===================================================================
+# To account for spatial dependence between neighboring spots, spots are
+# aggregated into patch-level pseudo-bulk profiles. Differential
+# expression is then performed on these pseudo-bulk units using limma,
+# while accounting for non-independence between pseudo-bulks from the
+# same slide via duplicateCorrelation.
+
+```{r}
+#===================================================================
+# 24. Construct patch-level pseudo-bulk profiles
+#===================================================================
+# This section aggregates spots into pseudo-bulk units defined by nerve
+# IDs, nerve-border IDs, or tumour-distal cluster IDs. It then filters
+# low-information pseudo-bulks and lowly expressed genes to create the
+# expression matrix used for limma-based DE analysis.
+
+
+sub <- spe[,spe$Area %in% c("InvadedNerve","TumorProximal","Nerve","TumorDistal")] 
+sub$ID <- sub$NerveID
+sub$ID[is.na(sub$ID)] <- sub$BorderID[is.na(sub$ID)]
+sub$ID[is.na(sub$ID)] <- sub$TumorDistalID[is.na(sub$ID)] + 1000 # Just to make sure we don't assign to the same ID
+
+# Psuedobulk
+ids <- DataFrame(
+  area=sub$Area,
+  sample_id=sub$sample_id,
+  id=sub$ID #this is the ID of each Pseudobulk sample 
+)
+# This drops NA levels automatically thumbs up
+sb <- aggregateAcrossCells(sub,ids)
+
+# Just some naming
+levs <- paste(
+  colData(sb)$area,
+  colData(sb)$id,
+  colData(sb)$sample_id, 
+  sep = "."
+)
+colData(sb)$level_id <- levs
+colnames(sb) <- levs
+
+# Remove few spots & log transform
+sb <- sb[,sb$ncells > 1 & sb$ncells < 100] #!
+sb <- computeLibraryFactors(sb)
+sb <- logNormCounts(sb)
+
+# Some filtering
+mdl <- model.matrix(~ 0 + area,data.frame(colData(sb)))
+keep <- edgeR::filterByExpr(logcounts(sb), design=mdl, min.count=2)
+sb <- sb[keep,]
+m <- logcounts(sb)
+```
+
+**Invaded Nerves versus Non-Invaded Nerves**
+We use patient as random effect.
+
+```{r}
+#===================================================================
+# 25. Estimate within-slide correlation among pseudo-bulks
+#===================================================================
+# This section estimates the correlation structure among pseudo-bulk
+# samples originating from the same slide, allowing this dependence to
+# be modeled in the linear framework.
+
+library(limma)
+# calculate intra-block correlation using limma
+corfit <- duplicateCorrelation(
+  m,
+  mdl, 
+  block = colData(sb)$sample_id
+)
+corfit$consensus.correlation
+```
+
+```{r}
+#===================================================================
+# 26. Test differential expression between invaded and non-invaded nerves
+#===================================================================
+# This section fits the limma model and computes the primary contrast of
+# invaded versus non-invaded nerve pseudo-bulks, producing the core
+# invasion-associated gene ranking.
+
+# Fit
+fit <- lmFit(
+    m, 
+    design = mdl, 
+    block = colData(sb)$sample_id, 
+    correlation = corfit$consensus.correlation
+  )
+
+# Get contrasts and eBayes
+
+conInvadedNerve <- makeContrasts("areaInvadedNerve-areaNerve",levels=colnames(mdl))
+confit <- contrasts.fit(fit, contrasts = conInvadedNerve)
+res <- eBayes(confit)
+
+# Results
+topSen <- topTable(res,n=nrow(res))#coef="areaInvadedNerve")
+topSen$Gene <- rownames(topSen)
+topSen$FDR <- topSen$adj.P.Val
+
+```
+
+
+```{r}
+#===================================================================
+# 27. Plot the primary invaded-versus-non-invaded nerve volcano plot
+#===================================================================
+# This section visualizes the DE results for invaded versus
+# non-invaded nerves, highlighting the strongest significant genes in a
+# basic volcano plot.
+
+p4a <- ggplot(topSen, aes(x=logFC, y=-log10(FDR))) +
+    geom_point(size=.5,color="grey80") +
+    geom_point(data=topSen[topSen$FDR<0.1,], size=1.5)+
+    geom_text_repel(data=topSen[1:20,], aes(label=Gene),size=3,max.overlaps=50) +
+    theme(text=element_text(size=12)) +
+    xlab("logFC") +
+    ylab("-log10(FDR)") +
+    labs(caption = "Invaded nerves - Non-invaded nerves") +
+    theme_bw()+
+  theme(
+    panel.border = element_blank(),   
+    axis.line = element_line(),
+    plot.caption = element_text(
+      hjust = 0.5,    
+      size  = 16,
+      margin = margin(t = 10, b = 5)),
+    plot.margin = margin(b = 40))
+
+ggsave("../figures/F2_A_v1.pdf", p4a, width = 10, height = 12)
+p4a
+```
+
+
+```{r}
+#===================================================================
+# 28. Highlight selected biological programs in the nerve DE volcano
+#===================================================================
+# This section overlays selected endothelial, fibroblast, and immune
+# genes onto the invaded-versus-non-invaded volcano plot to aid
+# biological interpretation of the nerve invasion signature.
+
+topSen$color <- "black"
+
+HEV_program <- c("ACKR1","SELP","CCL2","CCL14","CXCL2")
+topSen$color[topSen$Gene %in% HEV_program] <- "dodgerblue2"
+
+Fibro_program <- c("CFD","C3","CXCL12","EFEMP1")
+topSen$color[topSen$Gene %in% Fibro_program] <- "green4"
+
+Anti_program <- c("CCL19","CCL21","PTAFR","LILRB2","FCGR2B")
+topSen$color[topSen$Gene %in% Anti_program] <- "#E31A1C"
+
+p4b <- ggplot(topSen, aes(x=logFC, y=-log10(FDR))) +
+    geom_point(size=.5,color="grey80") +
+    geom_point(data=topSen[topSen$FDR<0.1,], size=1.5,color=topSen[topSen$FDR<0.1,]$color)+
+    geom_text_repel(data=topSen[1:20,], aes(label=Gene),size=3,max.overlaps=50) +
+    geom_text_repel(data=topSen[topSen$Gene %in% c(HEV_program,Fibro_program,Anti_program), ],
+                    aes(label=Gene),size=3,max.overlaps=50, color=topSen[topSen$Gene %in% c(HEV_program,Fibro_program,Anti_program), ]$color, force = 20) +
+    theme(text=element_text(size=12)) +
+    xlab("logFC") +
+    ylab("-log10(FDR)") +
+  labs(caption = "Invaded nerves - Non-invaded nerves") +
+    theme_bw()+
+  theme(
+    panel.border = element_blank(),   
+    axis.line = element_line(),
+    plot.caption = element_text(
+      hjust = 0.5,    
+      size  = 16,
+      margin = margin(t = 10, b = 5)),
+    plot.margin = margin(b = 40))
+#ggsave("../figures/F2_A_v2.pdf", p4b, width = 10, height = 12)
+p4b
+```
+
+```{r}
+#===================================================================
+# 29. Highlight malignant and adipocyte-associated signals in the volcano
+#===================================================================
+# This section generates an alternative volcano plot emphasizing genes
+# associated with malignant epithelial and adipocyte-like programs, to
+# assess whether the invaded nerve signature contains potential tumour
+# or adipose contamination.
+
+
+Malignant <- c("KRT19","KRT7","KRT17","EPCAM","S100P", "CEACAM6") 
+topSen$color[topSen$Gene %in% Malignant] <- "dodgerblue2" 
+Adipocytes <- c("PLA2G2A","FABP4","PLTP") 
+topSen$color[topSen$Gene %in% Adipocytes] <- "green4"
+
+
+topSen$category <- "Other" 
+topSen$category[topSen$Gene %in% Malignant] <- "Malignant" 
+topSen$category[topSen$Gene %in% Adipocytes] <- "Adipocytes" 
+topSen$category <- factor(topSen$category, levels = c("Other","Malignant","Adipocytes"))
+
+# --- Category-based volcano (ONLY label Malignant/Adipocytes) ---
+p_cat <- ggplot(topSen, aes(x = logFC, y = -log10(FDR))) +
+  # background points
+  geom_point(data = subset(topSen, category == "Other"),
+             color = "grey85", size = 0.45) +
+
+  # highlighted categories
+  geom_point(data = subset(topSen, category != "Other"),
+             aes(color = category), size = 2) +
+
+  # label only the highlighted genes
+  geom_text_repel(
+  data = subset(topSen, category != "Other"),
+  aes(label = Gene, color = category),
+  size = 5,
+  max.overlaps = 50,
+  force = 15,
+  show.legend = FALSE   # <-- THIS FIXES IT
+) +
+  
+  scale_color_manual(values = c(
+    "Malignant"  = "dodgerblue2",
+    "Adipocytes" = "green4"
+  )) +
+
+  labs(
+    x = "logFC",
+    y = "-log10(FDR)",
+    color = "Category",
+    caption = "Invaded nerves - Non-invaded nerves"
+  ) +
+
+  theme_bw(base_size = 16) +
+  theme(
+    panel.border = element_blank(),
+    axis.line = element_line(linewidth = 0.6),
+
+    axis.title = element_text(size = 20, face = "bold"),
+    axis.text  = element_text(size = 16),
+
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text  = element_text(size = 14),
+
+    plot.caption = element_text(
+      hjust = 0.5,
+      size = 16,
+      margin = margin(t = 10, b = 5)
+    ),
+    plot.margin = margin(b = 40)
+  )
+
+#ggsave("../figures/F2_A_v3.pdf", p_cat, width = 10, height = 10)
+p_cat
+```
+
+
+**Genes specifically up-regulated in invaded nerves**
+So now how do we subset this to genes that are actually not just cancer genes but potentially interesting candidates. We can define this subset as genes that are unregulated in Invaded Nerves vs. Non-Invaded Nerves but not in Tumor Proximal vs. Non-Invaded Nerves. The plot below shows the LFC from the two comparisons against each other.
+
+```{r}
+#===================================================================
+# 30. Build a two-contrast framework to prioritize invaded nerve genes
+#===================================================================
+# This section compares the invaded-versus-non-invaded nerve contrast
+# with a tumour-distal-versus-nerve control contrast, allowing
+# prioritization of genes that are selectively elevated in invaded
+# nerves rather than broadly elevated in tumour-associated regions.
+
+conRec <- makeContrasts("areaTumorDistal-areaNerve",levels=colnames(mdl))
+confit <- contrasts.fit(fit, contrasts = conRec)
+res <- eBayes(confit)
+
+# Results
+topRS <- topTable(res,n=nrow(res))
+topRS$Gene <- rownames(topRS)
+topRS$FDR <- topRS$adj.P.Val
+
+# Build common dataframe
+compNerve <- topSen
+colnames(compNerve) <- paste0("InvadedNerve",".",colnames(compNerve))
+topRS <- topRS[rownames(topSen),]
+compNerve$Rec.logFC <- topRS$logFC
+compNerve$Rec.adj.P.Val <- topRS$adj.P.Val
+
+# Define Significance
+compNerve$InvadedNerveSignificance <- compNerve$InvadedNerve.adj.P.Val < 0.1 & abs(compNerve$InvadedNerve.logFC)
+compNerve$RecSignificance <- compNerve$Rec.adj.P.Val < 0.1 & abs(compNerve$Rec.logFC)
+
+compNerve$Significance <- ifelse(compNerve$InvadedNerveSignificance & compNerve$RecSignificance, "SigInBoth",
+  ifelse(compNerve$InvadedNerveSignificance & !compNerve$RecSignificance, "SigInInvaded",
+  ifelse(!compNerve$InvadedNerveSignificance & compNerve$RecSignificance, "SigInTumor", "UnSig")))
+
+# Define interesting gene set
+# Only significant in invaded, with positive fold change and below a noise threshold in tumor control
+defint <- compNerve$Significance=="SigInInvaded" & compNerve$InvadedNerve.logFC > 0 
+defint <- defint | (((compNerve$InvadedNerve.logFC > 0) & (compNerve$Rec.logFC < 0)) & compNerve$Significance=="SigInBoth")
+defint <- defint | (((compNerve$InvadedNerve.logFC  - compNerve$Rec.logFC > 0.5)) & compNerve$Significance=="SigInBoth" & compNerve$InvadedNerve.logFC > 0)
+```
+
+```{r}
+#===================================================================
+# 31. Export updated spot-level metadata for downstream analyses
+#===================================================================
+# This section saves the current spot metadata, including the spatial
+# annotations used in the DE analysis, for reuse in later steps.
+
+write.csv(data.frame(colData(spe)),"../data/coldata/DE_SPE_annotaion.csv")
+```
+
+```{r}
+#===================================================================
+# 32. Plot two-contrast prioritization of invaded nerve candidate genes
+#===================================================================
+# This section visualizes the fold-change relationship between the
+# invaded-versus-non-invaded nerve contrast and the tumour-distal
+# control contrast, highlighting the top prioritized invaded nerve
+# genes together with selected control markers.
+
+library(ggplot2)
+library(dplyr)
+library(ggrepel)
+
+# ---- Select genes to label ----
+tolbl <- compNerve[defint, ] |>
+  arrange(desc(InvadedNerve.logFC)) |>
+  slice_head(n = 10) |>
+  pull(InvadedNerve.Gene)
+
+control_genes <- c("EPCAM","S100B","FABP4")
+
+# Remove control genes from main list if overlapping
+tolbl_main <- setdiff(tolbl, control_genes)
+
+# ---- Plot ----
+p5 <- ggplot(compNerve, aes(x = Rec.logFC, y = InvadedNerve.logFC)) +
+
+  geom_point(size = 0.35, color = "grey80") +
+
+  geom_point(
+    data = compNerve[defint, , drop = FALSE],
+    size = 1.3,
+    color = "dodgerblue3"
+  ) +
+
+  geom_point(
+    data = compNerve[control_genes, , drop = FALSE],
+    size = 1.5,
+    color = "black"
+  ) +
+
+  geom_text_repel(
+    data = compNerve[tolbl_main, , drop = FALSE],
+    aes(label = InvadedNerve.Gene),
+    color = "dodgerblue4",
+    size = 3,
+    segment.size = 0.3,
+    segment.color = "grey50",
+    box.padding = 0.4,
+    point.padding = 0.4,
+    force_pull = 0,
+    nudge_y = 0.2,
+    max.overlaps = Inf,
+    seed = 1
+  ) +
+
+  geom_text_repel(
+    data = compNerve[control_genes, , drop = FALSE],
+    aes(label = InvadedNerve.Gene),
+    color = "black",
+    size = 2.8,
+    fontface = "italic",
+    segment.size = 0.25,
+    segment.color = "black",
+    box.padding = 0.45,
+    point.padding = 0.3,
+    force_pull = 0,
+    nudge_y = 0.35,
+    max.overlaps = Inf,
+    seed = 2
+  ) +
+  
+  # reference lines
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", linewidth = 0.3, color = "grey40") +
+  geom_hline(yintercept = 0, linewidth = 0.3, color = "grey50") +
+  geom_vline(xintercept = 0, linewidth = 0.3, color = "grey50") +
+
+  # labels
+  labs(
+    x = "log2FC (Tumor distal − Non-invaded nerves)",
+    y = "log2FC (Invaded − Non-invaded nerves)"
+  ) +
+
+  coord_fixed(ratio = 1) +
+
+  theme_classic(base_size = 9) +
+  theme(
+    axis.title = element_text(size = 10),
+    axis.text  = element_text(size = 9),
+    axis.line  = element_line(linewidth = 0.3),
+    axis.ticks = element_line(linewidth = 0.3),
+    legend.position = "none"
+  )
+
+p5
+```
+
+```{r}
+ggsave("../figures/F3_Avs2.pdf",
+       plot = p5,
+       width = 85/25.4, height = 85/25.4,  # single-column square (~85 mm)
+)
+```
+
+```{r}
+#===================================================================
+# 33. Test whether prioritized genes align with nerve-like or tumour-like programs
+#===================================================================
+# This section evaluates whether genes prioritized from the invaded
+# nerve analysis correlate more strongly with the nerve NMF component
+# or the malignant epithelial NMF component within invaded nerve spots.
+
+feats <- rownames(compNerve[defint,])
+plotGroupedHeatmap(sub,group="Area", features=feats, block="sample_id",center=TRUE,scale=TRUE,fontsize=4)
+
+sub2 <- spe[,!is.na(spe$Invaded)]
+sub2 <- sub2[,sub2$Invaded=="Invaded" & !is.na(sub2$NerveID)]
+tm <- reducedDim(sub2,"compk30")[,"Ductal_malignant"]
+nrv <- reducedDim(sub2,"compk30")[,"Nerve"]
+m <- logcounts(sub2)[feats,]
+out <- data.frame()
+for (gene in feats){
+  cornrv <- cor.test(nrv,m[gene,], alternative='greater', method="spearman")
+  cortm <- cor.test(tm,m[gene,], alternative='greater', method="spearman")
+  tmp <- data.frame("Gene"= gene,
+    "TumorCor" = cortm$estimate,
+    "NerveCor" = cornrv$estimate,
+    "TumorPval" = cortm$p.value,
+    "NervePval" = cornrv$p.value
+  )
+  out <- rbind(out,tmp)
+}
+out$TumorPval <- p.adjust(out$TumorPval, method="BH")
+out$NervePval <- p.adjust(out$NervePval, method="BH")
+out$Group <- ifelse(out$TumorPval < 0.01 & out$NervePval < 0.01, 
+  "Both", ifelse(out$TumorPval < 0.01, "Tumor", ifelse(out$NervePval < 0.01, "Nerve", "None")))
+tolbl <- out[!out$Group %in% c("Both","None"),]
+ggplot(out, aes(x=TumorCor, y=NerveCor, color=Group)) +
+  geom_point() +
+  geom_vline(xintercept=0) +
+  geom_hline(yintercept=0) +
+  geom_text_repel(data=tolbl,aes(label=Gene), max.overlaps=30) +
+  coord_fixed(1)
+```
+
+```{r}
+#===================================================================
+# 34. Plot tumour-versus-nerve correlation structure of prioritized genes
+#===================================================================
+
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+
+pal <- c(
+  "Nerve" = "#D62728",
+  "Tumor" = "#2CA02C",
+  "Both"  = "dodgerblue4",
+  "None"  = "grey80"
+)
+
+# -----------------------------
+# Select labels automatically
+# -----------------------------
+top_nerve <- out %>%
+  filter(Group == "Nerve") %>%
+  arrange(desc(NerveCor)) %>%
+  slice_head(n = 5)
+
+top_tumor <- out %>%
+  filter(Group == "Tumor") %>%
+  arrange(desc(TumorCor)) %>%
+  slice_head(n = 5)
+
+# For "Both", rank by combined strength of both correlations
+top_both <- out %>%
+  filter(Group == "Both") %>%
+  mutate(BothScore = TumorCor + NerveCor) %>%
+  arrange(desc(BothScore)) %>%
+  slice_head(n = 2)
+
+tolbl <- bind_rows(top_nerve, top_tumor, top_both) %>%
+  distinct(Gene, .keep_all = TRUE)
+
+a3 <- ggplot(out, aes(TumorCor, NerveCor)) +
+  geom_hline(yintercept = 0, linewidth = 0.3, color = "grey85") +
+  geom_vline(xintercept = 0, linewidth = 0.3, color = "grey85") +
+
+  geom_point(aes(color = Group), size = 2.4, alpha = 0.9) +
+
+  geom_text_repel(
+    data = tolbl,
+    aes(label = Gene),
+    color = "black",
+    size = 4,
+    max.overlaps = Inf,
+    seed = 1
+  ) +
+
+  scale_color_manual(values = pal) +
+  theme_classic(base_size = 10) +
+  theme(
+    axis.line = element_line(linewidth = 0.4),
+    axis.ticks = element_line(linewidth = 0.4),
+    legend.position = "right"
+  ) +
+  labs(
+    x = "Spearman \u03c1 (Tumor NMF vs gene)",
+    y = "Spearman \u03c1 (Nerve NMF vs gene)",
+    color = NULL
+  )
+
+a3
+```
+
+```{r}
+ggsave("../figures/F3_C_vs3.pdf",
+       plot = a3,
+       width = 110/25.4, height = 85/25.4,
+)
+
+```
+
+# Now differential gene expression for tumor proximal vs tumor distal
+```{r}
+#===================================================================
+# 36. Test differential expression between nerve-adjacent and nerve-remote tumour
+#===================================================================
+# This section computes differential expression between tumour spots
+# located adjacent to nerves (TumorProximal) and tumour spots located
+# away from nerves (TumorDistal). The resulting volcano plot highlights
+# genes associated with tumour proximity to nerves.
+
+
+# calculate intra-block correlation using limma
+conInvadedNerve <- makeContrasts("areaTumorProximal-areaTumorDistal",levels=colnames(mdl))
+confit <- contrasts.fit(fit, contrasts = conInvadedNerve)
+res <- eBayes(confit)
+
+# Results
+topRec <- topTable(res,n=nrow(res))#coef="areaInvadedNerve")
+topRec$Gene <- rownames(topRec)
+topRec$FDR <- topRec$adj.P.Val
+
+ggplot(topRec, aes(x=logFC, y=-log10(FDR))) +
+    geom_point(size=.5,color="grey80") +
+    geom_point(data=topRec[topRec$FDR<0.1,], size=1.5)+
+    geom_text_repel(data=topRec[1:30,], aes(label=Gene),size=3,max.overlaps =30) +
+    theme(text=element_text(size=12)) +
+    xlab("logFC") +
+    ylab("-log10(FDR)") +
+    theme_bw()# calculate intra-block correlation using limma
+conInvadedNerve <- makeContrasts("areaTumorProximal-areaTumorDistal",levels=colnames(mdl))
+confit <- contrasts.fit(fit, contrasts = conInvadedNerve)
+res <- eBayes(confit)
+
+# Results
+topRec <- topTable(res,n=nrow(res))#coef="areaInvadedNerve")
+topRec$Gene <- rownames(topRec)
+topRec$FDR <- topRec$adj.P.Val
+
+DEGtumor<- ggplot(topRec, aes(x=logFC, y=-log10(FDR))) +
+    geom_point(size=.5,color="grey80") +
+    geom_point(data=topRec[topRec$FDR<0.1,], size=1.5)+
+    geom_text_repel(data=topRec[1:30,], aes(label=Gene),size=3,max.overlaps =30) +
+    theme(text=element_text(size=12)) +
+    xlab("logFC") +
+    ylab("-log10(FDR)") +
+    theme_bw()
+
+DEGtumor
+```
+
+```{r}
+#===================================================================
+# 37. Export tumour proximity volcano plot
+#===================================================================
+# This section saves the tumour-proximal versus tumour-distal volcano
+# plot in publication-ready dimensions.
+
+ggsave("../figures/DEG_tumorcomp.pdf",DEGtumor, width=85/25.4, height=85/25.4)
+```
+
+```{r}
+#===================================================================
+# 38. Prioritize tumour-proximity genes using a second control contrast
+#===================================================================
+# This section compares the tumour-proximal versus tumour-distal
+# contrast with a nerve-versus-tumour-distal control contrast. This
+# helps identify genes that are selectively associated with the
+# nerve-adjacent tumour state rather than reflecting more general
+# differences between nerve and tumour compartments.
+
+conRec <- makeContrasts("areaNerve-areaTumorDistal",levels=colnames(mdl))
+confit <- contrasts.fit(fit, contrasts = conRec)
+res <- eBayes(confit)
+
+# Results
+topSR <- topTable(res,n=nrow(res))
+topSR$Gene <- rownames(topSR)
+topSR$FDR <- topSR$adj.P.Val
+
+compRec <- topRec
+colnames(compRec) <- paste0("InvadedNerve",".",colnames(compRec))
+topSR <- topSR[rownames(topRec),]
+compRec$Rec.logFC <- topSR$logFC
+compRec$Rec.adj.P.Val <- topSR$adj.P.Val
+
+# Define Significance
+compRec$InvadedNerveSignificance <- compRec$InvadedNerve.adj.P.Val < 0.1
+compRec$RecSignificance <- compRec$Rec.adj.P.Val < 0.1
+
+compRec$Significance <- ifelse(compRec$InvadedNerveSignificance & compRec$RecSignificance, "SigInBoth",
+  ifelse(compRec$InvadedNerveSignificance & !compRec$RecSignificance, "SigInInvaded",
+  ifelse(!compRec$InvadedNerveSignificance & compRec$RecSignificance, "SigInTumor", "UnSig")))
+
+# Define interesting gene set
+defint <- compRec$Significance=="SigInInvaded" & compRec$InvadedNerve.logFC > 0
+defint <- defint | (((compRec$InvadedNerve.logFC > 0) & (compRec$Rec.logFC < 0)) & compRec$Significance=="SigInBoth")
+
+# Define labels to plot: top 10 genes by InvadedNerve logFC
+tolbl <- compRec[defint, ] |>
+  arrange(desc(InvadedNerve.logFC)) |>
+  slice_head(n = 10) |>
+  pull(InvadedNerve.Gene)
+
+# Add selected control genes
+tolbl <- unique(c(tolbl, "EPCAM", "S100B"))
+
+DEG_tumo_two_contrast_vs1 <- ggplot(compRec, aes(y=InvadedNerve.logFC, x=Rec.logFC)) +
+  geom_point(size=0.3, color="grey80") +
+  geom_point(data=compRec[defint, , drop=FALSE], size=1.2, color="dodgerblue") +
+  geom_label_repel(
+    data = compRec %>% filter(InvadedNerve.Gene %in% tolbl),
+    aes(label = InvadedNerve.Gene),
+    max.overlaps = 30,
+    size = 4,
+    force_pull = 0,
+    nudge_y = 0.5
+  ) +
+  geom_abline(slope=1, intercept=0, lty="dashed") +
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = 0) +
+  xlab("LFC(Nerve-TumorDistal)") +
+  ylab("LFC(TumorProximal-TumorDistal)") +
+  coord_fixed(ratio=1) +
+  theme(legend.position ="bottom")
+
+DEG_tumo_two_contrast_vs1
+```
+
+```{r}
+#===================================================================
+# 38B. Different plottting for two contrast 
+#===================================================================
+# This section compares the tumour-proximal versus tumour-distal
+# contrast with a nerve-versus-tumour-distal control contrast. This
+# helps identify genes that are selectively associated with the
+# nerve-adjacent tumour state rather than reflecting more general
+# differences between nerve and tumour compartments.
+
+# ---- Define labels ----
+tolbl <- compRec[defint, ] |>
+  arrange(desc(InvadedNerve.logFC)) |>
+  slice_head(n = 17) |>
+  pull(InvadedNerve.Gene)
+
+control_genes <- c("EPCAM","S100B")
+
+# remove controls from main list
+tolbl_main <- setdiff(tolbl, control_genes)
+
+DEG_tumo_two_contrast <- ggplot(compRec, aes(y=InvadedNerve.logFC, x=Rec.logFC)) +
+
+  # background points
+  geom_point(size=0.3, color="grey80") +
+
+  # highlighted significant genes
+  geom_point(
+    data = compRec[defint, , drop=FALSE],
+    size = 1.2,
+    color = "dodgerblue"
+  ) +
+
+  # top genes (blue, no box)
+  geom_text_repel(
+    data = compRec %>% filter(InvadedNerve.Gene %in% tolbl_main),
+    aes(label = InvadedNerve.Gene),
+    color = "dodgerblue4",
+    size = 3.5,
+    segment.size = 0.3,
+    segment.color = "grey50",
+    box.padding = 0.6,
+    point.padding = 0.35,
+    force_pull = 0,
+    nudge_y = 0.4,
+    max.overlaps = Inf,
+    seed = 1
+  ) +
+
+  # control genes (black italic)
+  geom_text_repel(
+    data = compRec %>% filter(InvadedNerve.Gene %in% control_genes),
+    aes(label = InvadedNerve.Gene),
+    color = "black",
+    fontface = "italic",
+    size = 3.3,
+    segment.size = 0.25,
+    segment.color = "black",
+    box.padding = 0.5,
+    point.padding = 0.3,
+    force_pull = 0,
+    nudge_y = 0.4,
+    max.overlaps = Inf,
+    seed = 2
+  ) +
+
+  geom_abline(slope=1, intercept=0, lty="dashed") +
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = 0) +
+
+  xlab("LFC(Nerve − TumorDistal)") +
+  ylab("LFC(TumorProximal − TumorDistal)") +
+
+  coord_fixed(ratio=1) +
+  theme_classic(base_size = 10) +
+  theme(legend.position ="none")
+
+DEG_tumo_two_contrast
+```
+```{r}
+#===================================================================
+# 38B. Different plotting for two contrast 
+#===================================================================
+
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+
+control_genes <- c("EPCAM", "S100B")
+
+# pick top genes, excluding control genes, so you get 15 blue labels + 2 black labels
+tolbl_main <- compRec[defint, ] |>
+  arrange(desc(InvadedNerve.logFC)) |>
+  filter(!InvadedNerve.Gene %in% control_genes) |>
+  slice_head(n = 5) |>
+  pull(InvadedNerve.Gene)
+
+DEG_tumo_two_contrast <- ggplot(compRec, aes(x = Rec.logFC, y = InvadedNerve.logFC)) +
+
+  # background points
+  geom_point(size = 0.3, color = "grey80") +
+
+  # highlighted significant genes
+  geom_point(
+    data = compRec[defint, , drop = FALSE],
+    size = 1.2,
+    color = "dodgerblue"
+  ) +
+
+  # control genes as black points
+  geom_point(
+    data = compRec %>% filter(InvadedNerve.Gene %in% control_genes),
+    size = 1.4,
+    color = "black"
+  ) +
+
+  # top 15 genes in blue
+  geom_text_repel(
+    data = compRec %>% filter(InvadedNerve.Gene %in% tolbl_main),
+    aes(label = InvadedNerve.Gene),
+    color = "dodgerblue4",
+    size = 3.5,
+    segment.size = 0.3,
+    segment.color = "grey50",
+    box.padding = 0.6,
+    point.padding = 0.35,
+    force_pull = 0,
+    nudge_y = 0.4,
+    max.overlaps = Inf,
+    seed = 1
+  ) +
+
+  # EPCAM and S100B in black italic
+  geom_text_repel(
+    data = compRec %>% filter(InvadedNerve.Gene %in% control_genes),
+    aes(label = InvadedNerve.Gene),
+    color = "black",
+    fontface = "italic",
+    size = 3.3,
+    segment.size = 0.3,
+    segment.color = "black",
+    box.padding = 0.5,
+    point.padding = 0.3,
+    force_pull = 0,
+    nudge_y = 0.4,
+    max.overlaps = Inf,
+    seed = 2
+  ) +
+
+  geom_abline(slope = 1, intercept = 0, lty = "dashed") +
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = 0) +
+
+  xlab("LFC(Nerve − TumorDistal)") +
+  ylab("LFC(TumorProximal − TumorDistal)") +
+
+  coord_fixed(ratio = 1) +
+  theme_classic(base_size = 15) +
+  theme(legend.position = "none")
+
+DEG_tumo_two_contrast
+```
+
+
+
+```{r}Identification of transcriptional changes in tumour cells associated with nerve proximity. Genes are plotted by log fold change in Tum-ProxN versus Tum-DistN (y-axis) and in the Nerve versus Tum-DistN (x-axis). Blue points denote selected genes with positive fold change in Tum-ProxN versus Tumr-DistN cells that were either significant only in this comparison or significant in both comparisons with opposite directions of change. The dashed diagonal indicates the line of equality between contrasts. Signature tumor (EPCAM) and nerve (S100B) genes are marked for reference.
+#===================================================================
+# 39. Export two-contrast tumour prioritization plot
+#===================================================================
+# This section saves the two-contrast plot used to prioritize genes
+# associated with tumour proximity to nerves.
+
+ggsave("../figures/DEG_tumorcomp_two_contrast.pdf",DEG_tumo_two_contrast, width=180/25.4, height=85/25.4)
+```
+
+
+```{r}
+#========================================================
+# 40. Heatmap of prioritized genes from the tumour two-contrast strategy
+#========================================================
+
+# Select the same top 17 genes used in the two-contrast plot
+feats <- compRec[defint, ] |>
+  dplyr::arrange(desc(InvadedNerve.logFC)) |>
+  dplyr::slice_head(n = 17) |>
+  dplyr::pull(InvadedNerve.Gene) |>
+  unique()
+
+# Keep only genes present in the object
+feats <- intersect(feats, rownames(sub))
+
+# Make sure Area is a valid factor with the correct existing labels
+sub$Area <- factor(
+  sub$Area,
+  levels = c("Nerve", "TumorProximal", "TumorDistal", "InvadedNerve")
+)
+
+sub$sample_id <- droplevels(factor(sub$sample_id))
+
+# sanity checks
+table(sub$Area, useNA = "ifany")
+table(sub$sample_id, useNA = "ifany")
+feats
+
+# PDF (best for publication)
+pdf("../figures/heatmap_tumor_2contrast.pdf", width = 6, height = 6)
+
+plotGroupedHeatmap(
+  sub,
+  group = "Area",
+  features = feats,
+  block = "sample_id",
+  center = TRUE,
+  scale = TRUE,
+  fontsize = 5
+)
+
+dev.off()
+```
+

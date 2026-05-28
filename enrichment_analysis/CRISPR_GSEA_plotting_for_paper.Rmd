@@ -1,0 +1,132 @@
+```{r}
+# =========================================================
+# RE-PLOT FROM EXISTING SUMMARY FILE ONLY
+# padj <= 0.3, Hallmark + C5 only
+# =========================================================
+
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(tidyr)
+library(grid)   # for unit()
+
+out_dir <- "CRISPR_screen_GSEA/final_selected_plots/FILTERING_TO_PLUS_CONTROL_PAIRED_TOTAL/"
+
+# path to already existing summary file from your previous run
+summary_file <- file.path("CRISPR_screen_GSEA/pvaluebased/FILTERING_TO_PLUS_CONTROL_PAIRED_TOTAL/2026_04_08_GSEA_MAGeCK_LFCp/GSEA_summary_compact.csv")
+if (!file.exists(summary_file)) {
+  stop("Could not find summary file: ", summary_file)
+}
+
+summary_tbl_small <- readr::read_csv(summary_file, show_col_types = FALSE)
+
+# -----------------------------
+# settings you can control
+# -----------------------------
+plot_collections <- c("Hallmark", "C5")
+top_n_use <- 15
+plot_width <- 10
+plot_height <- 4
+y_text_size <- 12
+panel_spacing_y_lines <- 0.05
+panel_spacing_x_lines <- 0.08
+
+# -----------------------------
+# helper for leading edge count
+# -----------------------------
+count_core_genes <- function(core_enrichment_string) {
+  if (is.na(core_enrichment_string) || core_enrichment_string == "") return(NA_integer_)
+  length(strsplit(core_enrichment_string, "/", fixed = TRUE)[[1]])
+}
+
+# -----------------------------
+# make filtered view
+# -----------------------------
+x <- summary_tbl_small %>%
+  dplyr::select(any_of(c(
+    "ID", "Description", "setSize", "NES", "pvalue", "p.adjust",
+    "collection", "arm", "core_enrichment"
+  ))) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(
+    arm = dplyr::recode(
+      arm,
+      "positive_selection" = "Resistance arm",
+      "negative_selection" = "Sensitisation arm"
+    ),
+    leading_edge_n = vapply(core_enrichment, count_core_genes, integer(1))
+  ) %>%
+  dplyr::filter(
+    collection %in% plot_collections,
+    !is.na(arm),
+    !is.na(NES),
+    NES > 0,
+    !is.na(setSize),
+    setSize >= 10,
+    !is.na(leading_edge_n),
+    leading_edge_n >= 3,
+    !is.na(p.adjust),
+    p.adjust <= 0.30
+  )
+
+if (nrow(x) == 0) {
+  stop("No rows passed the Hallmark/C5 padj <= 0.3 filter.")
+}
+
+# -----------------------------
+# top terms per arm/collection
+# -----------------------------
+nes_compare <- x %>%
+  dplyr::group_by(collection, arm) %>%
+  dplyr::arrange(p.adjust, dplyr::desc(NES), .by_group = TRUE) %>%
+  dplyr::slice_head(n = top_n_use) %>%
+  dplyr::ungroup()
+
+# optional export
+readr::write_csv(
+  nes_compare,
+  file.path(out_dir, "NES_compare_top_terms_padj_0.3_Hallmark_C5_only.csv")
+)
+
+# -----------------------------
+# plot
+# -----------------------------
+p_nes <- ggplot(
+  nes_compare,
+  aes(
+    x = reorder(Description, NES),
+    y = NES,
+    size = setSize
+  )
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4, colour = "grey60") +
+  geom_point() +
+  coord_flip() +
+  facet_grid(collection ~ arm, scales = "free_y", space = "free_y") +
+  labs(
+    title = "Top enriched pathways by selection arm\npadj <= 0.3, Hallmark + C5 only",
+    x = NULL,
+    y = "Normalized Enrichment Score (NES)",
+    size = "Gene set size"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold"),
+    axis.text.y = element_text(size = y_text_size),
+    panel.spacing.y = unit(panel_spacing_y_lines, "lines"),
+    panel.spacing.x = unit(panel_spacing_x_lines, "lines")
+  )
+
+ggsave(
+  file.path(out_dir, "NES_compare_top_terms_padj_0.3_Hallmark_C5_only.png"),
+  p_nes, width = plot_width, height = plot_height, dpi = 300
+)
+
+ggsave(
+  file.path(out_dir, "NES_compare_top_terms_padj_0.3_Hallmark_C5_only.pdf"),
+  p_nes, width = plot_width, height = plot_height, dpi = 300
+)
+
+p_nes
+```

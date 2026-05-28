@@ -1,0 +1,603 @@
+# Creation of images for the paper
+# ============================================================
+# Patient-adjusted nerve-level statistics for RCTD and NMF
+# No plotting
+# ============================================================
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(S4Vectors)
+  library(SummarizedExperiment)
+  library(emmeans)
+  library(broom)
+  library(purrr)
+})
+```
+
+```{r}
+# ============================================================
+# 1. Paths
+# ============================================================
+
+spe_path        <- "../../../../../Konstantina/12_Olas_project/Publication_files/data/SPE/Integrated_NMF.rds"
+coldata_path    <- "../../../../../Konstantina/12_Olas_project/Publication_files/data/coldata/DE_SPE_annotaion.csv"
+rctd_path       <- "../../../../../Konstantina/12_Olas_project/Publication_files/data/Deconvolution/RCTD_weights.Rds"
+nmf_path        <- "../../../../../Konstantina/12_Olas_project/Publication_files/data/coldata/NMFcomp.csv"
+
+outdir <- "figure2_nerve_level_stats"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r}
+# ============================================================
+# 2. Helper functions
+# ============================================================
+
+logit_transform <- function(p, eps = 1e-4) {
+  p <- as.numeric(p)
+  p <- pmax(eps, pmin(1 - eps, p))
+  log(p / (1 - p))
+}
+
+safe_log1p <- function(x) {
+  x <- as.numeric(x)
+  log1p(pmax(x, 0))
+}
+
+clean_feature_name <- function(x) {
+  x %>%
+    gsub("[()]", "", .) %>%
+    gsub("[/ ]+", "_", .) %>%
+    gsub("__+", "_", .)
+}
+
+run_patient_adjusted_model <- function(df, value_col, transform_type = c("none", "logit", "log1p")) {
+  
+  transform_type <- match.arg(transform_type)
+  
+  tmp <- df %>%
+    filter(
+      !is.na(.data[[value_col]]),
+      !is.na(nerve_category),
+      !is.na(patient_id)
+    ) %>%
+    mutate(
+      value_raw = as.numeric(.data[[value_col]]),
+      value_model = case_when(
+        transform_type == "logit" ~ logit_transform(value_raw),
+        transform_type == "log1p" ~ safe_log1p(value_raw),
+        TRUE ~ value_raw
+      )
+    ) %>%
+    filter(is.finite(value_model))
+  
+  # Require at least two categories to test
+  if (n_distinct(tmp$nerve_category) < 2) {
+    return(list(
+      ok = FALSE,
+      error = "Fewer than two nerve categories available",
+      overall = NULL,
+      contrasts = NULL,
+      emmeans = NULL
+    ))
+  }
+  
+  # Require enough rows to fit model
+  if (nrow(tmp) < 5) {
+    return(list(
+      ok = FALSE,
+      error = "Too few observations",
+      overall = NULL,
+      contrasts = NULL,
+      emmeans = NULL
+    ))
+  }
+  
+  out <- tryCatch({
+    
+    fit <- lm(value_model ~ nerve_category + patient_id, data = tmp)
+    
+    # Overall category test
+    overall <- broom::tidy(anova(fit)) %>%
+      mutate(term = rownames(anova(fit))) %>%
+      relocate(term) %>%
+      filter(term == "nerve_category")
+    
+    emm <- emmeans(fit, ~ nerve_category)
+    
+    contrast_list <- list(
+      "NonInvaded_Diseased_vs_Invaded" = c(0, 1, -1),
+      "NonInvaded_Diseased_vs_NonInvaded_Adjacent" = c(-1, 1, 0),
+      "NonInvaded_Adjacent_vs_Invaded" = c(1, 0, -1)
+    )
+    
+    contrasts <- contrast(
+      emm,
+      method = contrast_list
+    ) %>%
+      summary(infer = TRUE) %>%
+      as.data.frame()
+    
+    emm_df <- summary(emm) %>%
+      as.data.frame()
+    
+    list(
+      ok = TRUE,
+      error = NA_character_,
+      overall = overall,
+      contrasts = contrasts,
+      emmeans = emm_df
+    )
+    
+  }, error = function(e) {
+    list(
+      ok = FALSE,
+      error = conditionMessage(e),
+      overall = NULL,
+      contrasts = NULL,
+      emmeans = NULL
+    )
+  })
+  
+  out
+}
+
+summarise_raw_by_category <- function(df, value_col) {
+  df %>%
+    filter(!is.na(.data[[value_col]]), !is.na(nerve_category)) %>%
+    group_by(nerve_category) %>%
+    summarise(
+      n_nerves = n(),
+      n_patients = n_distinct(patient_id),
+      mean_raw = mean(.data[[value_col]], na.rm = TRUE),
+      median_raw = median(.data[[value_col]], na.rm = TRUE),
+      sd_raw = sd(.data[[value_col]], na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+```
+
+```{r}
+# ============================================================
+# 3. Read input objects
+# ============================================================
+
+spe <- readRDS(spe_path)
+
+colData(spe) <- DataFrame(read.csv(coldata_path, check.names = FALSE))
+colnames(spe) <- spe$barcode
+
+rctd_weights <- readRDS(rctd_path)
+rctd_weights <- as.data.frame(rctd_weights)
+rctd_weights$barcode <- as.character(rctd_weights$barcode)
+
+nmf_scores <- read.csv(nmf_path, check.names = FALSE)
+nmf_scores$barcode <- as.character(nmf_scores$barcode)
+```
+
+```{r}
+# ============================================================
+# 4. Define nerve metadata and categories
+# ============================================================
+
+nerve_mask <- colData(spe)$is.nerve == TRUE
+
+nerve_meta_df <- data.frame(
+  barcode     = as.character(spe$barcode[nerve_mask]),
+  patient_id  = as.factor(colData(spe)$patient_id[nerve_mask]),
+  NerveID     = as.factor(colData(spe)$NerveID[nerve_mask]),
+  Invaded     = as.character(colData(spe)$Invaded[nerve_mask]),
+  type_raw    = as.character(colData(spe)$type[nerve_mask]),
+  stringsAsFactors = FALSE
+)
+
+nerve_meta_df <- nerve_meta_df %>%
+  mutate(
+    types_grouped = ifelse(type_raw == "noPNI", "Adjacent", "Diseased"),
+    nerve_category = ifelse(
+      Invaded == "NonInvaded",
+      paste0("NonInvaded_", types_grouped),
+      Invaded
+    ),
+    nerve_category = factor(
+      nerve_category,
+      levels = c("NonInvaded_Adjacent", "NonInvaded_Diseased", "Invaded")
+    ),
+    patient_id = factor(patient_id),
+    NerveID = factor(NerveID)
+  ) %>%
+  filter(!is.na(nerve_category), !is.na(NerveID), !is.na(patient_id))
+
+# Save basic nerve counts
+nerve_counts <- nerve_meta_df %>%
+  distinct(patient_id, NerveID, nerve_category) %>%
+  dplyr::count(patient_id, nerve_category, name = "n_nerves") %>%
+  arrange(patient_id, nerve_category)
+
+write_csv(nerve_counts, file.path(outdir, "nerve_counts_by_patient_and_category.csv"))
+```
+
+```{r}
+# ============================================================
+# 5. RCTD nerve-level summaries
+# ============================================================
+
+rctd_cols <- c(
+  "Acinar",
+  "B_cells",
+  "CAF",
+  "Lymphocyte(CD4)",
+  "Lymphocyte(CD8)",
+  "Ductal_malignant",
+  "Ductal_normal",
+  "Endocrine",
+  "Endothelial",
+  "Myeloid",
+  "Lymphocyte(NK)",
+  "B_cells_(Plasma_cells)",
+  "Schwann",
+  "Stellate"
+)
+
+rctd_cols <- intersect(rctd_cols, colnames(rctd_weights))
+
+if (length(rctd_cols) == 0) {
+  stop("No RCTD columns found in RCTD weights object.")
+}
+
+rctd_spot <- nerve_meta_df %>%
+  left_join(rctd_weights, by = "barcode")
+
+rctd_nerve <- rctd_spot %>%
+  group_by(patient_id, NerveID, nerve_category) %>%
+  summarise(
+    across(all_of(rctd_cols), ~ mean(as.numeric(.x), na.rm = TRUE)),
+    n_spots = n(),
+    .groups = "drop"
+  )
+
+write_csv(rctd_nerve, file.path(outdir, "RCTD_nerve_level_mean_proportions.csv"))
+```
+
+```{r}
+# ============================================================
+# 6. NMF nerve-level summaries
+# ============================================================
+
+metadata_cols <- c(
+  "barcode", "patient_id", "NerveID", "nerve_category",
+  "Invaded", "type_raw", "types_grouped"
+)
+
+nmf_candidate_cols <- setdiff(colnames(nmf_scores), "barcode")
+
+nmf_cols <- nmf_candidate_cols[
+  vapply(nmf_scores[nmf_candidate_cols], is.numeric, logical(1))
+]
+
+if (length(nmf_cols) == 0) {
+  stop("No numeric NMF program columns found in NMF score file.")
+}
+
+nmf_spot <- nerve_meta_df %>%
+  left_join(nmf_scores, by = "barcode")
+
+nmf_nerve <- nmf_spot %>%
+  group_by(patient_id, NerveID, nerve_category) %>%
+  summarise(
+    across(all_of(nmf_cols), ~ mean(as.numeric(.x), na.rm = TRUE)),
+    n_spots = n(),
+    .groups = "drop"
+  )
+
+write_csv(nmf_nerve, file.path(outdir, "NMF_nerve_level_mean_program_activity.csv"))
+```
+
+```{r}
+# ============================================================
+# 7. Run patient-adjusted statistics for all RCTD populations
+# ============================================================
+
+rctd_results <- map_dfr(rctd_cols, function(feature) {
+  
+  model_out <- run_patient_adjusted_model(
+    df = rctd_nerve,
+    value_col = feature,
+    transform_type = "logit"
+  )
+  
+  raw_summary <- summarise_raw_by_category(rctd_nerve, feature) %>%
+    mutate(
+      raw_summary = paste0(
+        nerve_category,
+        ": mean=", signif(mean_raw, 4),
+        ", median=", signif(median_raw, 4),
+        ", n=", n_nerves
+      )
+    ) %>%
+    summarise(raw_summary = paste(raw_summary, collapse = " | ")) %>%
+    pull(raw_summary)
+  
+  if (!model_out$ok) {
+    return(tibble(
+      data_type = "RCTD",
+      feature = feature,
+      transform = "logit",
+      model_ok = FALSE,
+      model_error = model_out$error,
+      contrast = NA_character_,
+      estimate = NA_real_,
+      SE = NA_real_,
+      df = NA_real_,
+      lower.CL = NA_real_,
+      upper.CL = NA_real_,
+      t.ratio = NA_real_,
+      p.value = NA_real_,
+      raw_summary = raw_summary
+    ))
+  }
+  
+  model_out$contrasts %>%
+    as_tibble() %>%
+    mutate(
+      data_type = "RCTD",
+      feature = feature,
+      transform = "logit",
+      model_ok = TRUE,
+      model_error = NA_character_,
+      raw_summary = raw_summary
+    ) %>%
+    select(
+      data_type, feature, transform, model_ok, model_error,
+      contrast, estimate, SE, df, lower.CL, upper.CL, t.ratio, p.value,
+      raw_summary
+    )
+})
+
+rctd_results <- rctd_results %>%
+  group_by(contrast) %>%
+  mutate(p_adj_BH = p.adjust(p.value, method = "BH")) %>%
+  ungroup() %>%
+  arrange(contrast, p_adj_BH)
+
+write_csv(rctd_results, file.path(outdir, "RCTD_patient_adjusted_contrasts_all_celltypes.csv"))
+
+# Overall category p-values for RCTD
+rctd_overall <- map_dfr(rctd_cols, function(feature) {
+  
+  model_out <- run_patient_adjusted_model(
+    df = rctd_nerve,
+    value_col = feature,
+    transform_type = "logit"
+  )
+  
+  if (!model_out$ok || is.null(model_out$overall)) {
+    return(tibble(
+      data_type = "RCTD",
+      feature = feature,
+      transform = "logit",
+      model_ok = FALSE,
+      model_error = model_out$error,
+      statistic = NA_real_,
+      p.value = NA_real_
+    ))
+  }
+  
+  model_out$overall %>%
+    as_tibble() %>%
+    transmute(
+      data_type = "RCTD",
+      feature = feature,
+      transform = "logit",
+      model_ok = TRUE,
+      model_error = NA_character_,
+      statistic = statistic,
+      p.value = p.value
+    )
+})
+
+rctd_overall <- rctd_overall %>%
+  mutate(p_adj_BH = p.adjust(p.value, method = "BH")) %>%
+  arrange(p_adj_BH)
+
+write_csv(rctd_overall, file.path(outdir, "RCTD_patient_adjusted_overall_category_tests.csv"))
+```
+
+```{r}
+# ============================================================
+# 8. Run patient-adjusted statistics for all NMF programs
+# ============================================================
+
+nmf_results <- map_dfr(nmf_cols, function(feature) {
+  
+  model_out <- run_patient_adjusted_model(
+    df = nmf_nerve,
+    value_col = feature,
+    transform_type = "log1p"
+  )
+  
+  raw_summary <- summarise_raw_by_category(nmf_nerve, feature) %>%
+    mutate(
+      raw_summary = paste0(
+        nerve_category,
+        ": mean=", signif(mean_raw, 4),
+        ", median=", signif(median_raw, 4),
+        ", n=", n_nerves
+      )
+    ) %>%
+    summarise(raw_summary = paste(raw_summary, collapse = " | ")) %>%
+    pull(raw_summary)
+  
+  if (!model_out$ok) {
+    return(tibble(
+      data_type = "NMF",
+      feature = feature,
+      transform = "log1p",
+      model_ok = FALSE,
+      model_error = model_out$error,
+      contrast = NA_character_,
+      estimate = NA_real_,
+      SE = NA_real_,
+      df = NA_real_,
+      lower.CL = NA_real_,
+      upper.CL = NA_real_,
+      t.ratio = NA_real_,
+      p.value = NA_real_,
+      raw_summary = raw_summary
+    ))
+  }
+  
+  model_out$contrasts %>%
+    as_tibble() %>%
+    mutate(
+      data_type = "NMF",
+      feature = feature,
+      transform = "log1p",
+      model_ok = TRUE,
+      model_error = NA_character_,
+      raw_summary = raw_summary
+    ) %>%
+    select(
+      data_type, feature, transform, model_ok, model_error,
+      contrast, estimate, SE, df, lower.CL, upper.CL, t.ratio, p.value,
+      raw_summary
+    )
+})
+
+nmf_results <- nmf_results %>%
+  group_by(contrast) %>%
+  mutate(p_adj_BH = p.adjust(p.value, method = "BH")) %>%
+  ungroup() %>%
+  arrange(contrast, p_adj_BH)
+
+write_csv(nmf_results, file.path(outdir, "NMF_patient_adjusted_contrasts_all_programs.csv"))
+
+# Overall category p-values for NMF
+nmf_overall <- map_dfr(nmf_cols, function(feature) {
+  
+  model_out <- run_patient_adjusted_model(
+    df = nmf_nerve,
+    value_col = feature,
+    transform_type = "log1p"
+  )
+  
+  if (!model_out$ok || is.null(model_out$overall)) {
+    return(tibble(
+      data_type = "NMF",
+      feature = feature,
+      transform = "log1p",
+      model_ok = FALSE,
+      model_error = model_out$error,
+      statistic = NA_real_,
+      p.value = NA_real_
+    ))
+  }
+  
+  model_out$overall %>%
+    as_tibble() %>%
+    transmute(
+      data_type = "NMF",
+      feature = feature,
+      transform = "log1p",
+      model_ok = TRUE,
+      model_error = NA_character_,
+      statistic = statistic,
+      p.value = p.value
+    )
+})
+
+nmf_overall <- nmf_overall %>%
+  mutate(p_adj_BH = p.adjust(p.value, method = "BH")) %>%
+  arrange(p_adj_BH)
+
+write_csv(nmf_overall, file.path(outdir, "NMF_patient_adjusted_overall_category_tests.csv"))
+```
+
+```{r}
+# ============================================================
+# 9. Combined result tables
+# ============================================================
+
+combined_contrasts <- bind_rows(rctd_results, nmf_results) %>%
+  group_by(data_type, contrast) %>%
+  mutate(p_adj_BH_within_data_type = p.adjust(p.value, method = "BH")) %>%
+  ungroup() %>%
+  arrange(data_type, contrast, p_adj_BH_within_data_type)
+
+write_csv(combined_contrasts, file.path(outdir, "combined_patient_adjusted_contrasts_RCTD_NMF.csv"))
+
+combined_overall <- bind_rows(rctd_overall, nmf_overall) %>%
+  group_by(data_type) %>%
+  mutate(p_adj_BH_within_data_type = p.adjust(p.value, method = "BH")) %>%
+  ungroup() %>%
+  arrange(data_type, p_adj_BH_within_data_type)
+
+write_csv(combined_overall, file.path(outdir, "combined_patient_adjusted_overall_tests_RCTD_NMF.csv"))
+```
+
+```{r}
+# ============================================================
+# 10. Extract key immune/myeloid features for manuscript checking
+# ============================================================
+
+key_features <- c(
+  "B_cells",
+  "B_cells_(Plasma_cells)",
+  "Lymphocyte(CD4)",
+  "Lymphocyte(CD8)",
+  "Lymphocyte(NK)",
+  "Myeloid",
+  "Lymphocytes",
+  "Myeloid(Macrophages)",
+  "Myeloid(C1q_macrophages)"
+)
+
+key_results <- combined_contrasts %>%
+  filter(feature %in% key_features) %>%
+  arrange(contrast, p_adj_BH_within_data_type)
+
+write_csv(key_results, file.path(outdir, "key_immune_myeloid_patient_adjusted_results.csv"))
+```
+
+```{r}
+# ============================================================
+# 11. Print short summaries to console
+# ============================================================
+
+cat("\nFinished patient-adjusted nerve-level statistics.\n")
+cat("Output directory:\n", outdir, "\n\n")
+
+cat("RCTD features tested:\n")
+print(rctd_cols)
+
+cat("\nNMF programs tested:\n")
+print(nmf_cols)
+
+cat("\nTop RCTD contrast results:\n")
+print(
+  rctd_results %>%
+    filter(model_ok) %>%
+    arrange(p_adj_BH) %>%
+    select(feature, contrast, estimate, p.value, p_adj_BH) %>%
+    head(20)
+)
+
+cat("\nTop NMF contrast results:\n")
+print(
+  nmf_results %>%
+    filter(model_ok) %>%
+    arrange(p_adj_BH) %>%
+    select(feature, contrast, estimate, p.value, p_adj_BH) %>%
+    head(20)
+)
+
+cat("\nKey immune/myeloid results:\n")
+print(
+  key_results %>%
+    select(data_type, feature, contrast, estimate, p.value, p_adj_BH_within_data_type) %>%
+    arrange(data_type, contrast, p_adj_BH_within_data_type)
+)
+```

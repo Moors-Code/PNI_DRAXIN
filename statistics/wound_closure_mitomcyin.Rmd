@@ -1,0 +1,278 @@
+```{r}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+```
+
+```{r}
+# ----------------------------
+# 1. input / output
+# ----------------------------
+input_file <- "input_files/wound_closure_mitomycin.csv"
+output_dir <- "output/wound_closure/mitomycin"
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r}
+# ----------------------------
+# 2. read and format data
+# ----------------------------
+
+df <- read.csv(input_file)
+
+# exclude problematic well
+df <- df %>%
+  filter(Well != "D5")
+
+df <- df %>%
+  mutate(
+    Well = as.character(Well),
+    Recombinant = factor(Recombinant, levels = c("CTRL", "WT", "MUTANT")),
+    Mitomycin = factor(Mitomycin, levels = c(0, 1), labels = c("0", "1")),
+    Cell_front_velocity = as.numeric(Cell_front_velocity)
+  )
+
+# optional: make sure CTRL_PERCENT is numeric if present
+if ("CTRL_PERCENT" %in% colnames(df)) {
+  df$CTRL_PERCENT <- as.numeric(df$CTRL_PERCENT)
+}
+
+# quick check
+stopifnot(all(levels(df$Recombinant) == c("CTRL", "WT", "MUTANT")))
+stopifnot(all(levels(df$Mitomycin) == c("0", "1")))
+
+write.csv(df, file.path(output_dir, "mitomycin_input_checked.csv"), row.names = FALSE)
+```
+
+```{r}
+# ----------------------------
+# 3. main model: two-way ANOVA / linear model
+# ----------------------------
+model <- lm(Cell_front_velocity ~ Recombinant * Mitomycin, data = df)
+
+model_summary <- summary(model)
+model_anova <- anova(model)
+
+capture.output(model_summary,
+               file = file.path(output_dir, "mitomycin_model_summary.txt"))
+
+capture.output(model_anova,
+               file = file.path(output_dir, "mitomycin_model_anova.txt"))
+
+# ----------------------------
+# 4. estimated marginal means
+# ----------------------------
+emm_full <- emmeans(model, ~ Recombinant * Mitomycin)
+
+emm_recomb_by_mito <- emmeans(model, ~ Recombinant | Mitomycin)
+emm_mito_by_recomb <- emmeans(model, ~ Mitomycin | Recombinant)
+
+write.csv(as.data.frame(emm_full),
+          file.path(output_dir, "emmeans_recombinant_by_mitomycin.csv"),
+          row.names = FALSE)
+```
+
+```{r}
+# ----------------------------
+# 5. comparisons of recombinant groups within each Mitomycin condition
+#    - WT vs CTRL
+#    - MUTANT vs CTRL
+# ----------------------------
+recomb_vs_ctrl <- as.data.frame(
+  contrast(
+    emm_recomb_by_mito,
+    method = "trt.vs.ctrl",
+    ref = which(levels(df$Recombinant) == "CTRL"),
+    adjust = "BH"
+  )
+)
+
+write.csv(recomb_vs_ctrl,
+          file.path(output_dir, "recombinant_vs_ctrl_within_mitomycin_BH.csv"),
+          row.names = FALSE)
+
+# ----------------------------
+# 6. WT vs MUTANT within each Mitomycin condition
+# ----------------------------
+wt_vs_mut <- as.data.frame(
+  contrast(
+    emm_recomb_by_mito,
+    method = list("WT - MUTANT" = c(0, 1, -1)),
+    adjust = "BH"
+  )
+)
+
+write.csv(wt_vs_mut,
+          file.path(output_dir, "WT_vs_MUTANT_within_mitomycin_BH.csv"),
+          row.names = FALSE)
+
+# ----------------------------
+# 7. Mitomycin effect within each recombinant group
+#    - 1 vs 0 for CTRL
+#    - 1 vs 0 for WT
+#    - 1 vs 0 for MUTANT
+# ----------------------------
+mito_within_group <- as.data.frame(
+  contrast(
+    emm_mito_by_recomb,
+    method = "revpairwise",   # gives 1 - 0 with current factor order
+    adjust = "BH"
+  )
+)
+
+write.csv(mito_within_group,
+          file.path(output_dir, "mitomycin_within_each_recombinant_BH.csv"),
+          row.names = FALSE)
+
+# ----------------------------
+# 8. optional: all pairwise recombinant comparisons within each Mitomycin
+#    includes CTRL vs WT, CTRL vs MUTANT, WT vs MUTANT
+# ----------------------------
+all_recomb_pairs <- as.data.frame(
+  pairs(emm_recomb_by_mito, adjust = "BH")
+)
+
+write.csv(all_recomb_pairs,
+          file.path(output_dir, "all_recombinant_pairwise_within_mitomycin_BH.csv"),
+          row.names = FALSE)
+
+# ----------------------------
+# 9. optional: simple effects of Mitomycin between recombinant groups
+#    asks whether the Mitomycin response differs from CTRL
+# ----------------------------
+mito_response_diff_vs_ctrl <- as.data.frame(
+  contrast(
+    emm_mito_by_recomb,
+    method = "trt.vs.ctrl",
+    ref = which(levels(df$Recombinant) == "CTRL"),
+    adjust = "BH"
+  )
+)
+
+write.csv(mito_response_diff_vs_ctrl,
+          file.path(output_dir, "mitomycin_response_difference_vs_ctrl_BH.csv"),
+          row.names = FALSE)
+```
+
+```{r}
+# ----------------------------
+# 10. summary table
+# ----------------------------
+summary_table <- df %>%
+  group_by(Recombinant, Mitomycin) %>%
+  summarise(
+    n = n(),
+    mean_velocity = mean(Cell_front_velocity, na.rm = TRUE),
+    sd_velocity = sd(Cell_front_velocity, na.rm = TRUE),
+    mean_ctrl_percent = if ("CTRL_PERCENT" %in% colnames(df)) mean(CTRL_PERCENT, na.rm = TRUE) else NA_real_,
+    sd_ctrl_percent = if ("CTRL_PERCENT" %in% colnames(df)) sd(CTRL_PERCENT, na.rm = TRUE) else NA_real_,
+    .groups = "drop"
+  )
+
+write.csv(summary_table,
+          file.path(output_dir, "mitomycin_summary_table.csv"),
+          row.names = FALSE)
+
+# ----------------------------
+# 11. helper function for formatting p-values for figure annotation
+# ----------------------------
+format_p_for_plot <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p < 1e-4) return("p < 0.0001")
+  paste0("p = ", formatC(signif(p, 3), format = "fg", flag = "#"))
+}
+
+# make annotation-ready tables
+recomb_vs_ctrl_annot <- recomb_vs_ctrl %>%
+  mutate(p_label = vapply(p.value, format_p_for_plot, character(1)))
+
+wt_vs_mut_annot <- wt_vs_mut %>%
+  mutate(p_label = vapply(p.value, format_p_for_plot, character(1)))
+
+mito_within_group_annot <- mito_within_group %>%
+  mutate(p_label = vapply(p.value, format_p_for_plot, character(1)))
+
+write.csv(recomb_vs_ctrl_annot,
+          file.path(output_dir, "recombinant_vs_ctrl_within_mitomycin_BH_for_plot.csv"),
+          row.names = FALSE)
+
+write.csv(wt_vs_mut_annot,
+          file.path(output_dir, "WT_vs_MUTANT_within_mitomycin_BH_for_plot.csv"),
+          row.names = FALSE)
+
+write.csv(mito_within_group_annot,
+          file.path(output_dir, "mitomycin_within_each_recombinant_BH_for_plot.csv"),
+          row.names = FALSE)
+
+# ----------------------------
+# 12. plots - raw values
+# ----------------------------
+p_raw <- ggplot(df, aes(x = Recombinant, y = Cell_front_velocity, fill = Mitomycin)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.8)) +
+  geom_jitter(aes(color = Mitomycin),
+              position = position_jitterdodge(jitter.width = 0.12, dodge.width = 0.8),
+              alpha = 0.85, size = 2) +
+  theme_classic() +
+  labs(
+    title = "Wound closure assay with Mitomycin",
+    x = "Recombinant",
+    y = "Cell front velocity"
+  )
+
+ggsave(file.path(output_dir, "mitomycin_raw_boxplot.pdf"), p_raw, width = 6.5, height = 5)
+ggsave(file.path(output_dir, "mitomycin_raw_boxplot.png"), p_raw, width = 6.5, height = 5, dpi = 300)
+
+# optional faceted version
+p_raw_facet <- ggplot(df, aes(x = Mitomycin, y = Cell_front_velocity, fill = Mitomycin)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.12, alpha = 0.85, size = 2) +
+  facet_wrap(~ Recombinant, nrow = 1) +
+  theme_classic() +
+  labs(
+    title = "Wound closure assay with Mitomycin",
+    x = "Mitomycin",
+    y = "Cell front velocity"
+  )
+
+ggsave(file.path(output_dir, "mitomycin_raw_boxplot_faceted.pdf"), p_raw_facet, width = 8, height = 4)
+ggsave(file.path(output_dir, "mitomycin_raw_boxplot_faceted.png"), p_raw_facet, width = 8, height = 4, dpi = 300)
+
+# ----------------------------
+# 13. optional normalized plot only
+# ----------------------------
+if ("CTRL_PERCENT" %in% colnames(df)) {
+  p_norm <- ggplot(df, aes(x = Recombinant, y = CTRL_PERCENT, fill = Mitomycin)) +
+    geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.8)) +
+    geom_jitter(aes(color = Mitomycin),
+                position = position_jitterdodge(jitter.width = 0.12, dodge.width = 0.8),
+                alpha = 0.85, size = 2) +
+    theme_classic() +
+    labs(
+      title = "Wound closure assay with Mitomycin (normalized to control)",
+      x = "Recombinant",
+      y = "Percent of control"
+    )
+
+  ggsave(file.path(output_dir, "mitomycin_norm_boxplot.pdf"), p_norm, width = 6.5, height = 5)
+  ggsave(file.path(output_dir, "mitomycin_norm_boxplot.png"), p_norm, width = 6.5, height = 5, dpi = 300)
+}
+```
+
+```{r}
+# ----------------------------
+# 14. short console output for quick inspection
+# ----------------------------
+cat("\n=== TWO-WAY ANOVA ===\n")
+print(model_anova)
+
+cat("\n=== Recombinant vs CTRL within each Mitomycin condition ===\n")
+print(recomb_vs_ctrl_annot)
+
+cat("\n=== WT vs MUTANT within each Mitomycin condition ===\n")
+print(wt_vs_mut_annot)
+
+cat("\n=== Mitomycin effect within each recombinant group ===\n")
+print(mito_within_group_annot)
+```

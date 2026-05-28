@@ -1,0 +1,341 @@
+# ============================================================
+# Cas12a library QC and normalization workflow
+# ============================================================
+#
+# Goal:
+# 1) Read the merged guide-count matrix across replicate libraries
+# 2) Compute simple library-size normalized CPM values
+# 3) Log-transform CPM values for replicate-to-replicate QC
+# 4) Assess similarity between replicates by correlation and PCA
+# 5) Quantify guide-level variability (CV)
+# 6) Summarize per-replicate count distribution metrics
+# 7) Compare replicate library QC to the original plasmid/library stock
+#
+# Notes:
+# - CPM + log2(CPM + 1) is used here for exploratory QC plots
+# - DESeq2 VST is used for PCA because it stabilizes the variance better
+#   than raw counts or plain log-transformed CPM
+# - No differential testing is performed in this script
+# ============================================================
+
+```{r}
+# -----------------------------
+# 0) Load required packages
+# -----------------------------
+suppressPackageStartupMessages({
+  library(edgeR)
+  library(DESeq2)
+  library(pheatmap)
+  library(ggplot2)
+  library(ggrepel)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(gridExtra)
+  library(reldist)
+})
+```
+
+```{r}
+# -----------------------------
+# 1) Define input/output files
+# -----------------------------
+count_file <- "input_files/merged_counts_final_libraryQC.csv"
+stock_file <- "input_files/M-AS11_AAJY01_RDA550_G0_CP1906_ScoresSum.csv"
+outdir <- "output_files/libraryQC/library_qc_outputs"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r}
+# -----------------------------
+# 2) Read merged replicate count matrix
+# -----------------------------
+# Expected structure:
+# - first column = guide/clone identifier
+# - remaining columns = replicate count columns
+count_df <- read.csv(count_file, check.names = FALSE)
+
+# Preserve guide IDs explicitly
+guide_id_col <- colnames(count_df)[1]
+colnames(count_df)[1] <- "guide_id"
+
+# Keep only replicate count columns
+count_mat <- count_df %>%
+  dplyr::select(-guide_id)
+
+# Convert to numeric matrix
+count_mat <- as.matrix(count_mat)
+mode(count_mat) <- "numeric"
+rownames(count_mat) <- count_df$guide_id
+
+# Optional sanity check
+stopifnot(all(!is.na(colnames(count_mat))))
+stopifnot(ncol(count_mat) >= 2)
+```
+
+```{r}
+# -----------------------------
+# 3) Compute library-size normalization (CPM)
+# -----------------------------
+# CPM rescales each sample by its total sequencing depth:
+# CPM = counts / total_reads * 1e6
+library_sizes <- colSums(count_mat, na.rm = TRUE)
+
+cpm_mat <- sweep(count_mat, 2, library_sizes, FUN = "/") * 1e6
+
+# Log-transform CPM for QC visualizations
+log2_cpm_mat <- log2(cpm_mat + 1)
+
+# -----------------------------
+# 4) Replicate correlation heatmap
+# -----------------------------
+# Spearman correlation is robust to non-normality and useful for ranking similarity
+cor_mat <- cor(log2_cpm_mat, method = "spearman", use = "pairwise.complete.obs")
+print(cor_mat)
+
+pheatmap(
+  cor_mat,
+  display_numbers = TRUE,
+  color = colorRampPalette(c("green", "white", "red"))(50),
+  main = "Spearman correlation between replicate libraries",
+  filename = file.path(outdir, "replicate_spearman_correlation_heatmap.pdf"),
+  width = 7,
+  height = 6
+)
+```
+
+```{r}
+# -----------------------------
+# 5) Guide-level variability after log2(CPM+1)
+# -----------------------------
+# For each guide:
+# - mean abundance across replicates
+# - SD across replicates
+# - coefficient of variation (CV = SD / mean)
+guide_mean_log2cpm <- rowMeans(log2_cpm_mat, na.rm = TRUE)
+guide_sd_log2cpm   <- apply(log2_cpm_mat, 1, sd, na.rm = TRUE)
+guide_cv_log2cpm   <- ifelse(guide_mean_log2cpm == 0, NA, guide_sd_log2cpm / guide_mean_log2cpm)
+
+cv_df <- data.frame(
+  guide_id = rownames(log2_cpm_mat),
+  mean_log2CPM = guide_mean_log2cpm,
+  sd_log2CPM = guide_sd_log2cpm,
+  cv_log2CPM = guide_cv_log2cpm
+)
+
+write.csv(cv_df, file.path(outdir, "guide_level_variability_log2CPM.csv"), row.names = FALSE)
+
+# CV histogram
+p_cv_hist <- ggplot(cv_df, aes(x = cv_log2CPM)) +
+  geom_histogram(bins = 50, fill = "blue", alpha = 0.7) +
+  labs(
+    title = "Distribution of guide-level CV",
+    x = "CV on log2(CPM + 1)",
+    y = "Number of guides"
+  ) +
+  theme_minimal()
+
+ggsave(
+  filename = file.path(outdir, "guide_cv_distribution.pdf"),
+  plot = p_cv_hist,
+  width = 7,
+  height = 5
+)
+
+# CV vs mean plot
+p_cv_mean <- ggplot(cv_df, aes(x = mean_log2CPM, y = cv_log2CPM)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "loess", se = FALSE, color = "red") +
+  labs(
+    title = "Guide variability as a function of abundance",
+    x = "Mean log2(CPM + 1)",
+    y = "CV on log2(CPM + 1)"
+  ) +
+  theme_minimal()
+
+ggsave(
+  filename = file.path(outdir, "guide_cv_vs_mean.pdf"),
+  plot = p_cv_mean,
+  width = 7,
+  height = 5
+)
+```
+
+```{r}
+# -----------------------------
+# 6) Filter low-count guides before VST / PCA
+# -----------------------------
+# Keep guides with enough total counts across all replicates
+# Adjust threshold if needed depending on library complexity
+min_total_count <- 100
+filtered_counts <- count_mat[rowSums(count_mat, na.rm = TRUE) > min_total_count, , drop = FALSE]
+
+# DESeq2 expects integer counts
+filtered_counts_int <- round(filtered_counts)
+mode(filtered_counts_int) <- "integer"
+
+# Dummy metadata because PCA is only for QC here
+colData <- data.frame(
+  sample = colnames(filtered_counts_int),
+  condition = "library_replicate",
+  row.names = colnames(filtered_counts_int)
+)
+
+dds <- DESeqDataSetFromMatrix(
+  countData = filtered_counts_int,
+  colData = colData,
+  design = ~ 1
+)
+
+# VST reduces mean-variance dependence for count data
+vst_obj <- vst(dds, blind = TRUE)
+vst_mat <- assay(vst_obj)
+```
+
+```{r}
+# -----------------------------
+# 7) PCA on variance-stabilized counts
+# -----------------------------
+pca_res <- prcomp(t(vst_mat), scale. = TRUE)
+
+pca_df <- data.frame(
+  Sample = rownames(pca_res$x),
+  PC1 = pca_res$x[, 1],
+  PC2 = pca_res$x[, 2]
+)
+
+# Variance explained
+pca_var <- summary(pca_res)$importance[2, 1:2] * 100
+
+p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, label = Sample)) +
+  geom_point(size = 3, alpha = 0.7, color = "blue") +
+  geom_text_repel(size = 4) +
+  labs(
+    title = "PCA of replicate libraries (DESeq2 VST)",
+    x = paste0("PC1 (", round(pca_var[1], 1), "%)"),
+    y = paste0("PC2 (", round(pca_var[2], 1), "%)")
+  ) +
+  theme_minimal()
+
+ggsave(
+  filename = file.path(outdir, "replicate_PCA_VST.pdf"),
+  plot = p_pca,
+  width = 7,
+  height = 5
+)
+
+print(summary(pca_res))
+```
+
+```{r}
+# -----------------------------
+# 8) Per-replicate QC summary metrics
+# -----------------------------
+# Convert replicate count matrix to long format so we can summarize each sample
+library_qc_long <- as.data.frame(count_mat) %>%
+  tibble::rownames_to_column("guide_id") %>%
+  pivot_longer(
+    cols = -guide_id,
+    names_to = "replicate",
+    values_to = "reads"
+  )
+
+summary_stat <- library_qc_long %>%
+  group_by(replicate) %>%
+  summarise(
+    total_reads = sum(reads, na.rm = TRUE),
+    median_reads = median(reads, na.rm = TRUE),
+    IQR_reads = IQR(reads, na.rm = TRUE),
+    percent_low_reads = 100 * mean(reads < 5, na.rm = TRUE),
+    percent_zero_count = 100 * mean(reads == 0, na.rm = TRUE),
+    gini_index = reldist::gini(reads),
+    .groups = "drop"
+  )
+
+print(summary_stat)
+write.csv(summary_stat, file.path(outdir, "replicate_qc_summary.csv"), row.names = FALSE)
+```
+
+```{r}
+# -----------------------------
+# 9) Histograms of replicate count distributions
+# -----------------------------
+replicate_names <- colnames(count_mat)
+
+hist_plots <- map(replicate_names, function(rep_name) {
+  ggplot(
+    data.frame(reads = count_mat[, rep_name]),
+    aes(x = log2(reads + 1))
+  ) +
+    geom_histogram(fill = "blue", bins = 50) +
+    theme_minimal() +
+    labs(
+      title = paste("Histogram of", rep_name),
+      x = "log2(read count + 1)",
+      y = "Number of guides"
+    )
+})
+
+pdf(file.path(outdir, "library_qc_histograms.pdf"), width = 10, height = 8)
+grid.arrange(grobs = hist_plots, ncol = 2, nrow = 2)
+dev.off()
+```
+
+```{r}
+# -----------------------------
+# 10) QC metrics for original library stock
+# -----------------------------
+# This section summarizes the plasmid/library stock distribution,
+# so it can be compared with the sequenced replicate libraries.
+stock_df <- read.csv(stock_file, check.names = FALSE)
+
+# Keep only the guide ID and the count column if extra annotation columns exist
+# Adjust this section if your stock file has a different structure
+stock_counts <- stock_df[, -c(2, 3), drop = FALSE]
+
+# Rename first column to guide_id for clarity
+colnames(stock_counts)[1] <- "guide_id"
+stock_value_col <- colnames(stock_counts)[2]
+
+summary_stat_stock <- stock_counts %>%
+  summarise(
+    total_reads = sum(.data[[stock_value_col]], na.rm = TRUE),
+    median_reads = median(.data[[stock_value_col]], na.rm = TRUE),
+    IQR_reads = IQR(.data[[stock_value_col]], na.rm = TRUE),
+    percent_low_reads = 100 * mean(.data[[stock_value_col]] < 5, na.rm = TRUE),
+    percent_zero_count = 100 * mean(.data[[stock_value_col]] == 0, na.rm = TRUE),
+    gini_index = reldist::gini(.data[[stock_value_col]])
+  )
+
+print(summary_stat_stock)
+write.csv(summary_stat_stock, file.path(outdir, "stock_library_qc_summary.csv"), row.names = FALSE)
+```
+
+```{r}
+# -----------------------------
+# 11) Save normalized matrices
+# -----------------------------
+write.csv(
+  cbind(guide_id = rownames(cpm_mat), as.data.frame(cpm_mat)),
+  file.path(outdir, "guide_counts_CPM.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  cbind(guide_id = rownames(log2_cpm_mat), as.data.frame(log2_cpm_mat)),
+  file.path(outdir, "guide_counts_log2CPM_plus1.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+# -----------------------------
+# 12) Session summary
+# -----------------------------
+cat("QC workflow completed.\n")
+cat("Input count matrix:", count_file, "\n")
+cat("Number of guides:", nrow(count_mat), "\n")
+cat("Number of replicate libraries:", ncol(count_mat), "\n")
+cat("Filtered guides used for VST/PCA:", nrow(filtered_counts_int), "\n")
+cat("Outputs written to:", outdir, "\n")
+```
