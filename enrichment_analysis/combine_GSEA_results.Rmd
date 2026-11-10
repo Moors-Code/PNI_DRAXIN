@@ -1,0 +1,65 @@
+# Combine all GSEA results files into one merged table
+
+#===================================================================
+# SCOPE: connects two separate projects (GSEA_cleaned and
+# publication_cleaned), which run in different R environments. This
+# script does ONE simple thing: reads every GSEA results CSV in
+# GSEA_SOURCE_DIR (one per collection -- GO_BP, KEGG, etc., each a
+# flat table with one row per pathway) and concatenates them into one
+# merged CSV, tagged with which file each pathway came from.
+#
+# No filtering, no category assignment happens here -- selecting
+# specific pathways of interest (by ID) and assigning them to curated
+# categories happens directly in
+# 07_gene_expression_heatmap_figure2_cleaned.Rmd, which reads this
+# merged file and looks up genes for whichever IDs you list there.
+#===================================================================
+
+```{r}
+library(dplyr)
+library(purrr)
+library(tools)
+
+# ---- 0. Paths -----------------------------------------------------------
+# External, separate-project path (GSEA_cleaned) -- see header note.
+GSEA_SOURCE_DIR <- "/media/Aleksandra/Computational/R programming/paper_projects/GSEA_cleaned/processed/Figure2_GSEA/GSEA"
+
+OUTPUT_DIR <- "/media/Aleksandra/Computational/R programming/paper_projects/GSEA_cleaned/output/Figure2_GSEA/tables/"
+OUTPUT_CSV <- file.path(OUTPUT_DIR, "combined_gsea_results.csv")
+
+stopifnot(dir.exists(GSEA_SOURCE_DIR))
+```
+
+```{r}
+# ---- 1. Read and merge every GSEA results CSV in the folder ---------------
+result_files <- list.files(GSEA_SOURCE_DIR, pattern = "\\.csv$", full.names = TRUE, ignore.case = TRUE)
+cat("Found", length(result_files), "result files:\n")
+print(basename(result_files))
+
+read_one_results_file <- function(path) {
+  df <- read.csv(path, stringsAsFactors = FALSE)
+  required <- c("ID", "Description", "core_enrichment")
+  missing <- setdiff(required, colnames(df))
+  if (length(missing) > 0) {
+    warning(basename(path), " is missing expected columns: ", paste(missing, collapse = ", "),
+            " -- skipping this file.")
+    return(NULL)
+  }
+  df$source_file <- file_path_sans_ext(basename(path))
+  df[, c("ID", "Description", "NES", "pvalue", "p.adjust", "core_enrichment", "source_file")]
+}
+
+combined_gsea_results <- map(result_files, read_one_results_file) %>% compact() %>% bind_rows()
+
+cat("\nTotal pathways merged:", nrow(combined_gsea_results), "\n")
+cat("Pathways per source file:\n")
+print(table(combined_gsea_results$source_file))
+```
+
+```{r}
+# ---- 2. Save the merged CSV ------------------------------------------------
+write.csv(combined_gsea_results, OUTPUT_CSV, row.names = FALSE)
+cat("\nSaved:", OUTPUT_CSV, "\n")
+cat("07_gene_expression_heatmap_figure2_cleaned.Rmd reads this file directly --\n")
+cat("select specific pathways of interest (by ID) there.\n")
+```

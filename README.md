@@ -20,31 +20,49 @@ Scripts for bulk RNA-seq count processing, normalization, batch-aware differenti
 
 ### 2. `Cas12_screen`
 
-Workflows for Cas12a pooled-screen quality control, guide-count normalization, MAGeCK-compatible filtering, and standard MAGeCK reporting for the selected T0 + ctrl filtering strategy.
+Workflows for Cas12a pooled-screen quality control, guide-count assembly, MAGeCK-compatible filtering and
+reporting for the Cas12a pooled screen (DRAXIN-treated versus control).
+Listed in the order they are run.
 
 | Script | Description |
 |---|---|
-| `01_libraryQC.Rmd` | Quality control and normalization of Cas12a guide-count libraries using CPM and variance-stabilized transformed counts. Includes replicate correlation analysis, PCA, guide variability assessment, and library composition summaries. |
-| `02_ScreenQC.Rmd` | Quality control analysis of pooled CRISPR screen count matrices using raw and normalized sgRNA counts. Includes detected sgRNA metrics, skew ratios, PCA, MDS, density plots, correlation heatmaps, scatterplots, and MD plots. |
-| `03_MAGECK_pre_filtering.Rmd` | Generation of MAGeCK-compatible filtered count matrices using voom-normalized logCPM thresholds across selected reference groups, including library input, T0, and ctrl samples. |
-| `FILTERING_T0_PLUS_CONTROL_PAIRED_TOTAL.report.Rmd` | Standard MAGeCK report summarizing CRISPR screen enrichment results from the selected T0 + ctrl filtering strategy, including sgRNA- and gene-level enrichment statistics and quality assessment plots. |
+| `01_libraryQC.Rmd` | Quality control of the Cas12a guide-count libraries. Library-size normalization (CPM and log2(CPM+1)), Spearman correlation between replicates, guide-level variability (CV versus abundance), PCA on variance-stabilized counts (DESeq2 VST), per-replicate distribution metrics including Gini index, and comparison against the plasmid library stock. |
+| `02a_merging_guide_count.R` | Assembles the analysis count matrix, combining the per-condition screen count files with the library QC counts into a single guide × sample table. Guides are matched by identifier rather than by row order, which corrects the merging error present in the earlier version of this step. |
+| `02_ScreenQC.Rmd` | Quality control of the merged screen count matrix. Detected sgRNAs and skew ratio per sample, CPM and TMM-normalized logCPM, density and histogram distributions, PCA, MDS, Pearson correlation heatmap, pairwise scatterplots, MD plots, and control checks comparing common-essential and non-targeting guides against the remaining library. |
+| `03_MAGECK_pre_filtering.Rmd` | Generates MAGeCK input matrices. Guides are retained on mean voom logCPM (cutoff 2.5) computed in a chosen set of reference samples; three strategies are run (library input + T0, T0 only, T0 + ctrl), each writing raw counts for MAGeCK together with the per-guide filtering decisions. |
+| `run_mageck_all_variants.sh` | Runs MAGeCK on the screen: a paired test of the two DRAXIN-treated against the two control replicates, repeated across seven combinations of input matrix (unfiltered, T0-filtered, T0 + ctrl filtered) and normalization method (non-targeting control, median, total). The analysis reported in the paper is `T0_PLUS_CONTROL_PAIRED_TOTAL`; the remaining variants are included to show that the reported hits do not depend on the filtering or normalization choice. Run on an HPC cluster (SLURM) with MAGeCK version `[VERSION]`. |
+| `04_MAGECK_figures_output.R` | Draws the published screen figures from the MAGeCK gene summary: ranked RRA score distributions for enriched and depleted arrays, and the volcano of −log10 FDR against log2 fold change. MAGeCK is not re-run, so the plotted values are those of the original analysis. |
+| `05_MAGECK.report.Rmd` | Standard MAGeCK report for the T0 + ctrl paired comparison, giving sgRNA- and gene-level statistics, RRA and p-value distributions, per-guide read counts for top genes, and essential-gene dropout by GSEA. Adapted from the report template distributed with MAGeCK (W. Li). |
 
+Paths in `run_mageck_all_variants.sh` are placeholders and must be set before
+running. Steps `04` and `05` read the `T0_PLUS_CONTROL_PAIRED_TOTAL` output.
 ---
 
 ### 3. `enrichment_analysis`
 
-Pathway and gene-set analysis workflows integrating bulk RNA-seq, CRISPR screen outputs, invaded nerve signatures, ssGSEA scoring, GSEA, ORA, and pathway-level visualizations.
+Pathway and gene-set analysis across bulk RNA-seq, the CRISPR screen and the
+spatial nerve data. Each analysis is split into a compute step, which saves
+result objects, and a plot step, which reads them — so figures can be
+regenerated without re-running GSEA.
 
 | Script | Description |
 |---|---|
-| `bulkRNAseq_01_GSEA.Rmd` | Automated edgeR-to-GSEA workflow performing GO, Reactome, KEGG, Disease Ontology, and MSigDB enrichment analyses across multiple differential expression comparisons. |
-| `bulkRNAseq_02_ssGSEA.Rmd` | ssGSEA pathway scoring of batch-corrected logCPM data across ctrl, 17 nM DRAXIN, and 68 nM DRAXIN conditions with pathway-level statistical comparison using limma. |
-| `bulkRNAseq_ENSEMBL_to_GENE_SYMBOL.R` | Annotation of differential expression tables by mapping Ensembl IDs to HGNC gene symbols using `org.Hs.eg.db`. |
-| `CRISPR_GSEA_p_Value_based_scoring.Rmd` | GSEA analysis of MAGeCK gene-level CRISPR screen results using separate ranking strategies for resistance and sensitisation arms across Hallmark, C2, C5, and Reactome gene sets. |
-| `CRISPR_GSEA_plotting_for_paper.Rmd` | Visualization and filtering of MAGeCK-GSEA results using Hallmark and C5 pathways with positive NES and adjusted p-value thresholds. |
-| `figure2_GSEA_inv_vs_uninv.Rmd` | GSEA analysis comparing invaded nerves and non-invaded nerve differential expression profiles using ontology, pathway, and custom GMT-based enrichment workflows. |
-| `figure2_ssGSEA_score_Rmd` | Pathway activity profiling across NI nerves from adjacent healthy tissue, NI nerves from tumour-bearing tissue, and invaded nerves using ssGSEA-derived pathway scores. |
-| `figure3_enricher_342_invasion_genes.Rmd` | Over-representation analysis of invasion-associated gene signatures using a defined differential-expression background universe. |
+| `00_annotate_gene_symbols.R` | Adds HGNC symbols to the edgeR differential expression tables by mapping Ensembl IDs with `org.Hs.eg.db`. |
+| `01a_GSEA_compute.R`, `01b_GSEA_plots.R` | GSEA on the bulk RNA-seq comparisons (DRAXIN vs ctrl, diluted vs ctrl, DRAXIN vs diluted), ranked by signed −log10 p. Covers GO (BP, CC, MF), Reactome, Disease Ontology, KEGG and MSigDB Hallmark, followed by a pass across all MSigDB collections. The plot step draws dotplots split by NES sign and writes gene-symbol result tables. |
+| `01c_ssGSEA_compute.R`, `01d_ssGSEA_plots.R` | ssGSEA pathway scoring of batch-corrected logCPM across 0, 17 and 68 nM DRAXIN, for a fixed panel of Hallmark, GO and KEGG gene sets. Scores are standardized both across all samples and relative to the control group; the plot step fits limma on the raw scores to test the three dose contrasts and annotates the panels with FDR. |
+| `01e_heatmap_compute.R`, `01f_heatmap_plots.R` | Leading-edge gene heatmaps for selected pathways. The compute step takes the union of leading-edge genes across the three comparisons and maps them onto the batch-corrected expression matrix; the plot step draws one row-z-scored heatmap per pathway, split by dose. |
+| `02a_CRISPR_GSEA_compute.R`, `02b_CRISPR_GSEA_plots.R` | GSEA on the MAGeCK gene summary, ranked by LFC × −log10 p, with the resistance and sensitisation arms ranked separately, across Hallmark, C2, C5 and Reactome. Multi-target guides, dedup-collapsed gene pairs and pooled control pseudo-genes are excluded from ranking and exported separately. The plot step produces the paper's NES comparison figure and the full results table. |
+| `02c_CRISPR_GSEA_exploration_supplementary.R` | Broader exploration of the CRISPR GSEA results: both filtering modes, all collections, per-result dotplots and a paired resistance-versus-sensitisation NES scatter. Not part of the reported figures. |
+| `03a_Figure2_GSEA_compute.R`, `03b_Figure2_GSEA_plots.R` | GSEA on the invaded versus non-invaded nerve differential expression, ranked by signed −log10 FDR. Covers GO, Reactome, WikiPathways, Disease Ontology, Network of Cancer Genes, KEGG, all MSigDB collections, and a custom cell-state signature set supplied as a GMT. |
+| `03c_Figure2_ssGSEA_compute.R`, `03d_Figure2_ssGSEA_plots.R` | Pathway activity across NI-Adj, NI-TB and InvN nerves. Spot-level ssGSEA scores for an immune and complement pathway panel are aggregated to the nerve level and z-scored across nerves; the plot step draws the two Figure 2 panels. |
+| `03e_Figure2_ssGSEA_stats_supplementary.R` | Repeated-measures ANOVA across nerve categories on the patient-aggregated pathway scores. Not used in the paper. |
+| `combine_GSEA_results.Rmd` | Concatenates the per-collection GSEA result tables from the invaded-nerve analysis into one merged file for downstream pathway selection. |
+
+`03c_Figure2_ssGSEA_compute.R` reads the spatial `SpatialExperiment` object
+and its annotation from a separate project directory (`external_spatial_dir`
+at the top of the script), not from this repository's `input/` folder, as the
+spatial data are large and shared across projects. Set that path to wherever
+the spatial data are located, or to the deposited dataset, before running it.
 
 ---
 
