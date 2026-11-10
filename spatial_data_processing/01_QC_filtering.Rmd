@@ -1,0 +1,476 @@
+## This is the code prepared for the computational and spatial analysis part of the paper
+This part of the script includes the quality control and filtering of the data.
+
+#Samples
+We have got 6 samples in total. Always a pair of two samples from the same patient. The blocks were classified as either high_PNI, no_PNI or noandhigh_PNI. For each of these we retained all spots on the slide (14336 per sample).
+
+#===================================================================
+# WHAT THIS SCRIPT PRODUCES
+#===================================================================
+# This is Step 0 of the whole pipeline -- the raw QC/filtering that
+# everything else (Integrated_NMF.rds, etc.) is ultimately built on top
+# of, produced by a separate downstream integration/NMF script not
+# shown here.
+#
+# Processed (processed/):
+#   - PNI_SPE_QC.rds
+#       THE MAIN OUTPUT. QC-passing, in-tissue spots only, library-size
+#       normalized (logNormCounts). Everything downstream in the
+#       pipeline is ultimately derived from this object.
+#
+# The panels of this script are Figure S1A-G of the manuscript:
+#   A  UMI counts per sample          E  HBB fraction
+#   B  detected genes per sample      F  spatial QC pass/fail coverage
+#   C  UMI vs detected genes          G  spot retention
+#   D  mitochondrial fraction
+# Anything named "exploratory_" is not in the manuscript.
+#
+# Tables (output/01_QC_filtering/tables/):
+#   - sample_composition.csv
+#       Patient x Type spot counts (the console table() output, saved).
+#   - retention_summary.csv
+#       Per-sample spot counts by status (Off_tissue / Failed_QC /
+#       Retained) -- backs Panel G below.
+#
+# Figures (output/01_QC_filtering/figures/):
+#   - exploratory_QC_overview_early.pdf
+#       Early QC overview (UMI/gene violin + scatter), before the final
+#       panel styling below -- kept for reference.
+#   - FigureS1_panels_A-E.pdf
+#       Panels A-E combined (UMI, genes, UMI-vs-genes scatter,
+#       mito %, HBB %).
+#   - FigureS1F_spatial.png
+#       Panel F: spatial QC pass/fail coverage, patient x context grid.
+#   - FigureS1G_retention.pdf
+#       Panel G: spot retention bar chart.
+#   - FigureS1_full_summary.pdf
+#       All panels (A-G) combined, everything rasterized uniformly --
+#       simplest, most robust option given repeated vector-rendering
+#       issues with this many points.
+#   - FigureS1_full_summary_A4_portrait.pdf /
+#     FigureS1_full_summary_A4_landscape.pdf
+#       Same full panel, but only the dense point-cloud panels (C, F)
+#       rasterized -- everything else stays vector/editable. Two page
+#       orientations for layout flexibility.
+#   - FigureS1<A-G>_*.pdf/.png
+#       Every individual panel exported separately, for placing into
+#       a custom supplementary figure layout by hand.
+#
+# BUGFIXES (this pass):
+#   - ggsave("../figures/S1_G", ...) had NO FILE EXTENSION -- ggsave()
+#     cannot infer the output format without one; this would either
+#     error or silently produce a malformed file. Now saved as
+#     exploratory_retention_summary_duplicate.pdf.
+#   - The rasterized-partial summary was saved TWICE to the exact same
+#     filename (FigureS1_full_summary_A4_portrait.pdf), once in
+#     A4 portrait dimensions and once in A4 landscape -- the second
+#     call silently overwrote the first. Now two distinct filenames
+#     (_A4_portrait / _A4_landscape).
+#===================================================================
+
+```{r}
+library(patchwork)
+library(SpatialExperiment)
+library(scuttle)
+library(scran)
+library(scater)
+library(ggplot2)
+library(ggspavis)
+library(dplyr)
+library(tidyr)
+theme_set(theme_minimal(base_size=14))
+
+# ---- 0. Directory structure -------------------------------------------
+# Paths are relative to the project folder (the one containing input/).
+# Run from there, or from scripts/ -- this moves up one level if needed.
+if (basename(getwd()) == "scripts") setwd("..")
+if (!dir.exists("input"))
+  stop("Run this script from the project folder (the one containing input/).")
+
+PROJECT_DIR   <- "."
+INPUT_DIR     <- file.path(PROJECT_DIR, "input")
+PROCESSED_DIR <- file.path(PROJECT_DIR, "processed")
+SCRIPTS_DIR   <- file.path(PROJECT_DIR, "scripts")
+
+ANALYSIS_NAME <- "01_QC_filtering"
+TABLES_DIR    <- file.path(PROJECT_DIR, "output", ANALYSIS_NAME, "tables")
+FIGURES_DIR   <- file.path(PROJECT_DIR, "output", ANALYSIS_NAME, "figures")
+dir.create(PROCESSED_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(TABLES_DIR,    recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR,   recursive = TRUE, showWarnings = FALSE)
+
+# NOTE: place general_functions.R into scripts/
+# before running.
+source(file.path(SCRIPTS_DIR, "general_functions.R"))
+
+# Load Data
+# NOTE: place PNI_SPE.rds (the raw, pre-QC SpatialExperiment object)
+# into input/ before running.
+spe <- readRDS(file.path(INPUT_DIR, "PNI_SPE.rds"))
+# Shuffle for plotting
+set.seed(42)
+spe <- spe[,sample(1:ncol(spe),ncol(spe))]
+# Some Formatting
+rownames(spe) <- uniquifyFeatureNames(rownames(spe), rowData(spe)$symbol)
+spe$patient_id <- unlist(lapply(strsplit(spe$sample_id,"bl"), function(X) X[[1]]))
+spe$type <- unlist(lapply(strsplit(spe$sample_id,"_"), function(X) X[[2]]))
+# Calculate QC
+mtgen <- grepl("^MT-",rownames(spe))
+hbbgn <- grepl("^HBB$",rownames(spe))
+spe <- addPerCellQC(spe,subsets=list("Mito"=mtgen,"HBB"=hbbgn))
+
+sample_composition <- as.data.frame(table("Patient" = spe$patient_id, "Type" = spe$type))
+write.csv(sample_composition, file.path(TABLES_DIR, "sample_composition.csv"), row.names = FALSE)
+print(table("Patient" = spe$patient_id, "Type" = spe$type))
+```
+# Spots in tissue
+```{r}
+spe$in_tissue <- factor(spe$in_tissue)
+levels(spe$in_tissue) <- c("no","yes")
+# The areas specified below are actually fatty tissue (verified by H&E images)
+spe$in_tissue[spe$sample_id=="54703bl28_highPNI" & spe$array_row > 100] <- "yes"
+spe$in_tissue[spe$sample_id=="54703bl28_highPNI" & spe$array_col < 100] <- "yes"
+spe$in_tissue[spe$sample_id=="6249bl18_noPNIandhighPNI" & spe$array_row > 95] <- "yes"
+spe$in_tissue[spe$sample_id=="6249bl18_noPNIandhighPNI" & spe$array_row < 38] <- "yes"
+spe$in_tissue[spe$sample_id=="6249bl23_noPNI" & spe$array_row > 90 & spe$array_col > 130] <- "yes"
+
+# Quality control visualization
+plotVisium(spe[,spe$in_tissue=="yes"], y_coord='pxl_row_in_fullres', x_coord='pxl_col_in_fullres', spots=TRUE, image=FALSE)
+```
+
+# Transcriptomics quality control
+We need to validate the UMI and gene count of our data:
+```{r}
+spe$sample_label <- factor(spe$sample_id,
+                        levels = c("70865bl15_highPNI", "6249bl18_noPNIandhighPNI", "70865bl5_noPNI","54703bl38_noPNI","54703bl28_highPNI",  "6249bl23_noPNI"),
+                        labels = c("P3-Diseased", "P2-Diseased", "P3-Adjacent","P1-Adjacent","P1-Diseased", "P2-Adjacent"))
+p0 <- ggcells(spe, aes(x=sample_label,y=sum,fill=in_tissue)) +
+    geom_violin(draw_quantiles=0.75,scale="width") +
+    ylab("UMIs") +
+    scale_y_log10() +
+    theme(legend.position="none")
+
+p1 <- ggcells(spe, aes(x=sample_label,y=detected,fill=in_tissue)) +
+    geom_violin(draw_quantiles=0.75,scale="width") +
+    ylab("Number of Genes") +
+    theme(legend.position="bottom", axis.text.x = element_text(angle = 45, hjust = 1))
+
+p2 <- ggcells(spe, aes(x=sum,y=detected,color=patient_id)) +
+    geom_point(size=0.1,alpha=.3) +
+    scale_x_log10() +
+    scale_y_log10() +
+    ylab("Number of Genes detected") +
+    xlab("UMIs") +
+    theme(legend.position="none") +
+    facet_wrap(~in_tissue)
+
+ptch <- (p0) / (p1 + p2)
+ptch + plot_annotation(title="Quality Overview of ST")
+ggsave(file.path(FIGURES_DIR, "exploratory_QC_overview_early.pdf"), ptch, width = 12, height = 8, dpi = 300)
+```
+**Definition of low quality**
+We use the standard definition of 3 MADs away from the median (log space) only considering the spots within the tissue. We do this for both genes detected and UMI counts.
+```{r}
+sumqcpass <- !(isOutlier(spe$sum, subset=spe$in_tissue=="yes", log=TRUE, nmads=3, batch=spe$sample_id, type="lower"))
+gdqcpass <- spe$detected > 500
+spe$QCPass <- sumqcpass & gdqcpass
+# Quality control visualization
+plotVisium(spe[,spe$in_tissue=="yes"], y_coord='pxl_row_in_fullres', x_coord='pxl_col_in_fullres', spots=TRUE, image=FALSE,fill="QCPass")
+```
+**Mitochondrial Fraction**
+We want to check the Mitochondrial fraction for further filtering. The only ones with high fractions are the ones that have very few counts, primarily from the one sample with a lot of adipose tissue. Therefore, we do not need to filter further.
+
+```{r}
+p0 <- ggcells(spe, aes(x=sample_id,y=subsets_Mito_percent,fill=in_tissue)) +
+  geom_violin(draw_quantiles=0.5,scale="width") +
+  geom_jitter(size=.2,alpha=0.1) +
+  ylab("[%] Mitochondrial") +
+  theme(legend.position="none")
+p1 <- ggcells(spe, aes(x=sum,y=subsets_Mito_percent,color=in_tissue)) +
+  geom_point(size=0.2,alpha=.4) +
+  scale_x_log10() +
+  xlab("UMIs") +
+  ylab("[%] Mitochondrial") +
+  theme(legend.position="none")
+p0 + p1
+```
+**Hemoglobin**
+We also checked spots that have primarily hemoglobin.
+```{r}
+p0 <- ggcells(spe, aes(x=sample_id,y=subsets_HBB_percent,fill=in_tissue)) +
+  geom_violin(draw_quantiles=0.5,scale="width") +
+  geom_jitter(size=.2,alpha=0.1) +
+  ylab("[%] HBB") +
+  theme(legend.position="none")
+p1 <- ggcells(spe, aes(x=sum,y=subsets_HBB_percent,color=in_tissue)) +
+  geom_point(size=0.2,alpha=.4) +
+  scale_x_log10() +
+  xlab("UMIs") +
+  ylab("[%] HBB") +
+  theme(legend.position="none")
+p0 + p1
+```
+
+#Gene Filtering
+We only remove genes with less than 100 counts across the entire dataset.
+```{r}
+rm <- rowSums(counts(spe)) < 100
+spe <- spe[!rm,]
+```
+
+```{r}
+library(magrittr)
+#========================================================
+# Sample labelling -- ordered by patient, then context (Adjacent before
+# Diseased within each patient). This REPLACES the sample_label factor
+# defined earlier in the "Transcriptomics quality control" section --
+# p0/p1/p2 are also redefined below using this new labeling, so the
+# panels actually saved to disk use this ordering, not the earlier one.
+#========================================================
+spe$sample_label <- factor(spe$sample_id,
+                        levels = c("54703bl38_noPNI", "54703bl28_highPNI",
+                                  "6249bl23_noPNI", "6249bl18_noPNIandhighPNI",
+                                  "70865bl5_noPNI", "70865bl15_highPNI"),
+                        labels = c("P1-Adjacent", "P1-Diseased",
+                                  "P2-Adjacent", "P2-Diseased",
+                                  "P3-Adjacent", "P3-Diseased"))
+
+spe$patient_label <- factor(sub("-.*", "", as.character(spe$sample_label)),
+                            levels = c("P1", "P2", "P3"))
+spe$context_label <- factor(sub(".*-", "", as.character(spe$sample_label)),
+                            levels = c("Adjacent", "Diseased"))
+
+# Sanity check
+print(table(spe$sample_label, spe$patient_label, spe$context_label))
+
+#========================================================
+# Reusable theme fix: white background + explicitly preserved axes
+# (fixes ggcells axis elements being dropped when panel.background is
+# overridden)
+#========================================================
+white_bg_with_axes <- theme(
+  panel.background = element_rect(fill = "white", color = NA),
+  plot.background = element_rect(fill = "white", color = NA),
+  axis.line = element_line(color = "black"),
+  axis.text = element_text(color = "black"),
+  axis.ticks = element_line(color = "black"),
+  axis.title = element_text(color = "black")
+)
+
+#========================================================
+# Panel A: UMI counts per sample
+#========================================================
+p0 <- ggcells(spe, aes(x = sample_label, y = sum, fill = in_tissue)) +
+    geom_violin(draw_quantiles = 0.75, scale = "width") +
+    ylab("UMIs") +
+    scale_y_log10() +
+    theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1)) +
+    white_bg_with_axes
+
+#========================================================
+# Panel B: Detected genes per sample
+#========================================================
+p1 <- ggcells(spe, aes(x = sample_label, y = detected, fill = in_tissue)) +
+    geom_violin(draw_quantiles = 0.75, scale = "width") +
+    ylab("Number of Genes") +
+    theme(legend.position = "bottom", axis.text.x = element_text(angle = 45, hjust = 1)) +
+    white_bg_with_axes
+
+#========================================================
+# Panel C: UMI vs detected genes scatter, by patient, faceted by in_tissue
+#========================================================
+p2 <- ggcells(spe, aes(x = sum, y = detected, color = patient_label)) +
+    geom_point(size = 0.1, alpha = .3) +
+    scale_x_log10() +
+    scale_y_log10() +
+    ylab("Number of Genes detected") +
+    xlab("UMIs") +
+    labs(color = "Patient") +
+    theme(legend.position = "right") +
+    facet_wrap(~in_tissue) +
+    white_bg_with_axes
+
+#========================================================
+# Panel D: Mitochondrial fraction
+#========================================================
+p_mito <- ggcells(spe, aes(x = sample_label, y = subsets_Mito_percent, fill = in_tissue)) +
+  geom_violin(draw_quantiles = 0.5, scale = "width") +
+  geom_jitter(size = .2, alpha = 0.1) +
+  ylab("[%] Mitochondrial") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1)) +
+  white_bg_with_axes
+
+#========================================================
+# Panel E: HBB fraction
+#========================================================
+p_hbb <- ggcells(spe, aes(x = sample_label, y = subsets_HBB_percent, fill = in_tissue)) +
+  geom_violin(draw_quantiles = 0.5, scale = "width") +
+  geom_jitter(size = .2, alpha = 0.1) +
+  ylab("[%] HBB") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1)) +
+  white_bg_with_axes
+
+#========================================================
+# Panel F: Spatial QC pass/fail coverage, patients x context grid
+#========================================================
+p_spatial_qc <- ggcells(spe[, spe$in_tissue == "yes"],
+                        aes(x = array_col, y = -array_row, color = QCPass)) +
+  geom_point(size = 0.4) +
+  facet_grid(context_label ~ patient_label) +
+  scale_color_manual(values = c(`TRUE` = "#2a78d6", `FALSE` = "#D55E00")) +
+  theme_void() +
+  labs(color = "QC Pass", title = "Spatial distribution of QC-passing spots") +
+  theme(plot.background = element_rect(fill = "white", color = NA))
+
+#========================================================
+# Panel G: Retained spot counts
+#========================================================
+retention_df <- as.data.frame(colData(spe)) %>%
+  group_by(sample_label) %>%
+  summarise(
+    Off_tissue = sum(in_tissue == "no"),
+    Failed_QC = sum(in_tissue == "yes" & !QCPass, na.rm = TRUE),
+    Retained = sum(in_tissue == "yes" & QCPass, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_longer(c(Off_tissue, Failed_QC, Retained), names_to = "Status", values_to = "n_spots") %>%
+  dplyr::mutate(Status = factor(Status, levels = c("Off_tissue", "Failed_QC", "Retained")))
+
+write.csv(retention_df, file.path(TABLES_DIR, "retention_summary.csv"), row.names = FALSE)
+
+p_retention <- ggplot(retention_df, aes(x = sample_label, y = n_spots, fill = Status)) +
+  geom_col() +
+  scale_fill_manual(values = c("Off_tissue" = "grey85", "Failed_QC" = "#D55E00", "Retained" = "#2a78d6")) +
+  labs(y = "Number of spots (of 14,336 total)", x = NULL, title = "Spot filtering summary") +
+  theme_classic(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom") +
+  white_bg_with_axes
+
+
+#========================================================
+# Final assembly -- ONE build, no duplication
+#========================================================
+#========================================================
+# File 1: Panels A-E (violin plots + UMI/gene scatter + mito/HBB)
+#========================================================
+panels_AE <- (p0 | p1) / p2 / (p_mito | p_hbb) +
+  plot_annotation(title = "Quality Overview of ST", tag_levels = "A") +
+  plot_layout(heights = c(1, 1, 1))
+
+ggsave(file.path(FIGURES_DIR, "FigureS1_panels_A-E.pdf"), panels_AE, width = 14, height = 14, dpi = 300)
+
+#========================================================
+# File 2: Panel F (spatial QC coverage) -- saved as PNG to avoid the
+# vector-object-count problem in Illustrator
+#========================================================
+ggsave(file.path(FIGURES_DIR, "FigureS1F_spatial.png"), p_spatial_qc,
+      width = 10, height = 6, dpi = 600, bg = "white")
+
+#========================================================
+# File 3: Panel G (retention bar chart) -- lightweight, vector PDF fine
+#========================================================
+ggsave(file.path(FIGURES_DIR, "FigureS1G_retention.pdf"), p_retention,
+      width = 6, height = 5, dpi = 300)
+
+#========================================================
+# Rasterize everything uniformly -- simplest, most robust option for
+# this supplementary figure given repeated vector-rendering issues
+#========================================================
+library(ggrastr)
+
+p0_r <- ggrastr::rasterise(p0, dpi = 600)
+p1_r <- ggrastr::rasterise(p1, dpi = 600)
+p2_r <- ggrastr::rasterise(p2, dpi = 600)
+p_mito_r <- ggrastr::rasterise(p_mito, dpi = 600)
+p_hbb_r <- ggrastr::rasterise(p_hbb, dpi = 600)
+p_spatial_qc_r <- ggrastr::rasterise(p_spatial_qc, dpi = 600)
+p_retention_r <- ggrastr::rasterise(p_retention, dpi = 600)
+
+qc_full_panel <- (p0_r | p1_r) / p2_r / (p_mito_r | p_hbb_r) / (p_spatial_qc_r | p_retention_r) +
+  plot_annotation(title = "Quality Overview of ST", tag_levels = "A") +
+  plot_layout(heights = c(1, 1, 1, 1.3))
+
+ggsave(file.path(FIGURES_DIR, "FigureS1_full_summary.pdf"), qc_full_panel, width = 14, height = 20, dpi = 300)
+
+cat("File size:", file.info(file.path(FIGURES_DIR, "FigureS1_full_summary.pdf"))$size / 1e6, "MB\n")
+
+library(ggrastr)
+
+# ---- Only rasterize the two panels with per-spot point density -----------
+p2_r <- ggrastr::rasterise(p2, dpi = 600)
+p_spatial_qc_r <- ggrastr::rasterise(p_spatial_qc, dpi = 600)
+
+# ---- Everything else stays fully vector and editable -----------------------
+# p0, p1, p_mito, p_hbb, p_retention are all summary shapes (violins, bars)
+# with only a handful of objects each -- no need to rasterize these
+
+qc_full_panel <- (p0 | p1) / p2_r / (p_mito | p_hbb) / (p_spatial_qc_r | p_retention) +
+  plot_annotation(title = "Quality Overview of ST", tag_levels = "A") +
+  plot_layout(heights = c(1, 1, 1, 1.3))
+
+# BUGFIX: previously both saved under the identical filename
+# "FigureS1_full_summary_A4_portrait.pdf" -- the landscape save
+# silently overwrote the portrait one. Now two distinct filenames.
+ggsave(file.path(FIGURES_DIR, "FigureS1_full_summary_A4_portrait.pdf"), qc_full_panel,
+      width = 8.27, height = 11.69, units = "in", dpi = 300)
+
+ggsave(file.path(FIGURES_DIR, "FigureS1_full_summary_A4_landscape.pdf"), qc_full_panel,
+      width = 11.69, height = 8.27, units = "in", dpi = 300)
+cat("File size:", file.info(file.path(FIGURES_DIR, "FigureS1_full_summary.pdf"))$size / 1e6, "MB\n")
+
+# ---- Panels D and E: rasterize ONLY the point/jitter layer, keep
+# axes/violin outlines/text as editable vector ------------------------------
+p_mito_r <- ggrastr::rasterise(p_mito, layers = "Point", dpi = 600)
+p_hbb_r  <- ggrastr::rasterise(p_hbb,  layers = "Point", dpi = 600)
+
+ggsave(file.path(FIGURES_DIR, "FigureS1D_mito_rasterised.pdf"), p_mito_r, width = 6, height = 4)
+ggsave(file.path(FIGURES_DIR, "FigureS1E_hbb_rasterised.pdf"), p_hbb_r, width = 6, height = 4)
+
+ggsave(file.path(FIGURES_DIR, "FigureS1A_umi.pdf"), p0, width = 6, height = 4)
+ggsave(file.path(FIGURES_DIR, "FigureS1B_genes.pdf"), p1, width = 6, height = 4)
+ggsave(file.path(FIGURES_DIR, "FigureS1C_scatter.pdf"), p2, width = 6, height = 4, dpi = 300)  # PNG, since it's dense
+ggsave(file.path(FIGURES_DIR, "FigureS1D_mito.pdf"), p_mito, width = 6, height = 4)
+ggsave(file.path(FIGURES_DIR, "FigureS1E_hbb.pdf"), p_hbb, width = 6, height = 4)
+ggsave(file.path(FIGURES_DIR, "FigureS1F_spatial_lowres.png"), p_spatial_qc, width = 8, height = 5, dpi = 300)  # PNG
+ggsave(file.path(FIGURES_DIR, "FigureS1G_retention_single.pdf"), p_retention, width = 6, height = 4)
+
+```
+
+```{r}
+# NOTE: this recomputes retention_df/p_retention identically to the
+# "Panel G" block above -- kept here only because the original script
+# used this second copy to save under a different filename
+# (BUGFIX: previously "S1_G" with no file extension). If you don't need
+# a separately-named copy of Panel G, this whole chunk can be deleted
+# and downstream code can just reuse p_retention from above.
+retention_df <- as.data.frame(colData(spe)) %>%
+  group_by(sample_label) %>%
+  summarise(
+    Off_tissue = sum(in_tissue == "no"),
+    Failed_QC = sum(in_tissue == "yes" & !QCPass, na.rm = TRUE),
+    Retained = sum(in_tissue == "yes" & QCPass, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_longer(c(Off_tissue, Failed_QC, Retained), names_to = "Status", values_to = "n_spots") %>%
+  mutate(Status = factor(Status, levels = c("Off_tissue", "Failed_QC", "Retained")))
+
+p_retention <- ggplot(retention_df, aes(x = sample_label, y = n_spots, fill = Status)) +
+  geom_col() +
+  scale_fill_manual(values = c("Off_tissue" = "grey85", "Failed_QC" = "#D55E00", "Retained" = "#2a78d6")) +
+  labs(y = "Number of spots (of 14,336 total)", x = NULL, title = "Spot filtering summary") +
+  theme_classic(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom") +
+  white_bg_with_axes
+
+print(p_retention)
+ggsave(file.path(FIGURES_DIR, "exploratory_retention_summary_duplicate.pdf"), p_retention, width = 14, height = 20, dpi = 300)
+```
+
+**Normalization and Save**
+We keep only QC Pass spots and spots in the tissue, lib size normalize and save.
+```{r}
+spe <- spe[,spe$QCPass & spe$in_tissue=="yes"]
+spe <- logNormCounts(spe)
+saveRDS(spe, file.path(PROCESSED_DIR, "PNI_SPE_QC.rds"))
+cat("Saved QC'd SPE object to:", file.path(PROCESSED_DIR, "PNI_SPE_QC.rds"), "\n")
+```

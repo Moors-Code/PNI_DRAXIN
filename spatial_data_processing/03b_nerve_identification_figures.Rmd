@@ -1,0 +1,526 @@
+# Identification of Nerves -- FIGURES
+==================================================
+With the NMF factors we can now call nerves and group them into invaded and non-invaded.
+This code generates the figures that explain the spatial identification of the four tissue regions -- invaded nerves, non-invaded nerves, and nerve-proximal and nerve-distal tumour spots (Figure S5), together with the nerve- and tumour-signal panels of Figure 1A.
+
+It also generates stacked barplots to depict NMF composition of invaded and non-invaded nerves, individual nerve level
+
+It also generates a plot that depicts NMF tumor contribution in the invaded and non-invaded nerve borders Each point represents an individual spot in direct contact with a nerve, grouped by the nerve it borders (BorderID). The + symbol marks the mean tumor signal across all border spots associated with each nerve. Facets separate spots bordering invaded versus non-invaded nerves.
+
+#===================================================================
+# THIS SCRIPT ONLY GENERATES FIGURES -- it does NOT compute or modify
+# NerveID/Invaded/BorderInvaded/NerveProximal. It loads nerveID.csv,
+# produced once by nerve_identification_COMPUTE_historical.Rmd, and
+# treats those assignments as fixed. Run this script as often as you
+# like to check or regenerate any figure -- it can never renumber
+# nerves or desync from a completed pathologist review, because it
+# never re-runs the clustering/thresholding step.
+#
+# If nerveID.csv doesn't exist yet, run
+# nerve_identification_COMPUTE_historical.Rmd first (once).
+#
+# WHAT THIS SCRIPT PRODUCES
+# --------------------------
+# Figures (output/03_nerve_identification/figures/):
+#   - Figure1A_panel_nerve_signal.pdf
+#       Figure 1A panel. Spatial map of the nerve NMF signal.
+#   - Figure1A_panelb_tumor_signal.pdf
+#       Figure 1A panel b. Spatial map of the tumour NMF signal.
+#   - FigureS5A.pdf
+#       Figure S5A. 4-panel figure (nerve signal / thresholded /
+#       NerveID / invaded vs tumour background), patient 54703.
+#   - FigureS5B_mean_tumor_contribution.pdf
+#       Figure S5B. Histogram supporting the 1% invasion threshold.
+#   - FigureS5C.pdf
+#       Figure S5C. 2-panel figure (NerveID + border spots /
+#       nerve-proximal zone), patient 54703.
+#   - exploratory_C1q_macrophages_spatial.pdf
+#       Spatial map of the C1q macrophage NMF signal. NOT in the
+#       manuscript.
+#   - exploratory_Invaded_nerves_NMF_composition.pdf /
+#     exploratory_Noninvaded_nerves_NMF_composition.pdf
+#       Per-nerve NMF composition stacked bar charts, split by
+#       invasion status. NOT in the manuscript.
+#
+# Several chunks print a figure without saving it (the thresholded-nerve
+# map, the NerveID map, the invaded-vs-tumour overlay, the border-spot
+# map, the nerve-proximal map and the border tumour-content check).
+# Those are inspection views; the saved versions of the ones that are
+# in the manuscript are the FigureS5* panels above.
+#
+# Anything named "exploratory_" is not in the manuscript.
+#===================================================================
+
+## Load libraries, helper functions, color palette, and input objects
+```{r}
+library(patchwork)
+library(SpatialExperiment)
+library(scuttle)
+library(batchelor)
+library(scran)
+library(scater)
+library(bluster)
+library(ggspavis)
+library(dplyr)
+library(RcppML)
+library(ggrepel)
+library(RANN)
+library(plyr)
+theme_set(theme_minimal(base_size=14))
+library(irlba)
+
+# ---- 0. Directory structure -------------------------------------------
+# Paths are relative to the project folder (the one containing input/).
+# Run from there, or from scripts/ -- this moves up one level if needed.
+if (basename(getwd()) == "scripts") setwd("..")
+if (!dir.exists("input"))
+  stop("Run this script from the project folder (the one containing input/).")
+
+PROJECT_DIR   <- "."
+INPUT_DIR     <- file.path(PROJECT_DIR, "input")
+SCRIPTS_DIR   <- file.path(PROJECT_DIR, "scripts")
+
+NMF_VIZ_TABLES_DIR <- file.path(PROJECT_DIR, "output", "02_NMF_visualization", "tables")
+
+ANALYSIS_NAME <- "03_nerve_identification"
+TABLES_DIR    <- file.path(PROJECT_DIR, "output", ANALYSIS_NAME, "tables")
+FIGURES_DIR   <- file.path(PROJECT_DIR, "output", ANALYSIS_NAME, "figures")
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+source(file.path(SCRIPTS_DIR, "general_functions.R"))
+
+minmaxscale <- function(x, ...) {
+    return((x - min(x, ...)) /(max(x, ...) - min(x, ...)))
+}
+c25 <- c(
+  "dodgerblue2", "#E31A1C", # red
+"green4",
+"#6A3D9A", # purple
+"#FF7F00", # orange
+"black", "gold1",
+"skyblue2", "#FB9A99", # lt pink
+"palegreen2",
+"#CAB2D6", # lt purple
+"#FDBF6F", # lt orange
+"gray70", "khaki2",
+"maroon", "orchid1", "deeppink1", "blue1", "steelblue4",
+"darkturquoise", "green1", "yellow4", "yellow3",
+"darkorange4", "brown"
+)
+
+# ---- Load spe + FROZEN nerve identification (never recomputed here) -----
+NERVEID_PATH <- file.path(TABLES_DIR, "nerveID.csv")
+if (!file.exists(NERVEID_PATH)) {
+  stop("nerveID.csv not found at: ", NERVEID_PATH,
+       "\nRun nerve_identification_COMPUTE_historical.Rmd once first.")
+}
+
+spe <- readRDS(file.path(INPUT_DIR, "Integrated_NMF.rds"))
+colData(spe) <- DataFrame(read.csv(NERVEID_PATH))
+colnames(spe) <- spe$barcode
+
+compk30 <- DataFrame(read.csv(file.path(NMF_VIZ_TABLES_DIR, "NMFcomp.csv")))
+names(compk30)[names(compk30) == "Myeloid.Macrophages."] <- "Myeloid(Macrophages)"
+names(compk30)[names(compk30) == "Myeloid.C1q_macrophages."] <- "Myeloid(C1q_macrophages)"
+rownames(compk30) <- compk30$barcode
+```
+
+**Nerve Signal**
+```{r}
+comp <- as.matrix(t(reducedDims(spe)[["compk30"]]))
+spe$nerve <- comp['Nerve',]
+spe$tumor <- comp['Ductal_malignant',]
+spe$C1qM <- comp['Myeloid(C1q_macrophages)',]
+nerve_sginal <- ggcells(spe, aes(x=array_col, y=-array_row, color=nerve)) +
+  geom_point(size=0.4) +
+  facet_wrap(~sample_id,
+             labeller = as_labeller(c(
+               "70865bl15_highPNI" = "Patient 3 - Diseased",
+               "6249bl18_noPNIandhighPNI" = "Patient 2 - Diseased",
+               "70865bl5_noPNI" = "Patient 3 - Adjacent",
+               "54703bl38_noPNI" = "Patient 1 - Adjacent",
+               "54703bl28_highPNI" = "Patient 1 - Diseased",
+               "6249bl23_noPNI" = "Patient 2 - Adjacent"
+             ))) +
+  theme_void()+
+  scale_color_viridis_b()
+
+nerve_sginal
+ggsave(file.path(FIGURES_DIR, "Figure1A_panel_nerve_signal.pdf"), nerve_sginal, height= 10, width=14, dpi=600)
+```
+
+**C1q macrophages signal**
+```{r}
+p<- ggcells(spe, aes(x=array_col, y=-array_row, color=C1qM)) +
+  geom_point(size=0.8) +
+  facet_wrap(~sample_id,
+             labeller = as_labeller(c(
+               "70865bl15_highPNI" = "Patient 3 - Diseased",
+               "6249bl18_noPNIandhighPNI" = "Patient 2 - Diseased",
+               "70865bl5_noPNI" = "Patient 3 - Adjacent",
+               "54703bl38_noPNI" = "Patient 1 - Adjacent",
+               "54703bl28_highPNI" = "Patient 1 - Diseased",
+               "6249bl23_noPNI" = "Patient 2 - Adjacent"
+             ))) +
+  theme_void()+ 
+  scale_color_viridis_b() + labs(color = "C1q macrophages signal")
+ggsave(file.path(FIGURES_DIR, "exploratory_C1q_macrophages_spatial.pdf"), p, width = 16, height = 12)
+p
+```
+
+#Tumor NMF signal
+```{r}
+p2<- ggcells(spe, aes(x=array_col, y=-array_row, color=tumor)) +
+  geom_point(size=0.4) +
+  facet_wrap(~sample_id,
+             labeller = as_labeller(c(
+               "70865bl15_highPNI" = "Patient 3 - Diseased",
+               "6249bl18_noPNIandhighPNI" = "Patient 2 - Diseased",
+               "70865bl5_noPNI" = "Patient 3 - Adjacent",
+               "54703bl38_noPNI" = "Patient 1 - Adjacent",
+               "54703bl28_highPNI" = "Patient 1 - Diseased",
+               "6249bl23_noPNI" = "Patient 2 - Adjacent"
+             ))) +
+  theme_void()+ 
+  scale_color_viridis_b() + labs(color = "Mean tumor signal")
+ggsave(file.path(FIGURES_DIR, "Figure1A_panelb_tumor_signal.pdf"), p2, width = 16, height = 12)
+p2
+```
+
+#Thresholding for calling nerves -- FROZEN, loaded from nerveID.csv, not recomputed
+```{r}
+ggcells(spe, aes(x=array_col, y=-array_row, color=is.nerve)) +
+  geom_point(size=0.8) +
+  facet_wrap(~sample_id,
+             labeller = as_labeller(c(
+               "70865bl15_highPNI" = "Patient 3 - Diseased",
+               "6249bl18_noPNIandhighPNI" = "Patient 2 - Diseased",
+               "70865bl5_noPNI" = "Patient 3 - Adjacent",
+               "54703bl38_noPNI" = "Patient 1 - Adjacent",
+               "54703bl28_highPNI" = "Patient 1 - Diseased",
+               "6249bl23_noPNI" = "Patient 2 - Adjacent"
+             ))) +
+  scale_color_manual(values=c("black","grey50"))
+```
+
+#NerveID -- FROZEN, loaded from nerveID.csv, not recomputed
+```{r}
+ggcells(spe, aes(x=array_col, y=-array_row, color=factor(NerveID))) +
+  geom_point(size=0.8) +
+  facet_wrap(~sample_id,
+             labeller = as_labeller(c(
+               "70865bl15_highPNI" = "Patient 3 - Diseased",
+               "6249bl18_noPNIandhighPNI" = "Patient 2 - Diseased",
+               "70865bl5_noPNI" = "Patient 3 - Adjacent",
+               "54703bl38_noPNI" = "Patient 1 - Adjacent",
+               "54703bl28_highPNI" = "Patient 1 - Diseased",
+               "6249bl23_noPNI" = "Patient 2 - Adjacent"
+             ))) +
+  theme_void() +
+  theme(legend.position ='none')
+```
+
+#Mean tumor contribution per nerve (justifies the 1% invasion threshold)
+```{r}
+pd <- data.frame(colData(spe))
+pd <- pd[!is.na(pd$NerveID),]
+pd <- pd[!duplicated(pd$NerveID),]
+
+b <- ggplot(pd, aes(x = mnTumor)) +
+  geom_histogram(bins = 30,
+                 fill = "grey70",
+                 color = "black",
+                 linewidth = 0.2) +
+  geom_vline(xintercept = 1,
+             linetype = "dashed",
+             linewidth = 0.6) +
+  labs(
+    x = "Mean Tumor Contribution per Nerve",
+    y = "Number of Nerves"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 14),
+    axis.text  = element_text(size = 12),
+    plot.title = element_text(size = 16, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+b
+ggsave(file.path(FIGURES_DIR, "FigureS5B_mean_tumor_contribution.pdf"), b, width = 10, height = 10, dpi=300)
+```
+
+**Summary plot** -- invaded vs non-invaded overlay
+```{r}
+spe_nerve <- spe[,!is.na(spe$NerveID)]
+bg <- data.frame(colData(spe)[,c("array_col","array_row","tumor","sample_id")])
+ggcells(spe_nerve, aes(x=array_col, y=-array_row)) +
+  geom_point(data=bg,size=1,pch=21,aes(fill=tumor,color=NULL),stroke=0.05) +
+  geom_point(size=0.5,pch=19,aes(color=Invaded)) +
+  facet_wrap(~sample_id,
+             labeller = as_labeller(c(
+               "70865bl15_highPNI" = "Patient 3 - Diseased",
+               "6249bl18_noPNIandhighPNI" = "Patient 2 - Diseased",
+               "70865bl5_noPNI" = "Patient 3 - Adjacent",
+               "54703bl38_noPNI" = "Patient 1 - Adjacent",
+               "54703bl28_highPNI" = "Patient 1 - Diseased",
+               "6249bl23_noPNI" = "Patient 2 - Adjacent"
+             ))) +
+  scale_fill_viridis_c(option="A") +
+  scale_color_brewer(palette="Accent") +
+  labs(color="")
+```
+
+#Visualize spots in direct nerve proximity -- FROZEN BorderID, not recomputed
+```{r}
+exdata <- data.frame(colData(spe)[!is.na(spe$BorderID),])
+ggcells(spe, aes(x=array_col, y=-array_row, color=factor(spe$NerveID))) +
+  geom_point(size=0.8) +
+  geom_point(data=exdata,size=0.8,color="black") +
+  facet_wrap(~sample_id,
+             labeller = as_labeller(c(
+               "70865bl15_highPNI" = "Patient 3 - Diseased",
+               "6249bl18_noPNIandhighPNI" = "Patient 2 - Diseased",
+               "70865bl5_noPNI" = "Patient 3 - Adjacent",
+               "54703bl38_noPNI" = "Patient 1 - Adjacent",
+               "54703bl28_highPNI" = "Patient 1 - Diseased",
+               "6249bl23_noPNI" = "Patient 2 - Adjacent"
+             ))) +
+  theme_void() +
+  theme(legend.position ="none")
+```
+
+#NerveProximal -- FROZEN, not recomputed
+```{r}
+ggcells(spe, aes(x=array_col, y=-array_row, color=NerveProximal)) +
+  geom_point(size=0.7) +
+  facet_wrap(~sample_id,
+             labeller = as_labeller(c(
+               "70865bl15_highPNI" = "Patient 3 - Diseased",
+               "6249bl18_noPNIandhighPNI" = "Patient 2 - Diseased",
+               "70865bl5_noPNI" = "Patient 3 - Adjacent",
+               "54703bl38_noPNI" = "Patient 1 - Adjacent",
+               "54703bl28_highPNI" = "Patient 1 - Diseased",
+               "6249bl23_noPNI" = "Patient 2 - Adjacent"
+             ))) +
+  theme(legend.position ="none") +
+  ggtitle("Nerve Proximal") +
+  scale_color_manual(values=c("grey90","grey40"))
+```
+
+#Verify: tumor content higher near invaded nerves (FROZEN BorderInvaded)
+```{r}
+spe_nerve <- spe[,!is.na(spe$BorderInvaded)]
+ggcells(spe_nerve, aes(x=BorderID,y=tumor)) +
+  geom_jitter(color="grey80") +
+  stat_summary(geom = "point",fun.y = "mean",
+    size = 6, shape = "+",show.legend=FALSE) +
+  facet_wrap(~BorderInvaded) +
+  theme(axis.text.x =element_blank())
+```
+
+# Figure S5A
+```{r}
+p0 <- ggcells(spe[, spe$patient_id %in% "54703"], aes(x = array_col, y = -array_row)) +
+  geom_point(
+    data = bg[bg$sample_id %in% c("54703bl38_noPNI", "54703bl28_highPNI"), ],
+    size = 1,
+    pch = 21,
+    aes(fill = tumor, color = NULL),
+    stroke = 0.05
+  ) +
+  geom_point(size = 0.5, pch = 19, aes(color = Invaded)) +
+  facet_wrap(
+    ~sample_id,
+    labeller = as_labeller(c(
+      "54703bl38_noPNI" = "Patient 1 - Adjacent",
+      "54703bl28_highPNI" = "Patient 1 - Diseased"
+    ))
+  ) +
+  scale_fill_viridis_c(option = "A") +
+  scale_color_brewer(palette = "Accent") +
+  theme_void() +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x  = element_blank(),
+    axis.text.y  = element_blank()
+  ) +
+  labs(color = "")
+
+p1 <- ggcells(spe[, spe$patient_id %in% "54703"], aes(x=array_col, y=-array_row, color=nerve)) +
+  geom_point(size=0.8) +
+  facet_wrap(~sample_id,
+             labeller = as_labeller(c(
+              "54703bl38_noPNI" = "Patient 1 - Adjacent",
+               "54703bl28_highPNI" = "Patient 1 - Diseased"
+             ))) +
+  scale_color_viridis_b()+
+  theme_void() +
+  theme(
+  axis.title.x = element_blank(),
+  axis.title.y = element_blank(),
+  axis.text.x  = element_blank(),
+  axis.text.y  = element_blank()
+) + labs(color = "Nerve signal")
+
+p2 <- ggcells(spe[, spe$patient_id %in% "54703"], aes(x=array_col, y=-array_row, color=is.nerve)) +
+  geom_point(size=0.8)+ 
+  facet_wrap(~sample_id) +
+  scale_color_manual(values=c("black","grey50"))+
+  theme_void() +
+  theme(legend.position ='right', strip.text = element_blank(),
+  strip.background = element_blank())+
+  labs(color = "Spots with > 20% nerve signal")
+
+p3 <- ggcells(spe[, spe$patient_id %in% "54703"], aes(x=array_col, y=-array_row, color=factor(NerveID))) +
+  geom_point(size=0.8) +
+  facet_wrap(~sample_id) +
+  theme_void() +
+  theme(legend.position ='none', strip.text = element_blank(),
+  strip.background = element_blank())
+
+p4 <- p0 + theme(legend.position ='right', strip.text = element_blank(),
+  strip.background = element_blank())
+
+combined_p <- p1/p2/p3/p4
+ggsave(file.path(FIGURES_DIR, "FigureS5A.pdf"), combined_p, width = 8, height = 12, dpi = 300)
+combined_p
+```
+
+# Figure S5C
+```{r}
+exdata_b <- exdata[exdata$patient_id == "54703", ]
+p1b <- ggcells(spe[, spe$patient_id %in% "54703"], aes(x=array_col, y=-array_row, color=factor(spe[, spe$patient_id %in% "54703"]$NerveID))) +
+  geom_point(size=0.8) +
+  geom_point(data=exdata_b,size=0.8,color="black") +
+  facet_wrap(~sample_id,
+             labeller = as_labeller(c(
+              "54703bl38_noPNI" = "Patient 1 - Adjacent",
+               "54703bl28_highPNI" = "Patient 1 - Diseased"
+             ))) +
+  theme_void() +
+  theme(legend.position ="none",
+  axis.title.x = element_blank(),
+  axis.title.y = element_blank(),
+  axis.text.x  = element_blank(),
+  axis.text.y  = element_blank()
+)
+
+p2b <- ggcells(spe[, spe$patient_id %in% "54703"], aes(x=array_col, y=-array_row, color=NerveProximal)) +
+  geom_point(size=0.7) +
+  facet_wrap(~sample_id) +
+  scale_color_manual(
+    name   = "Spots distal to nerves ( >8 spots away)", 
+    values = c(`TRUE` = "grey40", `FALSE` = "grey90"),
+    labels = c(`TRUE` = "No", `FALSE` = "Yes"))+
+  theme_void() +
+  theme(legend.position ='right', strip.text = element_blank(),
+  strip.background = element_blank())
+
+combined_pb <- p1b/p2b
+ggsave(file.path(FIGURES_DIR, "FigureS5C.pdf"), combined_pb, width = 10, height = 8, dpi = 300)
+combined_pb
+```
+
+# Per nerve average composition
+```{r}
+nerve_ids <- DataFrame(
+  barcode = spe$barcode,
+  id=spe$NerveID,
+  invasion = spe$Invaded,
+  patient = spe$patient_id
+)
+
+Comp_nerve <- as.data.frame(compk30) 
+names(Comp_nerve) <- names(compk30)
+Comp_nerve$ID <- plyr::mapvalues(Comp_nerve$barcode, from = nerve_ids$barcode, to=nerve_ids$id)
+Comp_nerve <- tidyr::drop_na(Comp_nerve)
+rownames(Comp_nerve) <- Comp_nerve$barcode
+Comp_nerve$barcode <- NULL
+
+cell_types <- setdiff(names(Comp_nerve), "ID")
+Comp_nerve <- as_tibble(Comp_nerve)
+
+nerve_comp <- Comp_nerve %>%
+  dplyr::group_by(ID) %>%
+  dplyr::summarise(
+    dplyr::across(dplyr::all_of(cell_types), ~ mean(as.numeric(.x), na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+nerve_comp <- nerve_comp %>%
+  tidyr::pivot_longer(cols = dplyr::all_of(cell_types), names_to = "CellType", values_to = "mean_score") %>%
+  dplyr::group_by(ID) %>%
+  dplyr::mutate(pct = if (sum(mean_score, na.rm = TRUE) == 0) 0 else 100 * mean_score / sum(mean_score, na.rm = TRUE)) %>%
+  dplyr::ungroup()
+
+nerve_comp$invasion <- plyr::mapvalues(nerve_comp$ID, from = nerve_ids$id, to=nerve_ids$invasion, warn_missing = FALSE)
+nerve_comp$patient_id <- plyr::mapvalues(nerve_comp$ID, from = nerve_ids$id, to=nerve_ids$patient, warn_missing = FALSE)
+```
+
+```{r}
+color_maping <- c( "Acinar" = "gold1",
+                   "B_cells" = "maroon",
+                   "Lymphocyte(CD4)" = "green4",
+                   "Lymphocytes" = "green4",
+                   "Myeloid(Macrophages)" = "#6A3D9A",
+                   "Endothelial" = "#FF7F00",
+                   "Endocrine" = "yellow4",
+                   "Stellate" = "khaki2",
+                   "CAF" = "skyblue2",
+                   "Adipocytes" = "steelblue4",
+                   "Lymphocyte(NK)" = "green2",
+                   "Lymphocyte(CD8)" = "palegreen2",
+                   "Myeloid" = "#CAB2D6",
+                   "Schwann" = "#FDBF6F",
+                   "Myeloid(C1q_macrophages)" = "#CAB2D6",
+                   "Nerve" = "#FDBF6F",
+                   "Muscle" = "orchid1",
+                   "Ductal_malignant" = "gray70",
+                   "Ductal_normal" = "black",
+                   "B_cells_(Plasma cells)"  = "brown1")
+```
+
+# Per individual invaded nerve
+```{r}
+p5 <- ggplot(nerve_comp[nerve_comp$invasion == 'Invaded',], aes(x = ID, y = pct, fill = CellType)) +
+  geom_bar(width = 0.5, stat="identity",color = NA) +
+  scale_fill_manual(values = color_maping) +
+  ggtitle("Invaded nerves NMF composition")+
+  labs(x = "Nerve ID",
+       y = "Composition") +
+  facet_grid(~ patient_id, scales = "free_x", space = "free_x", labeller = as_labeller(c(
+               "70865" = "Patient 3",
+               "6249" = "Patient 2",
+               "54703" = "Patient 1"))) +
+  theme_minimal()+
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+ggsave(file.path(FIGURES_DIR, "exploratory_Invaded_nerves_NMF_composition.pdf"), p5, width = 14, height = 10)
+p5
+```
+# Per individual non-invaded nerve
+```{r}
+p6 <- ggplot(nerve_comp[nerve_comp$invasion == 'NonInvaded',], aes(x = ID, y = pct, fill = CellType)) +
+  geom_bar(width = 0.5, stat="identity",color = NA) +
+  scale_fill_manual(values = color_maping) +
+  ggtitle("Non-invaded nerves NMF composition")+
+  labs(x = "Nerve ID",
+       y = "Composition") +
+  facet_grid(~ patient_id, scales = "free_x", space = "free_x", labeller = as_labeller(c(
+               "70865" = "Patient 3",
+               "6249" = "Patient 2",
+               "54703" = "Patient 1"))) +
+  theme_minimal()+
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+ggsave(file.path(FIGURES_DIR, "exploratory_Noninvaded_nerves_NMF_composition.pdf"), p6, width = 14, height = 10)
+p6
+```

@@ -1,0 +1,374 @@
+# Differential Expression Analysis -- COMPUTE STEP
+
+#===================================================================
+# WHAT THIS SCRIPT PRODUCES
+#===================================================================
+# This is the CRITICAL COMPUTE step: builds the spatial group
+# definitions (InvadedNerve/Nerve/TumorProximal/TumorDistal), runs the
+# pseudo-bulk limma differential expression for all 4 contrasts used
+# throughout the manuscript, and produces DE_SPE_annotaion.csv -- the
+# file every other script in this project reads as its colData source.
+#
+# NOTE ON RE-RUNNING: TumorDistalID (like NerveID in
+# 03_nerve_identification) is assigned via hclust/cutree -- in
+# principle deterministic, but not guaranteed identical across R/package
+# versions. Since this feeds directly into which spots get pooled into
+# which pseudo-bulk sample for the DE tests below, re-running this from
+# scratch could in principle shift pseudo-bulk group membership at the
+# margins. Treat the outputs here (DE_analysis_results.rds,
+# DE_SPE_annotaion.csv) as a frozen result once generated -- see
+# 04_DE_analysis_figures_cleaned.Rmd for regenerating figures without
+# re-running any of this.
+#
+# BUGFIXES (this pass):
+#   - The same contrast/result variable names (conInvadedNerve, conRec,
+#     res, confit, defint, out) were reused for 4 DIFFERENT contrasts in
+#     sequence -- same class of naming collision fixed elsewhere in this
+#     project. Renamed to be contrast-specific throughout.
+#   - write.csv(DE_SPE_annotaion.csv) was missing row.names=FALSE.
+#
+# Handoff (input/):
+#   - DE_SPE_annotaion.csv
+#       *** THE FILE every downstream script in this project reads. ***
+#
+# Processed (processed/):
+#   - DE_analysis_results.rds
+#       Bundle of everything the figures script needs: topSen (Invaded
+#       vs NonInvaded), compNerve + defint_invaded (two-contrast
+#       invaded-nerve prioritization), topRec (TumorProximal vs
+#       TumorDistal), compRec + defint_tumorprox (two-contrast tumour-
+#       proximity prioritization), corr_invaded_genes_df (Spearman
+#       correlations), plus sb/sub (pseudo-bulk + spot-level objects
+#       needed for the heatmaps).
+#
+# Tables (output/04_DE_analysis/tables/):
+#   - <sample_id>_annotation.csv (x6)
+#===================================================================
+
+```{r}
+library(patchwork)
+library(limma)
+library(SpatialExperiment)
+library(scuttle)
+library(batchelor)
+library(scran)
+library(scater)
+library(ggspavis)
+library(dplyr)
+library(ggrepel)
+theme_set(theme_minimal(base_size=14))
+
+# ---- 0. Directory structure -------------------------------------------
+# Paths are relative to the project folder (the one containing input/).
+# Run from there, or from scripts/ -- this moves up one level if needed.
+if (basename(getwd()) == "scripts") setwd("..")
+if (!dir.exists("input"))
+  stop("Run this script from the project folder (the one containing input/).")
+
+PROJECT_DIR   <- "."
+INPUT_DIR     <- file.path(PROJECT_DIR, "input")
+PROCESSED_DIR <- file.path(PROJECT_DIR, "processed")
+SCRIPTS_DIR   <- file.path(PROJECT_DIR, "scripts")
+
+NERVE_ID_TABLES_DIR <- file.path(PROJECT_DIR, "output", "03_nerve_identification", "tables")
+
+ANALYSIS_NAME <- "04_DE_analysis"
+TABLES_DIR    <- file.path(PROJECT_DIR, "output", ANALYSIS_NAME, "tables")
+dir.create(PROCESSED_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(TABLES_DIR,    recursive = TRUE, showWarnings = FALSE)
+
+source(file.path(SCRIPTS_DIR, "general_functions.R"))
+
+minmaxscale <- function(x, ...) (x - min(x, ...)) / (max(x, ...) - min(x, ...))
+
+spe <- readRDS(file.path(INPUT_DIR, "Integrated_NMF.rds"))
+colData(spe) <- DataFrame(read.csv(file.path(NERVE_ID_TABLES_DIR, "nerveID.csv")))
+colnames(spe) <- spe$barcode
+```
+
+#Definition of groups
+```{r}
+cmp <- t(reducedDim(spe,"compk30"))
+nervmx <- names(which(apply(cmp,2,which.max)==(which(rownames(cmp)=="Nerve"))))
+def <- spe$Invaded=="Invaded"
+def[is.na(def)] <- FALSE
+invadedNerveCells <- spe$barcode[def]
+names(invadedNerveCells) <- rep("InvadedNerve",length(invadedNerveCells))
+spe$InvadedNerve <- def
+
+def <- spe$Invaded=="NonInvaded"
+def[is.na(def)] <- FALSE
+nerveCells <- spe$barcode[def]
+names(nerveCells) <- rep("Nerve",length(nerveCells))
+spe$Nerve <- def
+```
+
+```{r}
+tummx <- names(which(apply(cmp,2,which.max)==(which(rownames(cmp)=="Ductal_malignant"))))
+def <- spe$BorderInvaded=="Invaded" & spe$barcode %in% tummx
+def[is.na(def)] <- FALSE
+tumorProximalCells <- spe$barcode[def]
+names(tumorProximalCells) <- rep("TumorProximal",length(tumorProximalCells))
+spe$tumorProximalCells <- def
+```
+
+```{r}
+def <- is.na(spe$BorderID) & spe$barcode %in% tummx & !spe$NerveProximal & !spe$is.nerve
+def[is.na(def)] <- FALSE
+spe$TumorDistal <- def
+
+sub <- spe[,spe$TumorDistal]
+pos <- cbind(sub$row,sub$col)
+nn <- BayesSpace:::find_neighbors(pos,radius=2,method="manhattan")
+dd <- dist(pos,method="manhattan")
+tree <- hclust(dd,method="single")
+sub$TumorDistalID <- cutree(tree,h=2)
+
+add <- data.frame(colData(sub)[,c("barcode","TumorDistalID")])
+colData(spe) <- DataFrame(dplyr::left_join(data.frame(colData(spe)),add))
+setna <- as.integer(names(which(table(spe$TumorDistalID)<4)))
+spe$TumorDistalID[spe$TumorDistalID %in% setna] <- NA
+spe$TumorDistal[is.na(spe$TumorDistalID)] <- FALSE
+tumorDistalCells <- spe$barcode[spe$TumorDistal]
+names(tumorDistalCells) <- rep("TumorDistal",length(tumorDistalCells))
+```
+
+```{r}
+sample_key <- data.frame(
+  sample_id = c(
+    "54703bl38_noPNI", "54703bl28_highPNI",
+    "6249bl23_noPNI", "6249bl18_noPNIandhighPNI",
+    "70865bl5_noPNI", "70865bl15_highPNI"
+  ),
+  patient = c("Patient 1","Patient 1","Patient 2","Patient 2","Patient 3","Patient 3"),
+  context = c("Adjacent","Diseased","Adjacent","Diseased","Adjacent","Diseased"),
+  stringsAsFactors = FALSE
+)
+spe$patient <- sample_key$patient[match(spe$sample_id, sample_key$sample_id)]
+spe$context <- sample_key$context[match(spe$sample_id, sample_key$sample_id)]
+spe$patient <- factor(spe$patient, levels = c("Patient 1","Patient 2","Patient 3"))
+spe$context <- factor(spe$context, levels = c("Adjacent","Diseased"))
+
+frm <- c(invadedNerveCells, nerveCells, tumorProximalCells, tumorDistalCells)
+tpe <- plyr::mapvalues(spe$barcode, from = frm, to = names(frm))
+tpe[!spe$barcode %in% unname(frm)] <- NA
+spe$Area <- tpe
+spe$Area[is.na(spe$Area)] <- "other"
+```
+
+```{r}
+smps <- unique(spe$sample_id)
+for (smp in smps) {
+  expr <- data.frame(colData(spe)[spe$sample_id==smp,])
+  keep <- c("barcode","Area","is.nerve","k30label","Invaded")
+  expr <- expr[,keep]
+  expr$barcode <- gsub(paste0(smp,"_"),"",expr$barcode)
+  write.csv(expr, file.path(TABLES_DIR, paste0(smp,"_annotation.csv")), row.names=FALSE, quote=FALSE)
+}
+```
+
+# Identifying surrounding spots
+```{r}
+getContacts <- function(input,rad,knn,query=rownames(input),graph=FALSE,x="pxl_col_in_fullres",y="pxl_row_in_fullres") {
+    require(RANN); require(Matrix); require(igraph)
+    query.data <- input[query,c(x,y)]
+    nn <- nn2(data=input[,c(x,y)],query=query.data,k=knn,radius=rad,searchtype="radius")
+    nn.ct <- apply(nn[["nn.idx"]], 1, function(ROW) {
+        tmp <- sapply(ROW,function(ELEMENT) { out <- NA; if(ELEMENT!=0) out <- input$Cluster[ELEMENT]; out })
+        return(unlist(tmp))
+    })
+    expected <- unique(input$Cluster)
+    out.list <- lapply(1:ncol(nn.ct),function(COL) {
+        contacts <- nn.ct[,COL]; contacts <- contacts[-1]
+        freq <- as.data.frame(table("Contact_Celltype"=contacts))
+        mssng <- setdiff(expected,freq$Contact_Celltype)
+        if (length(mssng)>0) freq <- rbind(freq, data.frame("Contact_Celltype"=mssng,"Freq"=rep(0,length(mssng))))
+        freq$barcode <- input[query,"barcode"][COL]
+        freq$Cluster <- input[query,"Cluster"][COL]
+        return(freq)
+    })
+    do.call(rbind,out.list)
+}
+
+# NOTE: this broad ring was exploratory. The `invasion` column it creates
+# is used only by figures that are NOT in the manuscript, and every figure
+# script reads the frozen DE_SPE_annotaion.csv rather than recomputing it,
+# so the deposited annotation file -- not this radius -- is authoritative.
+out_border <- list()
+nneighbors <- 10
+rd <- nneighbors * 23
+kn <- (nneighbors * 6) + 1
+input <- data.frame(spatialCoords(spe))
+input$barcode <- spe$barcode
+input$Cluster <- spe$NerveID
+input$sample_id <- spe$sample_id
+
+for (smp in unique(input$sample_id)) {
+  inp <- input[input$sample_id == smp,]
+  cons <- getContacts(input=inp,rad=rd,knn=kn)
+  cons <- cons[is.na(cons$Cluster) & !is.na(cons$Contact_Celltype),]
+  cons <- cons[cons$Freq>0,]
+  cons <- cons[!duplicated(cons$barcode),]
+  out_border[[smp]] <- data.frame("barcode"=cons$barcode,"BorderID"=cons$Contact_Celltype,"sample_id"=smp)
+}
+add2 <- Reduce(rbind,out_border)
+
+add2$invasion <- plyr::mapvalues(add2$BorderID, from = spe$NerveID, to=spe$Invaded, warn_missing = FALSE)
+add2$invasion <- as.character(add2$invasion)
+add2$barcode <- as.character(add2$barcode)
+add2$invasion[add2$invasion == "Invaded"] <- "Surr_Invaded"
+add2$invasion[add2$invasion == "NonInvaded"] <- "Surr_NonInvaded"
+
+spe$invasion   <- as.character(spe$Area)
+spe$invasionID <- NA_character_      # must exist before subassignment
+j   <- match(spe$barcode, add2$barcode)
+hit <- !is.na(j)
+spe$invasion[hit]   <- as.character(add2$invasion[j[hit]])
+spe$invasionID[hit] <- as.character(add2$BorderID[j[hit]])
+```
+
+#Run DE (pseudo-bulk + limma, patient as random effect)
+```{r}
+sub <- spe[,spe$Area %in% c("InvadedNerve","TumorProximal","Nerve","TumorDistal")]
+sub$ID <- sub$NerveID
+sub$ID[is.na(sub$ID)] <- sub$BorderID[is.na(sub$ID)]
+sub$ID[is.na(sub$ID)] <- sub$TumorDistalID[is.na(sub$ID)] + 1000
+
+ids <- DataFrame(area=sub$Area, sample_id=sub$sample_id, id=sub$ID)
+sb <- aggregateAcrossCells(sub,ids)
+
+levs <- paste(colData(sb)$area, colData(sb)$id, colData(sb)$sample_id, sep = ".")
+colData(sb)$level_id <- levs
+colnames(sb) <- levs
+
+sb <- sb[,sb$ncells > 1 & sb$ncells < 100]
+sb <- computeLibraryFactors(sb)
+sb <- logNormCounts(sb)
+
+mdl <- model.matrix(~ 0 + area,data.frame(colData(sb)))
+keep <- edgeR::filterByExpr(logcounts(sb), design=mdl, min.count=2)
+sb <- sb[keep,]
+m <- logcounts(sb)
+
+corfit <- duplicateCorrelation(m, mdl, block = colData(sb)$sample_id)
+cat("Consensus correlation:", corfit$consensus.correlation, "\n")
+
+fit <- lmFit(m, design = mdl, block = colData(sb)$sample_id, correlation = corfit$consensus.correlation)
+```
+
+**Contrast 1: Invaded Nerves vs Non-Invaded Nerves**
+```{r}
+contrast_invaded_vs_noninvaded <- makeContrasts("areaInvadedNerve-areaNerve", levels=colnames(mdl))
+fit_invaded_vs_noninvaded <- eBayes(contrasts.fit(fit, contrasts = contrast_invaded_vs_noninvaded))
+
+topSen <- topTable(fit_invaded_vs_noninvaded, n=nrow(fit_invaded_vs_noninvaded))
+topSen$Gene <- rownames(topSen)
+topSen$FDR <- topSen$adj.P.Val
+```
+
+**Contrast 2 (control): Tumor Distal vs Non-Invaded Nerves -- used to prioritize invaded-nerve-specific genes**
+```{r}
+contrast_tumordistal_vs_noninvaded <- makeContrasts("areaTumorDistal-areaNerve", levels=colnames(mdl))
+fit_tumordistal_vs_noninvaded <- eBayes(contrasts.fit(fit, contrasts = contrast_tumordistal_vs_noninvaded))
+
+topRS <- topTable(fit_tumordistal_vs_noninvaded, n=nrow(fit_tumordistal_vs_noninvaded))
+topRS$Gene <- rownames(topRS)
+topRS$FDR <- topRS$adj.P.Val
+
+compNerve <- topSen
+colnames(compNerve) <- paste0("InvadedNerve",".",colnames(compNerve))
+topRS <- topRS[rownames(topSen),]
+compNerve$Rec.logFC <- topRS$logFC
+compNerve$Rec.adj.P.Val <- topRS$adj.P.Val
+
+compNerve$InvadedNerveSignificance <- compNerve$InvadedNerve.adj.P.Val < 0.1 & abs(compNerve$InvadedNerve.logFC)
+compNerve$RecSignificance <- compNerve$Rec.adj.P.Val < 0.1 & abs(compNerve$Rec.logFC)
+compNerve$Significance <- ifelse(compNerve$InvadedNerveSignificance & compNerve$RecSignificance, "SigInBoth",
+  ifelse(compNerve$InvadedNerveSignificance & !compNerve$RecSignificance, "SigInInvaded",
+  ifelse(!compNerve$InvadedNerveSignificance & compNerve$RecSignificance, "SigInTumor", "UnSig")))
+
+defint_invaded <- compNerve$Significance=="SigInInvaded" & compNerve$InvadedNerve.logFC > 0
+defint_invaded <- defint_invaded | (((compNerve$InvadedNerve.logFC > 0) & (compNerve$Rec.logFC < 0)) & compNerve$Significance=="SigInBoth")
+defint_invaded <- defint_invaded | (((compNerve$InvadedNerve.logFC - compNerve$Rec.logFC > 0.5)) & compNerve$Significance=="SigInBoth" & compNerve$InvadedNerve.logFC > 0)
+
+cat("Invaded-nerve-specific gene set:", sum(defint_invaded), "genes\n")
+```
+
+**Correlation of invaded-nerve-specific genes with Tumor/Nerve NMF, within invaded-nerve spots**
+```{r}
+feats_invaded <- rownames(compNerve[defint_invaded,])
+sub2 <- spe[,!is.na(spe$Invaded)]
+sub2 <- sub2[,sub2$Invaded=="Invaded" & !is.na(sub2$NerveID)]
+tm <- reducedDim(sub2,"compk30")[,"Ductal_malignant"]
+nrv <- reducedDim(sub2,"compk30")[,"Nerve"]
+m_sub2 <- logcounts(sub2)[feats_invaded,]
+
+corr_invaded_genes_df <- data.frame()
+for (gene in feats_invaded){
+  cornrv <- cor.test(nrv,m_sub2[gene,], alternative='greater', method="spearman")
+  cortm <- cor.test(tm,m_sub2[gene,], alternative='greater', method="spearman")
+  corr_invaded_genes_df <- rbind(corr_invaded_genes_df, data.frame(
+    "Gene"= gene, "TumorCor" = cortm$estimate, "NerveCor" = cornrv$estimate,
+    "TumorPval" = cortm$p.value, "NervePval" = cornrv$p.value
+  ))
+}
+corr_invaded_genes_df$TumorPval <- p.adjust(corr_invaded_genes_df$TumorPval, method="BH")
+corr_invaded_genes_df$NervePval <- p.adjust(corr_invaded_genes_df$NervePval, method="BH")
+corr_invaded_genes_df$Group <- ifelse(corr_invaded_genes_df$TumorPval < 0.01 & corr_invaded_genes_df$NervePval < 0.01,
+  "Both", ifelse(corr_invaded_genes_df$TumorPval < 0.01, "Tumor", ifelse(corr_invaded_genes_df$NervePval < 0.01, "Nerve", "None")))
+```
+
+**Contrast 3: Tumor Proximal vs Tumor Distal**
+```{r}
+contrast_tumorprox_vs_tumordistal <- makeContrasts("areaTumorProximal-areaTumorDistal",levels=colnames(mdl))
+fit_tumorprox_vs_tumordistal <- eBayes(contrasts.fit(fit, contrasts = contrast_tumorprox_vs_tumordistal))
+
+topRec <- topTable(fit_tumorprox_vs_tumordistal,n=nrow(fit_tumorprox_vs_tumordistal))
+topRec$Gene <- rownames(topRec)
+topRec$FDR <- topRec$adj.P.Val
+```
+
+**Contrast 4 (control): Nerve vs Tumor Distal -- used to prioritize tumor-proximity-specific genes**
+```{r}
+contrast_nerve_vs_tumordistal <- makeContrasts("areaNerve-areaTumorDistal",levels=colnames(mdl))
+fit_nerve_vs_tumordistal <- eBayes(contrasts.fit(fit, contrasts = contrast_nerve_vs_tumordistal))
+
+topSR <- topTable(fit_nerve_vs_tumordistal,n=nrow(fit_nerve_vs_tumordistal))
+topSR$Gene <- rownames(topSR)
+topSR$FDR <- topSR$adj.P.Val
+
+compRec <- topRec
+colnames(compRec) <- paste0("InvadedNerve",".",colnames(compRec))
+topSR <- topSR[rownames(topRec),]
+compRec$Rec.logFC <- topSR$logFC
+compRec$Rec.adj.P.Val <- topSR$adj.P.Val
+
+compRec$InvadedNerveSignificance <- compRec$InvadedNerve.adj.P.Val < 0.1
+compRec$RecSignificance <- compRec$Rec.adj.P.Val < 0.1
+compRec$Significance <- ifelse(compRec$InvadedNerveSignificance & compRec$RecSignificance, "SigInBoth",
+  ifelse(compRec$InvadedNerveSignificance & !compRec$RecSignificance, "SigInInvaded",
+  ifelse(!compRec$InvadedNerveSignificance & compRec$RecSignificance, "SigInTumor", "UnSig")))
+
+defint_tumorprox <- compRec$Significance=="SigInInvaded" & compRec$InvadedNerve.logFC > 0
+defint_tumorprox <- defint_tumorprox | (((compRec$InvadedNerve.logFC > 0) & (compRec$Rec.logFC < 0)) & compRec$Significance=="SigInBoth")
+
+cat("Tumor-proximity-specific gene set:", sum(defint_tumorprox), "genes\n")
+```
+
+```{r}
+# CRITICAL HANDOFF: see header note.
+DE_ANNOTATION_PATH <- file.path(INPUT_DIR, "DE_SPE_annotaion.csv")
+write.csv(data.frame(colData(spe)), DE_ANNOTATION_PATH, row.names = FALSE)
+cat("Saved:", DE_ANNOTATION_PATH, "\n")
+
+DE_results_bundle <- list(
+  topSen = topSen,
+  compNerve = compNerve, defint_invaded = defint_invaded,
+  corr_invaded_genes_df = corr_invaded_genes_df,
+  topRec = topRec,
+  compRec = compRec, defint_tumorprox = defint_tumorprox,
+  sb = sb, sub = sub
+)
+saveRDS(DE_results_bundle, file.path(PROCESSED_DIR, "DE_analysis_results.rds"))
+cat("Saved:", file.path(PROCESSED_DIR, "DE_analysis_results.rds"), "\n")
+```

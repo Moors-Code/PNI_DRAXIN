@@ -1,0 +1,160 @@
+# scRNAseq and snRNAseq pre-processing
+This is the pre-processing and annotation of the sc/snRNA-seq data from:
+"Chen, M. M., Gao, Q., Ning, H., Chen, K., Gao, Y., Yu, M., ... & Zhang, Z. (2025). Integrated single-cell and spatial transcriptomics uncover distinct cellular subtypes involved in neural invasion in pancreatic cancer. Cancer Cell."
+
+The annotated data will be used to deconvolve the ST data that we have.
+
+#===================================================================
+# WHAT THIS SCRIPT PRODUCES
+#===================================================================
+# Handoff (input/):
+#   - sc_sn_merged_obj.Rds
+#       *** THE FILE. Saved to input/, not output/, since every other
+#       script in this project that references the Chen et al. sc/snRNA
+#       reference (celltype specificity, DRAXIN analysis) treats it as
+#       a fixed input -- same convention as Integrated_NMF.rds and
+#       DE_SPE_annotaion.csv. ***
+#
+# Figures (output/00_scRNA_snRNA_preprocessing/figures/):
+#   - scRNA_QC_violin.pdf / snRNA_QC_violin.pdf
+#       nFeature_RNA / nCount_RNA / percent.mt violin plots supporting
+#       the QC filtering thresholds used below (not saved in the
+#       original script -- added here so the QC rationale has a
+#       persistent record).
+#
+# SCOPING NOTE (raised during review, kept as-is by design -- documented
+# here for transparency rather than changed): this script's merged
+# reference INCLUDES BOTH PNI-High and PNI-Low patients -- i.e. the RCTD
+# deconvolution reference is built from the fullest, most representative
+# pool of reference cells available. This is a deliberate, different
+# scoping decision from later analyses (e.g. the DRAXIN cell-type-
+# specificity script), which restrict to PNI-High only for reasons
+# specific to that analysis (matching this project's own high-PNI
+# disease context; PNI-Low Schwann cells there showed a severe single-
+# patient bias). Building the deconvolution REFERENCE from the full
+# cohort and restricting DOWNSTREAM INTERPRETATION to a clinically
+# matched subset are two different, independently justifiable choices --
+# noted explicitly here so the difference in scope between this script
+# and later ones is not mistaken for an inconsistency.
+#
+# REPRODUCIBILITY NOTE: added set.seed() before the stochastic steps
+# (RunPCA, RunBBKNN, FindClusters) that were previously unseeded. This
+# does not affect the critical cell_type_refined assignments below,
+# which come directly from the authors' own provided metadata (barcode
+# mapping), not from this script's own clustering -- but the PCA/BBKNN/
+# UMAP embedding and cluster labels themselves were previously not
+# guaranteed reproducible run-to-run.
+#===================================================================
+
+```{r}
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(readxl)
+
+# ---- 0. Directory structure -------------------------------------------
+PROJECT_ROOT  <- "/media/Aleksandra/Computational/R programming/Publication_files/publication_cleaned"
+PROJECT_DIR   <- PROJECT_ROOT
+INPUT_DIR     <- file.path(PROJECT_DIR, "input")
+
+ANALYSIS_NAME <- "04_scRNA_snRNA_preprocessing"
+FIGURES_DIR   <- file.path(PROJECT_DIR, "output", ANALYSIS_NAME, "figures")
+dir.create(INPUT_DIR,   recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+set.seed(42)
+
+# NOTE: place the GEO-downloaded 10X directories and metadata.csv files
+# into paper_revision_codes/input/GEOdata/scRNAseq/ and
+# paper_revision_codes/input/GEOdata/snRNAseq/ before running.
+scRNA.data <- Read10X(data.dir = file.path(INPUT_DIR, "GEOdata", "scRNAseq"))
+# Initialize the Seurat object with the raw (non-normalized data).
+scRNA <- CreateSeuratObject(counts = scRNA.data, project = "scRNA", min.cells = 3, min.features = 200)
+
+snRNA.data <- Read10X(data.dir = file.path(INPUT_DIR, "GEOdata", "snRNAseq"))
+# Initialize the Seurat object with the raw (non-normalized data).
+snRNA <- CreateSeuratObject(counts = snRNA.data, project = "snRNA", min.cells = 3, min.features = 200)
+
+```
+
+```{r}
+scRNA[["percent.mt"]] <- PercentageFeatureSet(scRNA, pattern = "^MT-")
+p_qc_sc <- VlnPlot(scRNA, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+p_qc_sc
+ggsave(file.path(FIGURES_DIR, "scRNA_QC_violin.pdf"), p_qc_sc, width = 12, height = 5)
+```
+```{r}
+snRNA[["percent.mt"]] <- PercentageFeatureSet(snRNA, pattern = "^MT-")
+p_qc_sn <- VlnPlot(snRNA, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+p_qc_sn
+ggsave(file.path(FIGURES_DIR, "snRNA_QC_violin.pdf"), p_qc_sn, width = 12, height = 5)
+```
+```{r}
+scRNA <- subset(scRNA, subset = nFeature_RNA > 200 & nFeature_RNA < 6000 & percent.mt < 25 & nCount_RNA < 25000)
+
+snRNA <- subset(snRNA, subset = nFeature_RNA > 200 & nFeature_RNA < 6000 & percent.mt < 25 & nCount_RNA < 25000)
+```
+
+Now we want to map the metadata provided by the authors in our Seurat object
+```{r}
+scRNA_metadata <- read.csv(file.path(INPUT_DIR, "GEOdata", "scRNAseq", "metadata.csv"))
+scRNA$barcode <-names(scRNA@active.ident)
+scRNA$cell_type <- plyr::mapvalues(scRNA$barcode, from = scRNA_metadata$X, to=scRNA_metadata$all_celltype)
+scRNA <- subset(scRNA, subset = !is.na(cell_type))
+scRNA$tissue <- plyr::mapvalues(scRNA$barcode, from = scRNA_metadata$X, to=scRNA_metadata$tissue)
+scRNA$patients <- plyr::mapvalues(scRNA$barcode, from = scRNA_metadata$X, to=scRNA_metadata$patients)
+```
+
+```{r}
+snRNA_metadata <- read.csv(file.path(INPUT_DIR, "GEOdata", "snRNAseq", "metadata.csv"))
+snRNA$barcode <-names(snRNA@active.ident)
+snRNA$cell_type <- plyr::mapvalues(snRNA$barcode, from = snRNA_metadata$X, to=snRNA_metadata$all_celltype)
+snRNA <- subset(snRNA, subset = !is.na(cell_type))
+snRNA$tissue <- plyr::mapvalues(snRNA$barcode, from = snRNA_metadata$X, to=snRNA_metadata$tissue)
+snRNA$patients <- plyr::mapvalues(snRNA$barcode, from = snRNA_metadata$X, to=snRNA_metadata$patients)
+```
+
+```{r}
+merged_obj <- merge(x = scRNA, y = snRNA, add.cell.ids = c("scRNA", "snRNA"),)
+# For our analysis we don't need the PBMC data so we remove them
+merged_obj <- subset(merged_obj, subset = !(merged_obj$tissue == "PBMC"))
+# SCOPING NOTE (see header): tissue is NOT further restricted by PNI
+# status here -- both PNI-High and PNI-Low patients remain in this
+# reference. This is intentional; see header for rationale.
+merged_obj <- NormalizeData(merged_obj)
+merged_obj <- FindVariableFeatures(merged_obj)
+merged_obj <- ScaleData(merged_obj)
+merged_obj <- RunPCA(merged_obj)
+```
+Then, according to the authors, we integrated the two datasets with the following parameters and function:
+```{r}
+#devtools::install_github("ycli1995/bbknnR")
+library(bbknnR)
+merged_obj <- RunBBKNN(merged_obj, batch_key = 'orig.ident', n_pcs = 30,run_UMAP = TRUE)
+```
+```{r}
+merged_obj <- FindNeighbors(merged_obj, dims = 1:10)
+merged_obj <- FindClusters(merged_obj, resolution = 1)
+```
+
+```{r}
+merged_obj <- JoinLayers(merged_obj)
+DimPlot(merged_obj, reduction = "umap")
+```
+We can use their metadata to characterize the ductal malignant cells as follows:
+```{r}
+# make a character copy so new labels are allowed
+merged_obj$cell_type_refined <- as.character(merged_obj$cell_type)
+
+merged_obj$cell_type_refined[merged_obj$cell_type == "Ductal" & merged_obj$tissue == "Tumor"]           <- "Ductal_malignant"
+merged_obj$cell_type_refined[merged_obj$cell_type == "Ductal" & merged_obj$tissue == "Adjacent_normal"] <- "Ductal_normal"
+merged_obj <- subset(merged_obj, subset = !(merged_obj$cell_type_refined == "Platelet")) # Because after removing PBMC samples only 2 cells left and that leads to errors when running RCTD
+```
+Now we can use this for the reference.
+```{r}
+saveRDS(merged_obj, file.path(INPUT_DIR, "sc_sn_merged_obj.Rds"))
+cat("Saved:", file.path(INPUT_DIR, "sc_sn_merged_obj.Rds"), "\n")
+cat("This file is now the primary sc/snRNA-seq reference for every\n")
+cat("downstream script in this project that uses it (celltype\n")
+cat("specificity, DRAXIN Chen-reference analysis).\n")
+```

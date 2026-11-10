@@ -1,0 +1,309 @@
+---
+title: "Immune composition and inflammatory milieu within 200 um of a nerve"
+output: html_document
+---
+
+<!--
+============================================================
+immune_cells_0_200um.Rmd
+
+Per-ROI immune composition and inflammatory milieu in the COMET immune
+panel, restricted to the ROIs that lie within 200 um of a nerve -- the
+window reported in the manuscript.
+
+Upstream: processing_ROIs.R combines the per-ROI exports into one
+per-cell table (rule-based classifications plus nuclear marker
+intensities and dot counts). That file, after manual correction of the
+rule-based labels, is the input here.
+
+Each ROI contributes one value per measure:
+  immune composition   % of immune cells in each population
+  CD45+ fraction       % of all cells that are CD45+
+  cytokine positivity  % of CD45+ cells with >= DOT_THRESHOLD nuclear
+                       dots for IFNG, CXCL9 or IL1B
+  PD-L1                % of CD45+ cells classified CD45+PDL1+
+
+The four inflammatory markers therefore share one denominator (CD45+
+cells) and can be read on the same axis.
+
+No distance modelling is performed: distance is used only to select the
+0-200 um window.
+
+Inputs  : input/combined_selected_columns_corrected_manually.csv
+          input/ROIs_immune_cells.csv   (columns ROI, Distance_nerve_um)
+Outputs : output/immune_cells/per_ROI_values.csv
+          output/immune_cells/summary_0-200um.csv
+          output/immune_cells/Fig_immune_composition_0-200um.pdf
+          output/immune_cells/Fig_inflammatory_milieu_0-200um.pdf
+============================================================
+-->
+
+```{r setup, message=FALSE, warning=FALSE}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+```
+
+```{r settings}
+# ---- Paths ------------------------------------------------------------
+CELL_FILE     <- file.path("input", "combined_selected_columns_corrected_manually.csv")
+DISTANCE_FILE <- file.path("input", "ROIs_immune_cells.csv")
+OUT_DIR       <- file.path("output", "immune_cells")
+
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# ---- Analysis settings ------------------------------------------------
+# Window reported in the manuscript: ROIs whose centre lies within this
+# distance of the nearest nerve.
+MAX_DISTANCE_UM <- 200
+
+# A cell counts as positive for a cytokine at this many nuclear dots or more.
+DOT_THRESHOLD <- 5
+
+# One ROI export carries no ROI number in its filename and is recorded as
+# missing; it is ROI22. (Noted here rather than edited into the input file.)
+ROI_WITHOUT_NUMBER <- "ROI22"
+
+# "non immune cells" is the CD45- remainder, not an immune population.
+# TRUE  -> composition is expressed as % of immune cells
+# FALSE -> composition is expressed as % of all classified cells
+EXCLUDE_NON_IMMUNE <- TRUE
+
+# ---- Immune label harmonisation --------------------------------------
+# The rule-based classifier writes its own labels; these are the names
+# used in the figures and in the colour palette.
+IMMUNE_RECODE <- c(
+  "CD4 T cells"       = "Lymphocyte(CD4)",
+  "CD8 T cells"       = "Lymphocyte(CD8)",
+  "CD8- CD4- T cells" = "Lymphocytes(CD4-CD8-)",
+  "NK cells"          = "Lymphocyte(NK)",
+  "CD20+ cells"       = "B_cells",
+  "CD11c DCs"         = "Myeloid(DCs)",
+  "CD68+ macro"       = "Myeloid(Macrophages)",
+  "Other immune cells" = "Other immune",
+  "non immune cells"  = "Non_immune"
+)
+
+# ---- Colours (as in the other figures of the paper) -------------------
+IMMUNE_COLOURS <- c(
+  "Lymphocyte(CD4)"       = "green4",
+  "Lymphocyte(CD8)"       = "palegreen2",
+  "Lymphocytes(CD4-CD8-)" = "darkolivegreen",
+  "Lymphocyte(NK)"        = "green2",
+  "B_cells"               = "maroon",
+  "Myeloid(DCs)"          = "orchid1",
+  "Myeloid(Macrophages)"  = "#6A3D9A",
+  "Other immune"          = "skyblue2",
+  "Non_immune"            = "grey"
+)
+
+# ---- Inflammatory markers, in plotting order --------------------------
+MARKERS <- c(IFNG_percent  = "IFNγ",
+             CXCL9_percent = "CXCL9",
+             PDL1_percent  = "PD-L1",
+             IL1B_percent  = "IL1B")
+```
+
+## 1. Read the per-cell table and harmonise labels
+
+```{r read}
+if (!file.exists(CELL_FILE))     stop("Per-cell table not found: ", CELL_FILE,
+                                      " -- run processing_ROIs.R first.")
+if (!file.exists(DISTANCE_FILE)) stop("ROI distance table not found: ", DISTANCE_FILE)
+
+cells <- read_csv(CELL_FILE, show_col_types = FALSE) %>%
+  mutate(
+    ROI_ID    = if_else(is.na(ROI_ID) | ROI_ID %in% c("", "NA"),
+                        ROI_WITHOUT_NUMBER, str_trim(ROI_ID)),
+    RB_CD45   = str_squish(RB_CD45),
+    RB_Immune = str_squish(RB_Immune),
+    RB_PDL1   = str_squish(RB_PDL1),
+    RB_Immune = recode(RB_Immune, !!!IMMUNE_RECODE, .default = RB_Immune)
+  )
+
+cat("Cells:", nrow(cells), "in", n_distinct(cells$ROI_ID), "ROIs\n")
+
+unknown <- setdiff(na.omit(unique(cells$RB_Immune)), names(IMMUNE_COLOURS))
+if (length(unknown)) warning("Immune label(s) without a colour: ",
+                             paste(unknown, collapse = ", "))
+```
+
+## 2. Per-ROI percentages
+
+```{r per-roi}
+# Immune composition: % of cells in each population
+immune_wide <- cells %>%
+  filter(!is.na(RB_Immune), RB_Immune != "") %>%
+  { if (EXCLUDE_NON_IMMUNE) filter(., RB_Immune != "Non_immune") else . } %>%
+  count(ROI_ID, RB_Immune, name = "n") %>%
+  group_by(ROI_ID) %>%
+  mutate(percent = 100 * n / sum(n)) %>%
+  ungroup() %>%
+  select(ROI_ID, RB_Immune, percent) %>%
+  pivot_wider(names_from = RB_Immune, values_from = percent,
+              names_glue = "immune_{RB_Immune}", values_fill = 0)
+
+# CD45+ fraction, as % of all cells; PD-L1, as % of the CD45+ cells, so that
+# it shares a denominator with the cytokines below
+fractions <- cells %>%
+  group_by(ROI_ID) %>%
+  summarise(
+    total_cells  = n(),
+    total_CD45   = sum(RB_CD45 == "CD45+", na.rm = TRUE),
+    CD45_percent = 100 * total_CD45 / total_cells,
+    PDL1_percent = 100 * sum(RB_PDL1 == "CD45+PDL1+", na.rm = TRUE) /
+                   pmax(total_CD45, 1),
+    .groups = "drop"
+  )
+
+# Cytokine positivity, as % of the CD45+ cells of the ROI
+cytokines <- cells %>%
+  filter(RB_CD45 == "CD45+") %>%
+  group_by(ROI_ID) %>%
+  summarise(
+    n_CD45        = n(),
+    IFNG_percent  = 100 * sum(Nuc_IFNG_dots  >= DOT_THRESHOLD, na.rm = TRUE) / n_CD45,
+    CXCL9_percent = 100 * sum(Nuc_CXCL9_dots >= DOT_THRESHOLD, na.rm = TRUE) / n_CD45,
+    IL1B_percent  = 100 * sum(Nuc_IL1B_dots  >= DOT_THRESHOLD, na.rm = TRUE) / n_CD45,
+    .groups = "drop"
+  ) %>%
+  select(-n_CD45)
+
+per_roi <- fractions %>%
+  left_join(immune_wide, by = "ROI_ID") %>%
+  left_join(cytokines,   by = "ROI_ID")
+```
+
+## 3. Distance to the nearest nerve, and the 0–200 µm window
+
+```{r distance}
+distance <- read_csv(DISTANCE_FILE, show_col_types = FALSE) %>%
+  rename(ROI_ID = ROI) %>%
+  mutate(ROI_ID = str_trim(ROI_ID),
+         distance_um = as.numeric(Distance_nerve_um)) %>%
+  select(ROI_ID, distance_um)
+
+no_distance <- setdiff(per_roi$ROI_ID, distance$ROI_ID)
+if (length(no_distance)) message("ROI(s) without a distance, not used: ",
+                                 paste(no_distance, collapse = ", "))
+
+per_roi <- per_roi %>% left_join(distance, by = "ROI_ID")
+write_csv(per_roi, file.path(OUT_DIR, "per_ROI_values.csv"))
+
+near <- per_roi %>% filter(!is.na(distance_um), distance_um <= MAX_DISTANCE_UM)
+
+cat("ROIs within", MAX_DISTANCE_UM, "um of a nerve:", nrow(near),
+    "of", sum(!is.na(per_roi$distance_um)), "\n")
+```
+
+## 4. Immune composition
+
+```{r composition, fig.width=6, fig.height=5}
+immune_cols <- grep("^immune_", names(near), value = TRUE)
+
+composition <- near %>%
+  select(ROI_ID, all_of(immune_cols)) %>%
+  pivot_longer(-ROI_ID, names_to = "population", values_to = "percent") %>%
+  mutate(population = str_remove(population, "^immune_")) %>%
+  filter(!is.na(percent))
+
+# Order the populations by their median, most abundant first
+pop_order <- composition %>%
+  group_by(population) %>%
+  summarise(med = median(percent), .groups = "drop") %>%
+  arrange(desc(med)) %>%
+  pull(population)
+composition$population <- factor(composition$population, levels = pop_order)
+
+p_composition <- ggplot(composition, aes(population, percent)) +
+  geom_boxplot(aes(fill = population), colour = "black", width = 0.55,
+               outlier.shape = NA, alpha = 0.3) +
+  geom_jitter(aes(colour = population), width = 0.15, size = 2.4, alpha = 0.9) +
+  scale_fill_manual(values = IMMUNE_COLOURS, drop = FALSE) +
+  scale_colour_manual(values = IMMUNE_COLOURS, drop = FALSE) +
+  scale_y_continuous(limits = c(0, 100), expand = expansion(mult = c(0, 0.02))) +
+  labs(x = NULL,
+       y = if (EXCLUDE_NON_IMMUNE) "% of immune cells per ROI"
+           else "% of classified cells per ROI") +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "none",
+        panel.grid.major.y = element_line(colour = "grey85", linewidth = 0.4),
+        axis.text.x = element_text(angle = 45, hjust = 1, colour = "black"),
+        axis.text.y = element_text(colour = "black"))
+
+p_composition
+ggsave(file.path(OUT_DIR, "Fig_immune_composition_0-200um.pdf"),
+       p_composition, width = 6, height = 5)
+```
+
+## 5. Inflammatory milieu
+
+```{r milieu, fig.width=6, fig.height=5}
+milieu <- near %>%
+  select(ROI_ID, all_of(names(MARKERS))) %>%
+  pivot_longer(-ROI_ID, names_to = "marker", values_to = "percent") %>%
+  filter(!is.na(percent)) %>%
+  mutate(marker = factor(marker, levels = names(MARKERS), labels = MARKERS))
+
+p_milieu <- ggplot(milieu, aes(marker, percent)) +
+  geom_boxplot(width = 0.55, outlier.shape = NA, fill = "grey85", colour = "black") +
+  geom_jitter(width = 0.15, size = 2.4, alpha = 0.85) +
+  labs(x = NULL, y = "% positive cells per ROI") +
+  theme_classic(base_size = 14) +
+  theme(axis.text = element_text(colour = "black"))
+
+p_milieu
+ggsave(file.path(OUT_DIR, "Fig_inflammatory_milieu_0-200um.pdf"),
+       p_milieu, width = 6, height = 5)
+```
+
+## 6. Summary table
+
+```{r summary}
+summarise_measure <- function(df, value_col, group_col, kind) {
+  df %>%
+    group_by(measure = .data[[group_col]]) %>%
+    summarise(
+      kind    = kind,
+      n_ROIs  = n_distinct(ROI_ID),
+      median  = round(median(.data[[value_col]], na.rm = TRUE), 1),
+      IQR_low = round(quantile(.data[[value_col]], 0.25, na.rm = TRUE), 1),
+      IQR_high = round(quantile(.data[[value_col]], 0.75, na.rm = TRUE), 1),
+      mean    = round(mean(.data[[value_col]], na.rm = TRUE), 1),
+      sd      = round(sd(.data[[value_col]], na.rm = TRUE), 1),
+      .groups = "drop"
+    )
+}
+
+summary_tbl <- bind_rows(
+  summarise_measure(composition, "percent", "population", "immune population"),
+  summarise_measure(milieu,      "percent", "marker",     "inflammatory marker"),
+  tibble(measure = "CD45+ cells", kind = "fraction",
+         n_ROIs  = nrow(near),
+         median  = round(median(near$CD45_percent), 1),
+         IQR_low = round(quantile(near$CD45_percent, 0.25), 1),
+         IQR_high = round(quantile(near$CD45_percent, 0.75), 1),
+         mean    = round(mean(near$CD45_percent), 1),
+         sd      = round(sd(near$CD45_percent), 1))
+) %>%
+  relocate(kind)
+
+write_csv(summary_tbl, file.path(OUT_DIR, "summary_0-200um.csv"))
+knitr::kable(summary_tbl)
+```
+
+```{r legend, results='asis'}
+cat(sprintf(
+  paste0("\n**Figure legend.** Immune composition and inflammatory milieu in regions of ",
+         "interest lying within %d um of a nerve (n = %d ROIs). Each dot is one ROI; ",
+         "boxes show the median and interquartile range. Immune composition: percentage ",
+         "of %s assigned to each population by the rule-based classifier. ",
+         "IFN-gamma, CXCL9 and IL1B: percentage of CD45+ cells with at least %d nuclear ",
+         "dots for that transcript. PD-L1: percentage of CD45+ cells classified as ",
+         "CD45+PDL1+.\n"),
+  MAX_DISTANCE_UM, nrow(near),
+  if (EXCLUDE_NON_IMMUNE) "immune cells" else "classified cells",
+  DOT_THRESHOLD))
+```

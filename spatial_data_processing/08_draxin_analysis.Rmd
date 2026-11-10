@@ -1,0 +1,737 @@
+---
+title: "DRAXIN expression and associated transcriptional programmes across nerve categories"
+output: html_document
+---
+
+<!--
+#========================================================================
+# 08_draxin_analysis_3.Rmd
+#
+# DRAXIN expression and associated transcriptional programmes across nerve
+# categories in the Visium spatial transcriptomic dataset. Nerve-level
+# aggregation throughout: the nerve, not the spot, is the statistical unit.
+#
+# WHAT CHANGED RELATIVE TO 08_draxin_analysis_2
+#   1. Tumour-associated nerves are now defined symmetrically: invaded AND
+#      non-invaded nerves must both lie in tumour-bearing (Diseased) tissue.
+#      Previously invaded nerves carried no tissue requirement, so one invaded
+#      nerve in adjacent tissue entered the set. The same restriction is
+#      applied to the invaded-only analysis, so every panel uses one definition.
+#   2. Signature scores are computed under BOTH z-scoring scopes and both are
+#      reported: "all_nerve_spots" (primary) and "within_sample" (sensitivity,
+#      genes z-scored within each section so section-level differences cannot
+#      enter the scores). Outputs go to scope-specific subfolders and a
+#      side-by-side comparison is written at the end.
+#   3. Benjamini-Hochberg correction across the three Schwann-cell subtype
+#      correlations (previously uncorrected).
+#   4. Gene-set overlap between the Hallmark TGFb set and the subtype
+#      signatures, and pairwise overlap among all subtype signatures, is
+#      quantified and written out, so independence of the correlations and the
+#      validity of the BH correction can be checked.
+#   5. Assertions that the two invasion annotations agree and that no nerve
+#      carries more than one category label.
+#
+# CORRELATION REPORTING
+#   Every correlation is reported three ways (cor_summary):
+#     rho               pooled Spearman across all nerves
+#     rho_within        Spearman on ranks centred within each section, so only
+#                       nerve-to-nerve variation inside a section contributes
+#                       (sections with >= MIN_NERVES nerves)
+#     patients_positive number of patients with a positive per-patient rho
+#   rho_within is the primary statistic: nerves are nested in patients and the
+#   pooled p value ignores that nesting.
+#
+# INPUTS  (INPUT_DIR)
+#   Integrated_NMF.rds, DE_SPE_annotaion.csv, RCTD_weights.Rds,
+#   1-s2.0-S1535610825002703-mmc3.xlsx  (Chen et al. Table S2 marker sheets)
+#
+# OUTPUTS (output/08_draxin/)
+#   figures/
+#     FigureS16A_invaded_DRAXIN_vs_NMF_programs.pdf
+#       Figure S16A. DRAXIN against the nerve and tumour NMF programmes,
+#       invaded nerves only, coloured by patient.
+#     exploratory_DRAXIN_vs_NMF_all_nerve_categories.png
+#       The same relationship across all three nerve categories. NOT in
+#       the manuscript.
+#     all_nerve_spots/Figure6D_DRAXIN_vs_SC_subtype_signatures.pdf
+#       Figure 6D. DRAXIN against the three Chen et al. Schwann-cell
+#       subtype signatures.
+#     all_nerve_spots/FigureS16B_DRAXIN_all_subtype_correlation_ranked.pdf
+#       Figure S16B. DRAXIN correlation ranked across every refined
+#       Chen et al. subtype.
+#     all_nerve_spots/FigureS16C_DRAXIN_vs_Hallmark_TGFB.pdf
+#       Figure S16C. DRAXIN against the MSigDB Hallmark TGFb signature.
+#     within_sample/robustness_*.pdf
+#       The same three panels under the within-section z-scoring scope,
+#       as a robustness check. NOT in the manuscript.
+#
+# Anything named "exploratory_" or "robustness_" is not in the
+# manuscript.
+#   tables/
+#     signature_overlap_Hallmark_vs_SC.csv
+#     signature_overlap_subtypes_summary.csv
+#     signature_overlap_subtypes_pairwise.csv
+#     <scope>/DRAXIN_vs_Hallmark_TGFB_correlation.csv
+#     <scope>/DRAXIN_vs_SC_subtype_correlations.csv
+#     <scope>/DRAXIN_vs_all_subtypes_correlation.csv
+#     comparison_Hallmark_and_SC_by_scope.csv
+#     comparison_all_subtypes_by_scope.csv
+#     nerve_counts_by_group.csv
+#========================================================================
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# 1. Libraries, paths and input data
+
+```{r}
+library(ggplot2)
+library(patchwork)
+library(SpatialExperiment)
+library(SummarizedExperiment)
+library(dplyr)
+library(tidyr)
+library(Matrix)
+library(stringr)
+library(msigdbr)
+library(readxl)
+
+# Paths are relative to the project folder (the one containing input/).
+# Run from there, or from scripts/ -- this moves up one level if needed.
+if (basename(getwd()) == "scripts") setwd("..")
+if (!dir.exists("input"))
+  stop("Run this script from the project folder (the one containing input/).")
+
+PROJECT_DIR   <- "."
+INPUT_DIR     <- file.path(PROJECT_DIR, "input")
+PROCESSED_DIR <- file.path(PROJECT_DIR, "processed")
+
+ANALYSIS_NAME <- "08_draxin"
+TABLES_DIR    <- file.path(PROJECT_DIR, "output", ANALYSIS_NAME, "tables")
+FIGURES_DIR   <- file.path(PROJECT_DIR, "output", ANALYSIS_NAME, "figures")
+for (d in c(PROCESSED_DIR, TABLES_DIR, FIGURES_DIR))
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+
+CHEN_SUPP_TABLE_PATH <- file.path(INPUT_DIR, "1-s2.0-S1535610825002703-mmc3.xlsx")
+
+# ---- Analysis constants (every threshold used anywhere in this script) ------
+MIN_SPOTS        <- 3     # spots required for a nerve to be analysed
+MIN_NERVES       <- 3     # nerves required for a section / patient to contribute
+                          #   to the within-section and per-patient statistics
+MIN_SIG_GENES    <- 3     # detected genes required to score a signature
+MIN_HALLMARK     <- 5     # detected genes required for the Hallmark score
+ALPHA            <- 0.05
+
+# z-scoring scopes. The manuscript reports the primary scope
+# (all_nerve_spots), quoting the within-section correlation (rho_within)
+# rather than the pooled one. The second scope, in which genes are
+# z-scored within each section, is run as a robustness check and is
+# reported in full here but not in the manuscript.
+SCOPES           <- c("all_nerve_spots", "within_sample")
+PRIMARY_SCOPE    <- "all_nerve_spots"
+
+NMF_NERVE_COL    <- "nerve"
+NMF_TUMOR_COL    <- "mnTumor"
+
+plot_cfg <- list(
+  point_size  = 2,
+  point_alpha = 0.85,
+  add_lm      = TRUE,
+  color_map   = c("Invaded" = "#E31A1C", "NonInvaded_Diseased" = "dodgerblue2"),
+  caption_wrap_width = 110,
+  bottom_margin_pt   = 28
+)
+
+spe <- readRDS(file.path(INPUT_DIR, "Integrated_NMF.rds"))
+colData(spe) <- DataFrame(read.csv(file.path(INPUT_DIR, "DE_SPE_annotaion.csv")))
+colnames(spe) <- spe$barcode
+
+W_df <- readRDS(file.path(INPUT_DIR, "RCTD_weights.Rds"))
+```
+
+# 2. Helper functions
+
+```{r}
+keep_genes <- function(x, expr_mat) intersect(x, rownames(expr_mat))
+
+# ---- Correlation summary used for every DRAXIN correlation ------------------
+# Nerves are pooled across sections and patients, so a plain Spearman
+# correlation can be produced by differences in LEVEL between sections or
+# patients (sequencing depth, tissue quality) rather than by a relationship
+# within tissue. Reported alongside the pooled value:
+#   rho_within        ranks centred within each section (sections with
+#                     >= MIN_NERVES nerves), so only nerve-to-nerve variation
+#                     inside the same section contributes. PRIMARY statistic.
+#   patients_positive number of patients (>= MIN_NERVES nerves) with a positive
+#                     per-patient Spearman rho.
+cor_summary <- function(df, x, y = "DRAXIN_mean", sample_col = "sample_id",
+                        patient_col = "patient_id", min_nerves = MIN_NERVES) {
+  df <- as.data.frame(df)
+  df <- df[is.finite(df[[x]]) & is.finite(df[[y]]), , drop = FALSE]
+  if (nrow(df) < 4)
+    return(data.frame(rho = NA_real_, p = NA_real_, rho_within = NA_real_,
+                      p_within = NA_real_, patients_positive = NA_character_,
+                      n_nerves = nrow(df), n_sections_within = 0L, label = ""))
+
+  ct <- suppressWarnings(cor.test(df[[x]], df[[y]], method = "spearman", exact = FALSE))
+
+  ns <- table(df[[sample_col]])
+  keep_sections <- names(ns)[ns >= min_nerves]
+  w  <- df[df[[sample_col]] %in% keep_sections, , drop = FALSE]
+  centre_ranks <- function(v, g) {
+    r <- ave(v, g, FUN = rank)
+    r - ave(r, g, FUN = mean)
+  }
+  cw <- if (nrow(w) >= 4)
+    suppressWarnings(cor.test(centre_ranks(w[[x]], w[[sample_col]]),
+                              centre_ranks(w[[y]], w[[sample_col]]))) else NULL
+
+  pp <- sapply(split(df, df[[patient_col]]), function(s)
+    if (nrow(s) >= min_nerves)
+      suppressWarnings(cor(s[[x]], s[[y]], method = "spearman")) else NA_real_)
+  pp <- pp[!is.na(pp)]
+
+  out <- data.frame(
+    rho               = unname(ct$estimate),
+    p                 = ct$p.value,
+    rho_within        = if (is.null(cw)) NA_real_ else unname(cw$estimate),
+    p_within          = if (is.null(cw)) NA_real_ else cw$p.value,
+    patients_positive = paste0(sum(pp > 0), "/", length(pp)),
+    n_nerves          = nrow(df),
+    n_sections_within = length(keep_sections)
+  )
+  out$label <- paste0(
+    "Spearman ρ = ", sprintf("%.2f", out$rho), ", p = ", signif(out$p, 2),
+    "\nwithin section ρ = ", sprintf("%.2f", out$rho_within),
+    ", p = ", signif(out$p_within, 2),
+    "; positive in ", out$patients_positive, " patients")
+  out
+}
+
+# ---- Nerve objects ---------------------------------------------------------
+build_nerve_spe <- function(spe_object) {
+  nerve_spe <- spe_object[, colData(spe_object)$is.nerve == TRUE]
+  nerve_spe$types <- nerve_spe$type
+  colData(nerve_spe)$types[colData(nerve_spe)$types == "noPNI"]   <- "Adjacent"
+  colData(nerve_spe)$types[colData(nerve_spe)$types != "Adjacent"] <- "Diseased"
+  colData(nerve_spe)$nerve_types <- ifelse(
+    colData(nerve_spe)$Invaded == "NonInvaded",
+    paste0(colData(nerve_spe)$Invaded, "_", colData(nerve_spe)$types),
+    as.character(colData(nerve_spe)$Invaded))
+  nerve_spe[, !is.na(colData(nerve_spe)$nerve_types)]
+}
+
+build_nerve_meta <- function(nerve_spe, assay_name = "logcounts") {
+  expr <- as.matrix(assay(nerve_spe, assay_name))
+  meta <- as.data.frame(colData(nerve_spe))
+  stopifnot("DRAXIN" %in% rownames(expr))
+  meta$DRAXIN_expr <- as.numeric(expr["DRAXIN", ])
+  list(expr = expr, meta = meta)
+}
+
+# ---- z-scoring, one function per scope -------------------------------------
+# Returns a gene x spot matrix for the tumour-associated spots only. Row names
+# are identical in every scope, so gene-set membership does not depend on it.
+#   all_nerve_spots    genes z-scored across ALL nerve spots, then subset
+#   tumour_associated  genes z-scored across the tumour-associated spots
+#   within_sample      genes z-scored separately within each section, so
+#                      section-level differences cannot enter the scores
+make_z_ta <- function(expr, ta_idx, meta_ta, scope) {
+  if (scope == "all_nerve_spots") {
+    z <- t(scale(t(expr)))
+    z[is.na(z)] <- 0
+    z[, ta_idx, drop = FALSE]
+  } else if (scope == "tumour_associated") {
+    e <- expr[, ta_idx, drop = FALSE]
+    z <- t(scale(t(e)))
+    z[is.na(z)] <- 0
+    z
+  } else if (scope == "within_sample") {
+    e <- expr[, ta_idx, drop = FALSE]
+    z <- e
+    for (smp in unique(meta_ta$sample_id)) {
+      j  <- which(meta_ta$sample_id == smp)
+      zz <- t(scale(t(e[, j, drop = FALSE])))
+      zz[is.na(zz)] <- 0
+      z[, j] <- zz
+    }
+    z
+  } else {
+    stop("Unknown z_scope: ", scope)
+  }
+}
+
+signature_score <- function(genes, z_ta, min_genes = MIN_SIG_GENES) {
+  g <- intersect(setdiff(unique(genes), "DRAXIN"), rownames(z_ta))
+  if (length(g) < min_genes) return(rep(NA_real_, ncol(z_ta)))
+  Matrix::colMeans(z_ta[g, , drop = FALSE], na.rm = TRUE)
+}
+
+# ---- Scatter plot shared by the Hallmark and subtype-signature panels ------
+nerve_scatter <- function(data, score_col, xlab, cor_result, cfg,
+                          caption = NULL, legend = "right") {
+  lm_layer <- if (isTRUE(cfg$add_lm))
+    geom_smooth(method = "lm", se = FALSE, colour = "black", linewidth = 0.7) else NULL
+  ggplot(data, aes(x = .data[[score_col]], y = DRAXIN_mean, colour = nerve_types)) +
+    geom_point(alpha = cfg$point_alpha, size = cfg$point_size) +
+    lm_layer +
+    scale_colour_manual(values = cfg$color_map, drop = FALSE) +
+    theme_bw() +
+    labs(x = xlab, y = "Mean DRAXIN expression (logcounts) per nerve",
+         colour = "Nerve type", caption = caption) +
+    annotate("text", x = -Inf, y = Inf, label = cor_result$label,
+             hjust = -0.05, vjust = 1.1, size = 3.3) +
+    theme(plot.margin  = margin(6, 10, cfg$bottom_margin_pt, 10),
+          plot.caption = element_text(size = 8.5, hjust = 0),
+          legend.position = legend)
+}
+```
+
+# 3. Nerve-level objects, with checks
+
+```{r}
+nerve_spe  <- build_nerve_spe(spe)
+nerve_data <- build_nerve_meta(nerve_spe, assay_name = "logcounts")
+expr <- nerve_data$expr
+meta <- nerve_data$meta
+
+# No nerve may carry more than one category label.
+stopifnot(all(tapply(as.character(meta$nerve_types), as.character(meta$NerveID),
+                     function(x) length(unique(x))) == 1))
+# The two invasion annotations must agree on the full nerve set.
+stopifnot("InvadedNerve" %in% names(meta))
+stopifnot(sum(meta$InvadedNerve %in% c(TRUE, 1, "TRUE")) ==
+          sum(meta$nerve_types == "Invaded", na.rm = TRUE))
+
+cat("Nerve spots by category and tissue context:\n")
+print(table(nerve_types = meta$nerve_types, tissue = meta$types, useNA = "ifany"))
+```
+
+```{r}
+# ---- Tumour-associated nerves ----------------------------------------------
+# Invaded AND non-invaded nerves must both lie in tumour-bearing tissue, so the
+# definition is symmetric. NonInvaded_Diseased already implies Diseased by
+# construction, so the tissue condition only constrains the invaded arm.
+ta_idx  <- which(meta$nerve_types %in% c("Invaded", "NonInvaded_Diseased") &
+                 meta$types == "Diseased")
+meta_ta <- meta[ta_idx, , drop = FALSE]
+
+# ---- Invaded-only set, same tissue restriction ----------------------------
+inv_idx  <- which(meta$InvadedNerve %in% c(TRUE, 1, "TRUE") & meta$types == "Diseased")
+meta_inv <- meta[inv_idx, , drop = FALSE]
+
+cat("\nTumour-associated nerve spots:", length(ta_idx),
+    "| invaded-only nerve spots:", length(inv_idx), "\n")
+cat("Invaded nerve spots excluded because they lie in adjacent tissue:",
+    sum(meta$nerve_types == "Invaded" & meta$types != "Diseased", na.rm = TRUE), "\n")
+```
+
+# 4. DRAXIN versus NMF programmes, all nerve categories
+
+These NMF programme scores come from `colData` and are not z-scored, so this
+section and the next do not depend on the z-scoring scope.
+
+```{r}
+nerve_df <- meta %>%
+  group_by(patient_id, sample_id, NerveID, nerve_types) %>%
+  summarise(DRAXIN_mean    = mean(DRAXIN_expr, na.rm = TRUE),
+            NMF_nerve_mean = mean(.data[[NMF_NERVE_COL]], na.rm = TRUE),
+            NMF_tumor_mean = mean(.data[[NMF_TUMOR_COL]], na.rm = TRUE),
+            n_spots        = dplyr::n(), .groups = "drop") %>%
+  filter(n_spots >= MIN_SPOTS) %>%
+  mutate(nerve_types = factor(nerve_types,
+           levels = c("Invaded", "NonInvaded_Diseased", "NonInvaded_Adjacent")))
+
+write.csv(as.data.frame(table(nerve_types = nerve_df$nerve_types)),
+          file.path(TABLES_DIR, "nerve_counts_by_group.csv"), row.names = FALSE)
+cat("Nerves analysed per category (>= ", MIN_SPOTS, " spots):\n", sep = "")
+print(table(nerve_df$nerve_types))
+
+df_long_all <- nerve_df %>%
+  pivot_longer(c(NMF_nerve_mean, NMF_tumor_mean),
+               names_to = "program", values_to = "program_score") %>%
+  mutate(program = recode(program,
+           NMF_nerve_mean = "NMF nerve program",
+           NMF_tumor_mean = "NMF tumour program"))
+
+cor_stats_all <- df_long_all %>%
+  group_by(program) %>% group_modify(~ cor_summary(.x, "program_score")) %>% ungroup()
+print(as.data.frame(cor_stats_all[, setdiff(names(cor_stats_all), "label")]))
+
+p4J_all <- ggplot(df_long_all, aes(program_score, DRAXIN_mean, colour = nerve_types)) +
+  geom_point(alpha = 0.85, size = 2) +
+  geom_smooth(method = "lm", se = FALSE, colour = "black", linewidth = 0.7) +
+  facet_wrap(~ program, scales = "free_x") +
+  geom_text(data = cor_stats_all, aes(x = -Inf, y = Inf, label = label),
+            inherit.aes = FALSE, hjust = -0.05, vjust = 1.1, size = 3.3) +
+  labs(x = "Mean NMF program score per nerve",
+       y = "Mean DRAXIN expression (logcounts) per nerve", colour = "Nerve type") +
+  theme_bw() +
+  theme(legend.position = "right", strip.text = element_text(face = "bold"),
+        plot.margin = margin(10, 20, 10, 10))
+p4J_all
+ggsave(file.path(FIGURES_DIR, "exploratory_DRAXIN_vs_NMF_all_nerve_categories.png"),
+       p4J_all, width = 7, height = 4.2, units = "in", dpi = 600)
+```
+
+# 5. DRAXIN versus NMF programmes, invaded nerves only
+
+```{r}
+inv_nerve <- meta_inv %>%
+  group_by(patient_id, sample_id, NerveID) %>%
+  summarise(nerve_mean   = mean(.data[[NMF_NERVE_COL]], na.rm = TRUE),
+            mnTumor_mean = mean(.data[[NMF_TUMOR_COL]], na.rm = TRUE),
+            DRAXIN_mean  = mean(DRAXIN_expr, na.rm = TRUE),
+            n_spots      = dplyr::n(), .groups = "drop") %>%
+  filter(n_spots >= MIN_SPOTS) %>%
+  mutate(patient_id = factor(patient_id, levels = c("54703", "6249", "70865")))
+
+cat("Invaded nerves analysed:", nrow(inv_nerve), "in",
+    length(unique(inv_nerve$patient_id)), "patients\n")
+
+df_long_inv <- inv_nerve %>%
+  pivot_longer(c(nerve_mean, mnTumor_mean),
+               names_to = "program", values_to = "program_score") %>%
+  mutate(program = recode(program,
+           nerve_mean   = "NMF nerve program",
+           mnTumor_mean = "NMF tumour program"))
+
+cor_stats_inv <- df_long_inv %>%
+  group_by(program) %>% group_modify(~ cor_summary(.x, "program_score")) %>% ungroup()
+print(as.data.frame(cor_stats_inv[, setdiff(names(cor_stats_inv), "label")]))
+write.csv(as.data.frame(cor_stats_inv[, setdiff(names(cor_stats_inv), "label")]),
+          file.path(TABLES_DIR, "DRAXIN_vs_NMF_invaded_nerves_correlation.csv"),
+          row.names = FALSE)
+
+p4J_inv <- ggplot(df_long_inv, aes(program_score, DRAXIN_mean, colour = patient_id)) +
+  geom_point(alpha = 0.85, size = 2) +
+  geom_smooth(method = "lm", se = FALSE, colour = "black", linewidth = 0.7) +
+  facet_wrap(~ program, scales = "free_x") +
+  geom_text(data = cor_stats_inv, aes(x = -Inf, y = Inf, label = label),
+            inherit.aes = FALSE, hjust = -0.05, vjust = 1.1, size = 3.3) +
+  labs(x = "Mean program score per invaded nerve",
+       y = "Mean DRAXIN expression (logcounts) per invaded nerve", colour = "Patient") +
+  theme_bw() +
+  theme(legend.position = "right", strip.text = element_text(face = "bold"),
+        plot.margin = margin(10, 20, 10, 10))
+p4J_inv
+ggsave(file.path(FIGURES_DIR, "FigureS16A_invaded_DRAXIN_vs_NMF_programs.pdf"),
+       p4J_inv, width = 5.99, height = 4.2, units = "in", dpi = 600)
+```
+
+# 6. Gene sets
+
+Scope-independent: the gene sets and their detected membership depend only on
+the rows of the expression matrix, which are the same under every scope.
+
+```{r}
+# ---- MSigDB Hallmark TGFb signalling --------------------------------------
+tgfb_hallmark_df <- msigdbr(species = "Homo sapiens", collection = "H")
+tgfb_genes_raw <- tgfb_hallmark_df %>%
+  filter(gs_name == "HALLMARK_TGF_BETA_SIGNALING") %>%
+  pull(gene_symbol) %>% unique()
+# DRAXIN excluded so the correlation cannot be partly DRAXIN with itself.
+tgfb_genes <- setdiff(keep_genes(tgfb_genes_raw, expr), "DRAXIN")
+cat("Hallmark TGFb genes: ", length(tgfb_genes_raw), " in the set, ",
+    length(tgfb_genes), " detected and used\n", sep = "")
+stopifnot(length(tgfb_genes) >= MIN_HALLMARK)
+
+hallmark_caption <- str_wrap(paste0(
+  "MSigDB Hallmark TGFβ signalling genes used for scoring, DRAXIN excluded: ",
+  paste(tgfb_genes, collapse = ", ")), width = plot_cfg$caption_wrap_width)
+
+# ---- Chen et al. Schwann-cell subtype signatures --------------------------
+chen_schwann <- read_excel(CHEN_SUPP_TABLE_PATH, sheet = "S2H. Schwann", skip = 1)
+sc_sigs <- list(
+  TGFBI    = unique(chen_schwann$gene[chen_schwann$cluster == "S02_Schwann-TGFBI"]),
+  ABCA8    = unique(chen_schwann$gene[chen_schwann$cluster == "S01_Schwann-ABCA8"]),
+  SERPINA3 = unique(chen_schwann$gene[chen_schwann$cluster == "S03_Schwann-SERPINA3"]))
+cat("\nDRAXIN present in the subtype marker list (removed if TRUE):\n")
+print(sapply(sc_sigs, function(g) "DRAXIN" %in% g))
+sc_sigs <- lapply(sc_sigs, function(g) setdiff(g, "DRAXIN"))
+sc_sigs_present <- lapply(sc_sigs, function(g) intersect(g, rownames(expr)))
+cat("\nSchwann subtype signature coverage (detected / in list):\n")
+print(data.frame(signature = names(sc_sigs),
+                 detected  = sapply(sc_sigs_present, length),
+                 in_list   = sapply(sc_sigs, length),
+                 pct = round(100 * sapply(sc_sigs_present, length) /
+                                   sapply(sc_sigs, length)), row.names = NULL))
+
+# ---- All refined Chen et al. subtypes -------------------------------------
+refined_sheets <- c("S2B. CD4T", "S2C. CD8T", "S2D. B cell", "S2E. Myeloid cell",
+                    "S2F. Fibro", "S2G. Ductal", "S2H. Schwann")
+all_subtype_markers <- bind_rows(lapply(refined_sheets, function(sh)
+  read_excel(CHEN_SUPP_TABLE_PATH, sheet = sh, skip = 1) %>% mutate(source_sheet = sh)))
+subtype_gene_lists <- split(all_subtype_markers$gene, all_subtype_markers$cluster)
+subtype_sheet <- sapply(names(subtype_gene_lists), function(ct)
+  unique(all_subtype_markers$source_sheet[all_subtype_markers$cluster == ct])[1])
+cat("\nRefined subtypes in the reference:", length(subtype_gene_lists), "\n")
+```
+
+# 7. Gene-set overlap
+
+Quantifies how far the correlated gene sets share genes, so the Hallmark and
+subtype-signature correlations can be reported as independent, and so the BH
+correction across subtypes can be justified.
+
+```{r}
+hallmark_overlap <- data.frame(
+  Signature    = names(sc_sigs_present),
+  n_genes      = sapply(sc_sigs_present, length),
+  n_shared     = sapply(sc_sigs_present, function(g) length(intersect(g, tgfb_genes))),
+  shared_genes = sapply(sc_sigs_present, function(g)
+                   paste(intersect(g, tgfb_genes), collapse = ", ")),
+  row.names = NULL)
+hallmark_overlap$pct_shared <-
+  round(100 * hallmark_overlap$n_shared / hallmark_overlap$n_genes, 1)
+cat("Hallmark TGFb genes used:", length(tgfb_genes), "\n")
+print(hallmark_overlap)
+write.csv(hallmark_overlap,
+          file.path(TABLES_DIR, "signature_overlap_Hallmark_vs_SC.csv"), row.names = FALSE)
+
+used_sigs <- lapply(subtype_gene_lists, function(g)
+  intersect(setdiff(unique(g), "DRAXIN"), rownames(expr)))
+used_sigs <- used_sigs[sapply(used_sigs, length) >= MIN_SIG_GENES]
+N_SIG_SCORED <- length(used_sigs)
+
+jaccard <- function(a, b) length(intersect(a, b)) / length(union(a, b))
+M <- outer(seq_along(used_sigs), seq_along(used_sigs),
+           Vectorize(function(i, j) jaccard(used_sigs[[i]], used_sigs[[j]])))
+dimnames(M) <- list(names(used_sigs), names(used_sigs))
+up <- M[upper.tri(M)]
+
+subtype_overlap <- data.frame(
+  n_signatures_scored = N_SIG_SCORED,
+  genes_per_signature = paste(range(sapply(used_sigs, length)), collapse = "-"),
+  jaccard_median      = round(median(up), 3),
+  jaccard_p90         = round(unname(quantile(up, 0.9)), 3),
+  jaccard_max         = round(max(up), 3),
+  pairs_above_0_1     = sum(up > 0.1),
+  n_pairs             = length(up))
+print(subtype_overlap)
+write.csv(subtype_overlap,
+          file.path(TABLES_DIR, "signature_overlap_subtypes_summary.csv"), row.names = FALSE)
+
+pairs_df <- as.data.frame(as.table(M), stringsAsFactors = FALSE)
+names(pairs_df) <- c("A", "B", "Jaccard")
+pairs_df <- pairs_df[pairs_df$A < pairs_df$B & pairs_df$Jaccard > 0, ]
+pairs_df <- pairs_df[order(-pairs_df$Jaccard), ]
+cat("\nMost overlapping signature pairs:\n"); print(head(pairs_df, 10), row.names = FALSE)
+write.csv(pairs_df,
+          file.path(TABLES_DIR, "signature_overlap_subtypes_pairwise.csv"), row.names = FALSE)
+```
+
+# 8. Signature-based correlations, run under every z-scoring scope
+
+One function, called once per scope. Figures and tables for each scope go to a
+subfolder named after it, so neither run overwrites the other.
+
+```{r}
+run_scope <- function(scope) {
+  tdir <- file.path(TABLES_DIR,  scope)
+  fdir <- file.path(FIGURES_DIR, scope)
+  dir.create(tdir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(fdir, recursive = TRUE, showWarnings = FALSE)
+  cat("\n================ z_scope =", scope, "================\n")
+
+  # The manuscript reports the primary scope (all_nerve_spots), quoting the
+  # within-section correlation. The second scope is a robustness check, so
+  # its figures carry a "robustness_" prefix rather than a figure number.
+  fig_name <- function(x) if (scope == PRIMARY_SCOPE) x else paste0("robustness_", x)
+
+  z_ta <- make_z_ta(expr, ta_idx, meta_ta, scope)
+  stopifnot(ncol(z_ta) == nrow(meta_ta))      # column order matches meta_ta rows
+  m <- meta_ta                                 # local copy; scores added positionally
+
+  # ---- Hallmark TGFb ------------------------------------------------------
+  m$TGFB_HALLMARK_score <- signature_score(tgfb_genes, z_ta, min_genes = MIN_HALLMARK)
+
+  ta_nerve <- m %>%
+    group_by(patient_id, sample_id, NerveID, nerve_types) %>%
+    summarise(DRAXIN_mean        = mean(DRAXIN_expr, na.rm = TRUE),
+              TGFB_HALLMARK_mean = mean(TGFB_HALLMARK_score, na.rm = TRUE),
+              mnTumor_mean       = mean(.data[[NMF_TUMOR_COL]], na.rm = TRUE),
+              n_spots            = dplyr::n(), .groups = "drop") %>%
+    filter(n_spots >= MIN_SPOTS) %>%
+    mutate(patient_id  = factor(patient_id),
+           nerve_types = factor(nerve_types, levels = names(plot_cfg$color_map)))
+
+  cs_tgfb <- cor_summary(ta_nerve, "TGFB_HALLMARK_mean")
+  cat("\nDRAXIN vs Hallmark TGFb, per tumour-associated nerve:\n")
+  print(cs_tgfb[, setdiff(names(cs_tgfb), "label")])
+  write.csv(cs_tgfb[, setdiff(names(cs_tgfb), "label")],
+            file.path(tdir, "DRAXIN_vs_Hallmark_TGFB_correlation.csv"), row.names = FALSE)
+
+  p_tgfb <- nerve_scatter(
+    ta_nerve, "TGFB_HALLMARK_mean",
+    "Mean MSigDB Hallmark TGFβ signalling score per tumour-associated nerve (z)",
+    cs_tgfb, plot_cfg, caption = hallmark_caption)
+  print(p_tgfb)
+  ggsave(file.path(fdir, fig_name("FigureS16C_DRAXIN_vs_Hallmark_TGFB.pdf")),
+         p_tgfb, width = 6.2, height = 4.6, units = "in", dpi = 600)
+
+  # ---- Three Schwann-cell subtype signatures -----------------------------
+  for (nm in names(sc_sigs_present))
+    m[[paste0(nm, "_score")]] <- signature_score(sc_sigs_present[[nm]], z_ta)
+
+  ta_nerve_sc <- m %>%
+    group_by(patient_id, sample_id, NerveID, nerve_types) %>%
+    summarise(DRAXIN_mean   = mean(DRAXIN_expr, na.rm = TRUE),
+              TGFBI_mean    = mean(TGFBI_score, na.rm = TRUE),
+              ABCA8_mean    = mean(ABCA8_score, na.rm = TRUE),
+              SERPINA3_mean = mean(SERPINA3_score, na.rm = TRUE),
+              n_spots       = dplyr::n(), .groups = "drop") %>%
+    filter(n_spots >= MIN_SPOTS) %>%
+    mutate(patient_id  = factor(patient_id),
+           nerve_types = factor(nerve_types, levels = names(plot_cfg$color_map)))
+
+  sc_cols <- c(TGFBI = "TGFBI_mean", ABCA8 = "ABCA8_mean", SERPINA3 = "SERPINA3_mean")
+  sc_cor_results <- lapply(names(sc_cols), function(nm)
+    cbind(Signature = nm, cor_summary(ta_nerve_sc, sc_cols[[nm]])))
+  names(sc_cor_results) <- names(sc_cols)
+
+  # BH correction across the three subtype correlations, both statistics.
+  sc_tab <- bind_rows(sc_cor_results)
+  sc_tab$padj        <- p.adjust(sc_tab$p,        method = "BH")
+  sc_tab$padj_within <- p.adjust(sc_tab$p_within, method = "BH")
+  cat("\nDRAXIN vs Schwann-cell subtype signatures (BH across the three):\n")
+  print(sc_tab[, c("Signature", "n_nerves", "rho", "p", "padj",
+                   "rho_within", "p_within", "padj_within", "patients_positive")])
+  write.csv(sc_tab[, setdiff(names(sc_tab), "label")],
+            file.path(tdir, "DRAXIN_vs_SC_subtype_correlations.csv"), row.names = FALSE)
+
+  sc_panels <- lapply(names(sc_cols), function(nm)
+    nerve_scatter(ta_nerve_sc, sc_cols[[nm]],
+                  paste0("Mean Schwann-", nm,
+                         " signature score\nper tumour-associated nerve (z)"),
+                  sc_cor_results[[nm]], plot_cfg, legend = "none"))
+  p_sc <- Reduce(`|`, sc_panels) + plot_layout(guides = "collect") &
+    theme(legend.position = "right")
+  print(p_sc)
+  ggsave(file.path(fdir, fig_name("Figure6D_DRAXIN_vs_SC_subtype_signatures.pdf")),
+         p_sc, width = 13, height = 4.6, units = "in", dpi = 600)
+
+  # ---- All refined subtypes ----------------------------------------------
+  cat("\nScoring", length(subtype_gene_lists), "refined subtypes (slow)...\n")
+  score_mat <- sapply(names(subtype_gene_lists), function(ct)
+    signature_score(subtype_gene_lists[[ct]], z_ta))
+  stopifnot(nrow(score_mat) == nrow(m))
+  sub_cols <- paste0("subtype_", colnames(score_mat))
+  for (k in seq_along(sub_cols)) m[[sub_cols[k]]] <- score_mat[, k]
+
+  ta_nerve_all <- m %>%
+    group_by(patient_id, sample_id, NerveID, nerve_types) %>%
+    summarise(DRAXIN_mean = mean(DRAXIN_expr, na.rm = TRUE),
+              across(all_of(sub_cols), ~ mean(.x, na.rm = TRUE)),
+              n_spots = dplyr::n(), .groups = "drop") %>%
+    filter(n_spots >= MIN_SPOTS)
+
+  all_cor <- bind_rows(lapply(colnames(score_mat), function(ct) {
+    col <- paste0("subtype_", ct)
+    if (all(is.na(ta_nerve_all[[col]]))) return(NULL)
+    cs <- cor_summary(ta_nerve_all, col)
+    data.frame(Subtype = ct, source_sheet = subtype_sheet[[ct]],
+               rho = cs$rho, p_value = cs$p,
+               rho_within_sample = cs$rho_within, p_within_sample = cs$p_within,
+               patients_positive = cs$patients_positive, n_nerves = cs$n_nerves)
+  }))
+  all_cor <- all_cor %>%
+    mutate(padj               = p.adjust(p_value,         method = "BH"),
+           padj_within_sample = p.adjust(p_within_sample, method = "BH"),
+           rank_pooled        = rank(-rho),
+           rank_within_sample = rank(-rho_within_sample),
+           is_schwann         = grepl("Schwann", Subtype)) %>%
+    arrange(desc(rho_within_sample))
+  cat("\nSubtypes scored:", nrow(all_cor),
+      "| top 10 by within-section rho:\n")
+  print(head(all_cor[, c("Subtype", "rho", "padj", "rho_within_sample",
+                         "padj_within_sample", "patients_positive")], 10),
+        row.names = FALSE)
+  cat("\nRanks of the Schwann-cell subtypes (within-section rho):\n")
+  print(all_cor[all_cor$is_schwann,
+                c("Subtype", "rho_within_sample", "padj_within_sample",
+                  "rank_within_sample")], row.names = FALSE)
+  write.csv(all_cor, file.path(tdir, "DRAXIN_vs_all_subtypes_correlation.csv"),
+            row.names = FALSE)
+
+  plot_df <- all_cor %>%
+    mutate(Subtype = factor(Subtype, levels = Subtype[order(rho_within_sample)]))
+  p_rank <- ggplot(plot_df, aes(rho_within_sample, Subtype, colour = is_schwann)) +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60") +
+    geom_point(size = 4) +
+    scale_colour_manual(values = c(`TRUE` = "#D55E00", `FALSE` = "grey50"), guide = "none") +
+    labs(x = "Spearman ρ, DRAXIN vs subtype signature (within section)", y = NULL,
+         title = paste0("DRAXIN correlation across ", nrow(all_cor),
+                        " refined Chen et al. subtypes"),
+         subtitle = paste0("Orange, Schwann-cell subtypes; z-scoring scope: ", scope)) +
+    theme_minimal(base_size = 14) +
+    theme(axis.text.y = element_text(size = 10), panel.grid.minor = element_blank())
+  print(p_rank)
+  ggsave(file.path(fdir, fig_name("FigureS16B_DRAXIN_all_subtype_correlation_ranked.pdf")),
+         p_rank, width = 10, height = 17.5, dpi = 600)
+
+  list(scope = scope, cs_tgfb = cs_tgfb, sc_tab = sc_tab, all_cor = all_cor,
+       ta_nerve = ta_nerve, ta_nerve_sc = ta_nerve_sc, ta_nerve_all = ta_nerve_all)
+}
+
+res <- lapply(SCOPES, run_scope)
+names(res) <- SCOPES
+```
+
+# 9. The two scopes side by side
+
+```{r}
+# ---- Hallmark and the three Schwann subtypes ------------------------------
+cmp_main <- bind_rows(lapply(SCOPES, function(s) {
+  h <- res[[s]]$cs_tgfb
+  bind_rows(
+    data.frame(z_scope = s, Comparison = "Hallmark TGFb",
+               rho = h$rho, p = h$p, padj = NA_real_,
+               rho_within = h$rho_within, p_within = h$p_within,
+               padj_within = NA_real_,
+               patients_positive = h$patients_positive, n_nerves = h$n_nerves),
+    data.frame(z_scope = s,
+               Comparison = paste0("Schwann-", res[[s]]$sc_tab$Signature),
+               rho = res[[s]]$sc_tab$rho, p = res[[s]]$sc_tab$p,
+               padj = res[[s]]$sc_tab$padj,
+               rho_within = res[[s]]$sc_tab$rho_within,
+               p_within = res[[s]]$sc_tab$p_within,
+               padj_within = res[[s]]$sc_tab$padj_within,
+               patients_positive = res[[s]]$sc_tab$patients_positive,
+               n_nerves = res[[s]]$sc_tab$n_nerves))
+}))
+cmp_main$primary_scope <- cmp_main$z_scope == PRIMARY_SCOPE
+print(cmp_main, row.names = FALSE)
+write.csv(cmp_main, file.path(TABLES_DIR, "comparison_Hallmark_and_SC_by_scope.csv"),
+          row.names = FALSE)
+
+# ---- All refined subtypes, one row per subtype ----------------------------
+cmp_sub <- Reduce(function(a, b) merge(a, b, by = c("Subtype", "source_sheet"), all = TRUE),
+  lapply(SCOPES, function(s) {
+    d <- res[[s]]$all_cor[, c("Subtype", "source_sheet", "rho", "padj",
+                              "rho_within_sample", "padj_within_sample",
+                              "rank_within_sample")]
+    names(d)[3:7] <- paste0(names(d)[3:7], "__", s)
+    d
+  }))
+cmp_sub <- cmp_sub[order(-cmp_sub[[paste0("rho_within_sample__", PRIMARY_SCOPE)]]), ]
+write.csv(cmp_sub, file.path(TABLES_DIR, "comparison_all_subtypes_by_scope.csv"),
+          row.names = FALSE)
+
+if (length(SCOPES) == 2) {
+  a <- cmp_sub[[paste0("rho_within_sample__", SCOPES[1])]]
+  b <- cmp_sub[[paste0("rho_within_sample__", SCOPES[2])]]
+  cat("\nAgreement between scopes, within-section rho across subtypes:",
+      "Spearman", round(cor(a, b, method = "spearman", use = "complete.obs"), 3),
+      "| Pearson", round(cor(a, b, use = "complete.obs"), 3), "\n")
+}
+cat("\nSchwann-cell subtypes under both scopes:\n")
+print(cmp_sub[grepl("Schwann", cmp_sub$Subtype), ], row.names = FALSE)
+
+cat("\nOutputs written to", file.path(PROJECT_DIR, "output", ANALYSIS_NAME), "\n")
+cat("Primary scope:", PRIMARY_SCOPE,
+    "| primary statistic: within-section rho (nerves are nested in patients)\n")
+sessionInfo()
+```

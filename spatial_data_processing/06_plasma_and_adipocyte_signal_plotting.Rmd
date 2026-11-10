@@ -1,0 +1,194 @@
+# Plasma cell and Adipocyte spatial signal maps
+
+#===================================================================
+# SCOPE NOTE: this script deliberately covers ONLY the two spatial
+# signal maps below (plasma cell RCTD signal, adipocyte NMF signal).
+# The DRAXIN/Schwann-program analysis these were originally embedded
+# in (08_Draxin_DE_analysis) is NOT going into the paper in its current
+# form and is intentionally left uncleaned in a trials/ folder -- only
+# the two plots that ARE being kept were extracted and cleaned here.
+#
+# BUGFIXES (this pass, from the original plasma cell script):
+#   - `W_nerve` was referenced but never defined anywhere in that
+#     script (undefined variable) -- should have been `W_df`.
+#   - The plasma cell column name appeared in three different WRONG
+#     spellings across that script (`B_cells_(Plasma cells)` with a
+#     space, `B_cells(Plasma cells)` missing an underscore) -- the
+#     actual column name, per RCTD_compute_cleaned.Rmd's renaming, is
+#     `B_cells_(Plasma_cells)` (underscores throughout). Fixed to use
+#     the correct name consistently.
+#
+# THIS SCRIPT ONLY GENERATES FIGURES -- reads RCTD_weights.Rds and the
+# frozen nerve identification columns; never recomputes either. Safe
+# to re-run as often as needed.
+#
+# WHAT THIS SCRIPT PRODUCES
+# --------------------------
+# Figures (output/13_plasma_and_adipocyte_signal/figures/):
+#   - FigureS7A_plasma_weight_rctd_with_nerve_borders.pdf
+#       Figure S7A. Continuous RCTD plasma-cell weight, with nerve hull
+#       outlines coloured by invasion status. A simple categorical
+#       version of the same map (Plasma-High vs Plasma-Low per spot)
+#       also existed; only this continuous version is kept.
+#   - FigureS6A_adipocyte_signal.png
+#       Figure S6A. Continuous adipocyte NMF programme signal, same
+#       nerve hull overlay style, clipped at the 1st/99th percentile
+#       for contrast.
+#===================================================================
+
+```{r}
+library(ggplot2)
+library(patchwork)
+library(SpatialExperiment)
+library(SummarizedExperiment)
+library(dplyr)
+library(tidyr)
+theme_set(theme_minimal(base_size=14))
+
+# ---- 0. Directory structure -------------------------------------------
+# Paths are relative to the project folder (the one containing input/).
+# Run from there, or from scripts/ -- this moves up one level if needed.
+if (basename(getwd()) == "scripts") setwd("..")
+if (!dir.exists("input"))
+  stop("Run this script from the project folder (the one containing input/).")
+
+PROJECT_DIR   <- "."
+INPUT_DIR     <- file.path(PROJECT_DIR, "input")
+
+ANALYSIS_NAME <- "06_plasma_and_adipocyte_signal"
+FIGURES_DIR   <- file.path(PROJECT_DIR, "output", ANALYSIS_NAME, "figures")
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+c25 <- c(
+  "dodgerblue2", "#E31A1C", "green4", "#6A3D9A", "#FF7F00",
+  "black", "gold1", "skyblue2", "#FB9A99", "palegreen2",
+  "#CAB2D6", "#FDBF6F", "gray70", "khaki2",
+  "maroon", "orchid1", "deeppink1", "blue1", "steelblue4",
+  "darkturquoise", "green1", "yellow4", "yellow3",
+  "darkorange4", "brown"
+)
+
+# ---- Frozen inputs: never recomputed here ------------------------------
+spe <- readRDS(file.path(INPUT_DIR, "Integrated_NMF.rds"))
+colData(spe) <- DataFrame(read.csv(file.path(INPUT_DIR, "DE_SPE_annotaion.csv")))
+colnames(spe) <- spe$barcode
+
+W_df <- readRDS(file.path(INPUT_DIR, "RCTD_weights.Rds"))
+
+# Adipocyte NMF signal
+comp <- as.matrix(t(reducedDims(spe)[["compk30"]]))
+spe$adipocytes <- comp["Adipocytes", ]
+
+sample_order <- c(
+  "54703bl38_noPNI", "6249bl23_noPNI", "70865bl5_noPNI",
+  "54703bl28_highPNI", "6249bl18_noPNIandhighPNI", "70865bl15_highPNI"
+)
+label_map <- c(
+  "54703bl38_noPNI" = "P1-Adjacent", "6249bl23_noPNI" = "P2-Adjacent",
+  "70865bl5_noPNI" = "P3-Adjacent", "54703bl28_highPNI" = "P1-Diseased",
+  "6249bl18_noPNIandhighPNI" = "P2-Diseased", "70865bl15_highPNI" = "P3-Diseased"
+)
+colData(spe)$sample_id <- factor(as.character(colData(spe)$sample_id), levels = sample_order)
+```
+
+## Nerve hulls (shared by plasma and adipocyte detail maps below)
+
+```{r}
+make_nerve_hulls <- function(dat) {
+  dat %>%
+    group_by(sample_id, NerveID, Invaded) %>%
+    filter(n() >= 3) %>%
+    slice(chull(x, y)) %>%
+    ungroup() %>%
+    mutate(group_id = interaction(sample_id, NerveID, drop = TRUE))
+}
+
+nerve_all <- as.data.frame(colData(spe)) %>%
+  filter(is.nerve == TRUE) %>%
+  transmute(
+    x = as.numeric(array_col),
+    y = -as.numeric(array_row),
+    sample_id = factor(as.character(sample_id), levels = sample_order),
+    NerveID = as.character(NerveID),
+    Invaded = as.character(Invaded)
+  ) %>%
+  filter(is.finite(x), is.finite(y), !is.na(sample_id), !is.na(NerveID), !is.na(Invaded))
+
+hulls_all <- make_nerve_hulls(nerve_all)
+hulls_inv <- hulls_all %>% filter(Invaded == "Invaded")
+hulls_non <- hulls_all %>% filter(Invaded == "NonInvaded")
+```
+
+## Plasma cell signal -- continuous RCTD weight with nerve hull outlines (Figure S7A)
+
+```{r}
+df_spots <- as.data.frame(colData(spe)) %>%
+  mutate(barcode = colnames(spe), x = array_col, y = -array_row) %>%
+  # BUGFIX: correct column name (see header note)
+  left_join(W_df %>% transmute(barcode, plasma_weight_rctd = `B_cells_(Plasma_cells)`), by = "barcode")
+
+clip_q <- c(0.01, 0.99)
+q_plasma <- quantile(df_spots$plasma_weight_rctd, probs = clip_q, na.rm = TRUE)
+df_spots <- df_spots %>%
+  mutate(plasma_for_plot = pmin(pmax(plasma_weight_rctd, q_plasma[1]), q_plasma[2]))
+
+p_plasma_hulls <- ggplot() +
+  geom_point(data = df_spots, aes(x = x, y = y, color = plasma_for_plot), size = 0.4) +
+  scale_color_viridis_c(name = "Plasma cell weight (RCTD)", option = "A", na.value = "grey85",
+                        limits = c(q_plasma[1], q_plasma[2]), oob = scales::squish) +
+  geom_polygon(data = hulls_non, inherit.aes = FALSE, aes(x = x, y = y, group = group_id),
+              fill = NA, linewidth = 0.3, color = "white") +
+  geom_polygon(data = hulls_inv, inherit.aes = FALSE, aes(x = x, y = y, group = group_id),
+              fill = NA, linewidth = 0.3, color = "white") +
+  geom_polygon(data = hulls_non, inherit.aes = FALSE, aes(x = x, y = y, group = group_id, linetype = "Uninvaded"),
+              fill = NA, linewidth = 0.7, color = "skyblue2") +
+  geom_polygon(data = hulls_inv, inherit.aes = FALSE, aes(x = x, y = y, group = group_id, linetype = "Invaded"),
+              fill = NA, linewidth = 0.7, color = "#E31A1C") +
+  scale_linetype_manual(name = "Nerve border", values = c("Uninvaded" = "solid", "Invaded" = "solid")) +
+  facet_wrap(~sample_id, labeller = as_labeller(label_map)) +
+  coord_fixed() +
+  theme_void()
+
+ggsave(file.path(FIGURES_DIR, "FigureS7A_plasma_weight_rctd_with_nerve_borders.pdf"), p_plasma_hulls,
+      width = 15, height = 10, dpi = 1200)
+p_plasma_hulls
+```
+
+## Adipocyte signal (NMF) with nerve hull outlines -- Figure S6A
+
+```{r}
+adipo_df <- as.data.frame(colData(spe)) %>%
+  transmute(
+    x = as.numeric(array_col), y = -as.numeric(array_row),
+    adipocytes = as.numeric(adipocytes),
+    sample_id = factor(as.character(sample_id), levels = sample_order)
+  ) %>%
+  filter(is.finite(x), is.finite(y), is.finite(adipocytes), !is.na(sample_id))
+
+q_adipo <- quantile(adipo_df$adipocytes, probs = clip_q, na.rm = TRUE)
+adipo_df <- adipo_df %>% mutate(adipo_plot = pmin(pmax(adipocytes, q_adipo[1]), q_adipo[2]))
+
+p_adipo_spatial_hulls <- ggplot() +
+  geom_point(data = adipo_df, aes(x = x, y = y, fill = adipo_plot),
+            pch = 21, size = 0.9, color = "transparent", stroke = 0, alpha = 1) +
+  geom_polygon(data = hulls_non, aes(x = x, y = y, group = group_id),
+              fill = NA, linewidth = 0, color = "white") +
+  geom_polygon(data = hulls_inv, aes(x = x, y = y, group = group_id),
+              fill = NA, linewidth = 0, color = "white") +
+  geom_polygon(data = hulls_non, aes(x = x, y = y, group = group_id, linetype = "Non-invaded"),
+              fill = NA, linewidth = 0.2, color = "skyblue2") +
+  geom_polygon(data = hulls_inv, aes(x = x, y = y, group = group_id, linetype = "Invaded"),
+              fill = NA, linewidth = 0.2, color = "khaki2") +
+  facet_wrap(~sample_id, labeller = as_labeller(label_map)) +
+  scale_fill_viridis_c(option = "A", name = "Adipocyte signal",
+                       limits = c(q_adipo[1], q_adipo[2]), oob = scales::squish) +
+  scale_linetype_manual(name = "Nerve border", values = c("Invaded" = "solid", "Non-invaded" = "solid")) +
+  guides(linetype = guide_legend(override.aes = list(linewidth = 1.2))) +
+  theme_void() +
+  theme(legend.position = "right", strip.text = element_text(size = 10, face = "bold"),
+        strip.background = element_blank())
+
+ggsave(file.path(FIGURES_DIR, "FigureS6A_adipocyte_signal.png"), p_adipo_spatial_hulls,
+      width = 12, height = 7, dpi = 600, bg = "white")
+p_adipo_spatial_hulls
+```

@@ -1,0 +1,279 @@
+```{r}
+#========================================================
+# LR pair ORA: ligand-receptor genes enriched at the tumour-nerve
+# interface, against a background of every gene tested across LIANA's
+# LR pairs. The query list is the Tier 1 genes from 01_LR_analysis.ipynb.
+#
+# No deduplication or similarity filtering: all significant terms are
+# saved as they are, and redundancy among nested or overlapping GO terms
+# is left for the reader to judge, as is usual for a supplementary
+# enrichment table.
+#
+# The script can be run on a different query list by changing
+# QUERY_GENES_FILE. TIER_LABEL is derived from that filename and appears
+# in every output name and cache path, so runs on different lists cannot
+# overwrite each other.
+#
+# WHAT THIS PRODUCES (filenames shown for TIER_LABEL = "tier1")
+# --------------------------------------------------------------
+# Tables (output/03_LR_interface_ORA/tables/):
+#   - LR_interface_ORA_FULL_tier1.csv
+#       Every significant ORA term, unfiltered and undeduplicated; the
+#       source table for the plots below.
+# Figures (output/03_LR_interface_ORA/figures/):
+#   - FigureS10D_LR_interface_enrichment_network_tier1.pdf
+#       Figure S10D. Term-term network, edges where the terms share
+#       driving genes (Jaccard > 0.1), top 40 terms by significance.
+#   - exploratory_LR_interface_dotplot_by_significance_tier1.pdf
+#       Top 25 terms by significance. NOT in the manuscript.
+#   - exploratory_LR_interface_dotplot_selected_terms_tier1.pdf
+#       Hand-picked terms, regardless of significance rank. NOT in the
+#       manuscript, and `selected_terms` below is a placeholder list.
+#
+# Anything named "exploratory_" is not in the manuscript.
+# ========================================================
+
+library(gprofiler2)
+library(dplyr)
+library(ggplot2)
+
+# plyr masks several dplyr functions with incompatible signatures --
+# pin the dplyr versions explicitly so this can't silently break again
+rename    <- dplyr::rename
+count     <- dplyr::count
+recode    <- dplyr::recode
+summarise <- dplyr::summarise
+mutate    <- dplyr::mutate
+
+# ---- 0. Directory structure -------------------------------------------
+# Paths are relative to the project folder (the one containing input/).
+# Run from there, or from scripts/ -- this moves up one level if needed.
+if (basename(getwd()) == "scripts") setwd("..")
+if (!dir.exists("input"))
+  stop("Run this script from the project folder (the one containing input/).")
+
+PROJECT_DIR   <- "."
+INPUT_DIR     <- file.path(PROJECT_DIR, "input")
+PROCESSED_DIR <- file.path(PROJECT_DIR, "processed")
+
+ANALYSIS_NAME <- "03_LR_interface_ORA"
+TABLES_DIR    <- file.path(PROJECT_DIR, "output", ANALYSIS_NAME, "tables")
+FIGURES_DIR   <- file.path(PROJECT_DIR, "output", ANALYSIS_NAME, "figures")
+dir.create(TABLES_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# ---- Which gene list is this run using? --------------------------------
+# The manuscript reports the ORA on the Tier 1 genes. TIER_LABEL is derived
+# from this filename and drives every output name and cache path below, so
+# a run on a different list cannot overwrite this one.
+QUERY_GENES_FILE <- "LR_query_genes_Tier1_FINAL.csv"   # Tier 2: "LR_query_genes_Tier2_FINAL.csv"
+
+TIER_LABEL <- regmatches(QUERY_GENES_FILE, regexpr("[Tt]ier[0-9]+", QUERY_GENES_FILE))
+if (length(TIER_LABEL) == 0 || TIER_LABEL == "") {
+  stop("Could not extract a Tier label (e.g. 'Tier1') from QUERY_GENES_FILE: ", QUERY_GENES_FILE,
+       " -- rename the file to include TierN, or set TIER_LABEL manually below.")
+}
+TIER_LABEL <- tolower(TIER_LABEL)   # -> "tier1", "tier2", etc., used in all filenames below
+cat("Running LR interface ORA for:", TIER_LABEL, "(", QUERY_GENES_FILE, ")\n\n")
+
+# Cache control -- gost() is an external g:Profiler API call; cache it so
+# downstream plotting chunks can be re-run without re-querying. Set to
+# TRUE to force a fresh query even if a cache exists. Cache path is
+# tier-specific, so switching QUERY_GENES_FILE above never loads a stale
+# cache from a different gene list.
+FORCE_RERUN_GOST <- FALSE
+GOST_CACHE <- file.path(PROCESSED_DIR, sprintf("lr_interface_gost_raw_%s.rds", TIER_LABEL))
+
+# NOTE: LR_background_genes.csv and the query gene lists are written by
+# 01_LR_analysis.ipynb. Copy them into input/ before running.
+```
+
+```{r}
+background_genes <- read.csv(file.path(INPUT_DIR, "LR_background_genes.csv"))$gene
+query_genes      <- read.csv(file.path(INPUT_DIR, QUERY_GENES_FILE))$gene
+
+cat("Background:", length(background_genes), "genes | Query:", length(query_genes), "genes\n")
+
+if (file.exists(GOST_CACHE) && !FORCE_RERUN_GOST) {
+  cat("Loading cached g:Profiler result from:", GOST_CACHE, "\n")
+  lr_ora <- readRDS(GOST_CACHE)
+} else {
+  cat("Querying g:Profiler live (set FORCE_RERUN_GOST <- TRUE to force this even if a cache exists)...\n")
+  lr_ora <- gost(query = query_genes,
+                organism = "hsapiens",
+                custom_bg = background_genes,
+                correction_method = "fdr",
+                evcodes = TRUE,
+                sources = c("GO:BP", "GO:MF", "GO:CC", "REAC", "KEGG"))
+  saveRDS(lr_ora, GOST_CACHE)
+  cat("Cached g:Profiler result to:", GOST_CACHE, "\n")
+}
+
+stopifnot(!is.null(lr_ora), nrow(lr_ora$result) > 0)
+cat("Significant terms:", nrow(lr_ora$result), "\n")
+```
+
+```{r}
+#========================================================
+# 1) Save the full, non-deduplicated ORA result: every significant term,
+# nothing collapsed or filtered.
+#========================================================
+lr_ora_full <- lr_ora$result %>%
+  dplyr::rename(driving_genes = intersection) %>%
+  dplyr::select(term_name, source, term_id, p_value, term_size, query_size,
+               intersection_size, driving_genes, everything(), -parents)
+
+LR_ORA_FULL_PATH <- file.path(TABLES_DIR, sprintf("LR_interface_ORA_FULL_%s.csv", TIER_LABEL))
+readr::write_csv(lr_ora_full, LR_ORA_FULL_PATH)
+cat("Saved:", nrow(lr_ora_full), "rows to", LR_ORA_FULL_PATH, "\n")
+```
+
+```{r}
+#========================================================
+# 2) Plot by significance -- top N terms, no deduplication, sorted by
+# p value. Not in the manuscript.
+#
+# Re-read from disk rather than reusing lr_ora_full from memory, so this
+# chunk and everything after it can be re-run on their own once the ORA
+# table exists.
+#========================================================
+lr_ora_full <- read.csv(LR_ORA_FULL_PATH)
+
+top_n <- 25
+
+plot_by_sig <- lr_ora_full %>%
+  arrange(p_value) %>%
+  head(top_n) %>%
+  mutate(
+    neglog10p = -log10(p_value),
+    term_specificity = intersection_size / term_size,
+    term_name = factor(term_name, levels = rev(term_name[order(p_value)]))
+  )
+
+ggplot(plot_by_sig, aes(x = neglog10p, y = term_name, size = term_specificity)) +
+  geom_point(color = "#2a78d6") +
+  scale_size_continuous(name = "Term specificity\n(intersection/term size)", range = c(2, 8)) +
+  labs(x = expression(-log[10](italic(p))), y = NULL,
+       title = "Enrichment at the tumour-nerve interface (LR pairs)",
+       subtitle = paste0("Top ", top_n, " terms by significance (unfiltered)")) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        axis.text.y = element_text(size = 9))
+
+ggsave(file.path(FIGURES_DIR, sprintf("exploratory_LR_interface_dotplot_by_significance_%s.pdf", TIER_LABEL)), width = 7, height = 8)
+```
+
+```{r}
+lr_ora_full %>%
+  filter(grepl("vascul", term_name, ignore.case = TRUE)) %>%
+  select(term_name, source, p_value, intersection_size) %>%
+  arrange(p_value)
+
+```
+
+```{r}
+library(igraph)
+library(ggraph)
+library(ggplot2)
+
+set.seed(1234)
+
+# ---- Tunable text/label sizes -----------------------------------------
+NODE_LABEL_SIZE <- 2.5     # was 2.5 -- increase for bigger node labels
+TITLE_SIZE <- 8
+SUBTITLE_SIZE <- 8
+LEGEND_TEXT_SIZE <- 6
+LEGEND_TITLE_SIZE <- 6
+
+top_n_network <- 40
+network_terms <- lr_ora_full %>% arrange(p_value) %>% head(top_n_network)
+
+term_gene_list <- network_terms %>%
+  select(term_name, driving_genes) %>%
+  mutate(genes = strsplit(driving_genes, ",")) %>%
+  { setNames(lapply(.$genes, trimws), .$term_name) }
+
+jaccard <- function(a, b) length(intersect(a, b)) / length(union(a, b))
+term_names <- names(term_gene_list)
+n <- length(term_names)
+edges <- data.frame()
+# seq_len(n - 1) rather than 1:(n - 1), so that n = 1 gives no iterations.
+if (n >= 2) {
+  for (i in seq_len(n - 1)) {
+    for (j in (i + 1):n) {
+      sim <- jaccard(term_gene_list[[i]], term_gene_list[[j]])
+      if (sim > 0.1) {
+        edges <- rbind(edges, data.frame(from = term_names[i], to = term_names[j], weight = sim))
+      }
+    }
+  }
+} else {
+  cat("Fewer than 2 terms in network_terms -- no edges to compute.\n")
+}
+
+nodes <- network_terms %>%
+  select(term_name, p_value, intersection_size, source) %>%
+  mutate(neglog10p = -log10(p_value))
+
+g <- graph_from_data_frame(edges, vertices = nodes, directed = FALSE)
+
+p_network <- ggraph(g, layout = "fr") +
+  geom_edge_link(aes(width = weight), color = "grey70", alpha = 0.6) +
+  geom_node_point(aes(size = intersection_size, color = neglog10p)) +
+  geom_node_text(aes(label = name), size = NODE_LABEL_SIZE, repel = TRUE, max.overlaps = 20) +
+  scale_edge_width(range = c(0.2, 2), name = "Gene overlap\n(Jaccard)") +
+  scale_size_continuous(name = "Genes in term", range = c(2, 10)) +
+  scale_color_viridis_c(name = expression(-log[10](italic(p)))) +
+  theme_void() +
+  theme(
+    plot.title = element_text(size = TITLE_SIZE, face = "bold"),
+    plot.subtitle = element_text(size = SUBTITLE_SIZE),
+    legend.text = element_text(size = LEGEND_TEXT_SIZE),
+    legend.title = element_text(size = LEGEND_TITLE_SIZE)
+  ) +
+  labs(title = "Enrichment network: tumour-nerve interface LR pairs",
+      subtitle = paste0("Top ", top_n_network, " terms; edges = shared driving genes"))
+
+print(p_network)
+ggsave(file.path(FIGURES_DIR, sprintf("FigureS10D_LR_interface_enrichment_network_%s.pdf", TIER_LABEL)),
+      p_network, width = 6, height = 4.5, dpi=600)
+```
+
+```{r}
+#========================================================
+# 3) Plot by hand-selected term names, regardless of significance rank.
+# Not in the manuscript; the list below is a placeholder.
+#========================================================
+selected_terms <- c(
+  # Placeholder list -- edit if this plot is ever used.
+  "vasculature development",
+  "nervous system development",
+  "cell motility",
+  "glial cell differentiation"
+)
+
+plot_by_selection <- lr_ora_full %>%
+  filter(term_name %in% selected_terms) %>%
+  mutate(
+    neglog10p = -log10(p_value),
+    term_specificity = intersection_size / term_size,
+    term_name = factor(term_name, levels = rev(term_name[order(p_value)]))
+  )
+
+missing_terms <- setdiff(selected_terms, lr_ora_full$term_name)
+if (length(missing_terms) > 0) {
+  cat("NOT FOUND in results -- check exact spelling:\n")
+  print(missing_terms)
+}
+
+ggplot(plot_by_selection, aes(x = neglog10p, y = term_name, size = term_specificity)) +
+  geom_point(color = "#eb6834") +
+  scale_size_continuous(name = "Term specificity\n(intersection/term size)", range = c(2, 8)) +
+  labs(x = expression(-log[10](italic(p))), y = NULL,
+       title = "Selected terms of interest at the tumour-nerve interface") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        axis.text.y = element_text(size = 9))
+
+ggsave(file.path(FIGURES_DIR, sprintf("exploratory_LR_interface_dotplot_selected_terms_%s.pdf", TIER_LABEL)), width = 7, height = 5)
+```

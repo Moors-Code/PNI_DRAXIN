@@ -1,234 +1,259 @@
+---
+title: "Perineurial p75NTR layer: annotation consensus, comparison and figure"
+output: html_document
+---
 
-Load libraries
-```{r}
+# Perineurial p75NTR⁺ layer in invaded vs non-invaded nerves
+
+Three annotators independently scored each nerve image for the presence of a
+surrounding p75NTR⁺ perineurial layer. A separate annotation assigned each nerve
+to invaded or non-invaded. The reported outcome is the majority vote of the three
+annotators.
+
+ANALYSIS SET
+  All annotated nerves are included. An earlier version of this analysis was
+  restricted to nerves for which none of the annotators had recorded a comment
+  (i.e. unambiguous cases). That restriction was checked and rejected: comments
+  were recorded far more often for invaded than for non-invaded nerves
+  (see "Check: is the comment-based exclusion balanced?" below), so excluding
+  commented nerves would have selected against ambiguous cases specifically in
+  the group of interest. The full set is therefore reported, and the restricted
+  set is retained only as a sensitivity analysis.
+
+UNIT OF ANALYSIS
+  All images derive from a single patient, so each nerve is treated as an
+  individual data point and no patient-level term is required.
+
+INPUTS
+  input/nerve_classification.xlsx   invaded / non-invaded call per image
+  input/nerve_annotator_1.xlsx      p75NTR layer: annotator 1 (image, label, comments)
+  input/nerve_annotator_2.xlsx      annotator 2
+  input/nerve_annotator_3.xlsx      annotator 3
+
+OUTPUTS
+  output/classification/consensus_per_nerve.csv
+  output/classification/contingency_tables.csv
+  output/classification/surrounding_p75ntr_line_plot.pdf / .png
+
+```{r setup, message=FALSE, warning=FALSE}
 suppressPackageStartupMessages({
-  #install.packages(tidyverse)
   library(tidyverse)
-  #install.packages(readxl)
   library(readxl)
-  #install.packages(writexl)
-  library(writexl)
-  #install.packages(readr)
-  library(readr)
   library(ggplot2)
+  library(scales)
+  library(irr)
 })
+
+IN_DIR  <- "input"
+OUT_DIR <- file.path("output", "classification")
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
 ```
 
-```{r}
-cancer_class_lisa <- read_excel("Cancer_labeling_Lisa.xlsx")
-cancer_class_ola_raw <- read_excel("Cancer_labeling_Ola.xlsx")
+## 1. Load annotations
 
-cancer_class_ola <- read_excel("Cancer_labeling_Ola.xlsx") |> select(c("image","label"))
- 
-mask <- !is.na(cancer_class_ola)
+```{r load}
+read_required <- function(file) {
+  path <- file.path(IN_DIR, file)
+  if (!file.exists(path)) stop("Input not found: ", path)
+  read_excel(path)
+}
 
-all.equal(cancer_class_lisa[mask],cancer_class_ola[mask])
+# Nerve-category annotation (invaded / non-invaded)
+cancer_class <- read_required("nerve_classification.xlsx")
 
+# Perineurial-layer annotation, three independent annotators
+nerve_class_1 <- read_required("nerve_annotator_1.xlsx")
+nerve_class_2 <- read_required("nerve_annotator_2.xlsx")
+nerve_class_3 <- read_required("nerve_annotator_3.xlsx")
 ```
 
-```{r}
-nerve_class_1 <- read_excel("Nerve_Only_labeling_Gabriela.xlsx")
-nerve_class_2 <- read_excel("Nerve_Only_labeling_Antonello.xlsx")
-nerve_class_3 <- read_excel("Nerve_Only_labeling_Elena.xlsx")
-```
+## 2. Merge and derive the consensus call
 
-```{r}
-# First, merge all three dataframes on 'image'
+```{r merge}
 merged <- Reduce(function(x, y) merge(x, y, by = "image", all = TRUE),
-                 list(
-                   nerve_class_1, nerve_class_2, nerve_class_3
-                 ))
+                 list(nerve_class_1, nerve_class_2, nerve_class_3))
+names(merged) <- c("image", "label_1", "comments_1",
+                   "label_2", "comments_2", "label_3", "comments_3")
 
-# merged will have: image, label.x, comments.x, label.y, comments.y, ...
+merged_all <- merge(merged, cancer_class[, c("image", "label")],
+                    by = "image", all.x = TRUE)
+colnames(merged_all)[colnames(merged_all) == "label"] <- "label_cancer"
 
-# Rename columns for clarity
-names(merged) <- c("image", "label_1", "comments_1", "label_2", "comments_2", "label_3", "comments_3")
-
-#Merge with the cancer annotation
-merged_all <- merge(merged, cancer_class_lisa[, c("image", "label")], by = "image", all.x = TRUE)
-colnames(merged_all)[8]<- "label_cancer"
-
-# Filter rows where all comments are NA
-filtered <- subset(merged_all, is.na(comments_1) & is.na(comments_2) & is.na(comments_3))
-
-# Keep only desired columns
-final_df <- filtered[, c("image", "label_1", "label_2", "label_3","label_cancer")]
-
-final_df_unfiltered <- merged_all[, c("image", "label_1", "label_2", "label_3","label_cancer")]
-
-names(final_df) <- c("image", "nerve_class_1", "nerve_class_2", "nerve_class_3", "cancer_class")
-names(final_df_unfiltered)<- c("image", "nerve_class_1", "nerve_class_2", "nerve_class_3", "cancer_class")
-
-```
-
-Find consensus
-```{r}
-# Function to calculate majority vote per row
+# Majority vote across the three annotators
 majority_vote <- function(x) {
   tab <- table(x)
   if (length(tab) == 0) return(NA)
   names(which.max(tab))
 }
 
-# Apply row-wise majority vote
-final_df$surrounding_line_consensus <- apply(final_df[, c("nerve_class_1", "nerve_class_2", "nerve_class_3")], 1, majority_vote)
+merged_all$consensus <- apply(
+  merged_all[, c("label_1", "label_2", "label_3")], 1, majority_vote)
 
+# Flag nerves for which any annotator left a comment (used only for the
+# exclusion check and the sensitivity analysis below)
+merged_all$any_comment <- !(is.na(merged_all$comments_1) &
+                            is.na(merged_all$comments_2) &
+                            is.na(merged_all$comments_3))
+
+analysis_df <- merged_all %>%
+  filter(!is.na(label_1), !is.na(label_2), !is.na(label_3)) %>%   # all three raters
+  filter(!is.na(label_cancer), !is.na(consensus)) %>%
+  transmute(
+    image,
+    any_comment,
+    cancer_class = factor(label_cancer,
+                          levels = c("Non Invaded Nerve", "Invaded Nerve"),
+                          labels = c("Non-invaded nerve", "Invaded nerve")),
+    line = factor(consensus,
+                  levels = c("Surrounding Line", "No Surrounding Line"),
+                  labels = c("Present", "Absent")))
+
+write_csv(analysis_df, file.path(OUT_DIR, "consensus_per_nerve.csv"))
+nrow(analysis_df)
 ```
 
-Same for unfiltered table
-```{r}
-# Function to calculate majority vote per row
-majority_vote <- function(x) {
-  tab <- table(x)
-  if (length(tab) == 0) return(NA)
-  names(which.max(tab))
+## 3. Inter-annotator agreement
+
+```{r kappa}
+# Report alongside the comparison: the outcome is a consensus call, so its
+# reliability belongs in the figure legend.
+kappa_all <- kappam.fleiss(merged_all[, c("label_1", "label_2", "label_3")])
+kappa_all
+
+kappa_df <- merged_all %>%
+  filter(image %in% analysis_df$image) %>%
+  select(label_1, label_2, label_3)
+kappa_analysed <- kappam.fleiss(kappa_df)
+kappa_analysed
+```
+
+## 4. Check: is the comment-based exclusion balanced?
+
+```{r exclusion-check}
+# If annotators flag doubts more often in one group, restricting the analysis
+# to uncommented nerves would bias the comparison. This is the test that
+# decided the analysis set.
+excl_tab <- table(analysis_df$cancer_class, analysis_df$any_comment)
+dimnames(excl_tab)[[2]] <- c("no comment", "comment")
+excl_tab
+round(100 * prop.table(excl_tab, 1), 1)
+excl_test <- fisher.test(excl_tab)
+excl_test
+```
+
+## 5. Primary comparison — all annotated nerves
+
+```{r primary}
+tab <- table(analysis_df$cancer_class, analysis_df$line)
+addmargins(tab)
+round(100 * prop.table(tab, 1), 1)   # % per nerve category
+
+ft <- fisher.test(tab)
+ft
+
+# Report proportions and the p value rather than the odds ratio: one cell is
+# near-empty, so the OR and its confidence interval are unstable.
+p_present <- prop.table(tab, 1)[, "Present"]
+cat(sprintf(
+  "Perineurial p75NTR+ layer present in %.1f%% of non-invaded (n = %d) and %.1f%% of invaded nerves (n = %d); Fisher's exact p = %.3g\n",
+  100 * p_present["Non-invaded nerve"], sum(tab["Non-invaded nerve", ]),
+  100 * p_present["Invaded nerve"],     sum(tab["Invaded nerve", ]),
+  ft$p.value))
+```
+
+## 6. Sensitivity analysis — unambiguous nerves only
+
+```{r sensitivity}
+# Restricted to nerves without annotator comments. Reported only to show that
+# the conclusion does not depend on the analysis set.
+tab_sens <- with(filter(analysis_df, !any_comment), table(cancer_class, line))
+tab_sens
+round(100 * prop.table(tab_sens, 1), 1)
+ft_sens <- fisher.test(tab_sens)
+ft_sens
+```
+
+```{r save-tables}
+# Both contingency tables in one file, for the supplement
+tab_to_df <- function(x, label) {
+  as.data.frame(x, stringsAsFactors = FALSE) %>%
+    setNames(c("cancer_class", "line", "n")) %>%
+    mutate(analysis = label)
 }
 
-# Apply row-wise majority vote
-final_df_unfiltered$surrounding_line_consensus <- apply(final_df_unfiltered[, c("nerve_class_1", "nerve_class_2", "nerve_class_3")], 1, majority_vote)
-
+bind_rows(
+  tab_to_df(tab,      "All annotated nerves"),
+  tab_to_df(tab_sens, "Without annotator comments")
+) %>%
+  relocate(analysis) %>%
+  write_csv(file.path(OUT_DIR, "contingency_tables.csv"))
 ```
 
+## 7. Figure
 
-```{r}
+```{r figure, fig.width=4.8, fig.height=4.2}
+# p value taken from the test above, so the figure cannot go out of date.
+# Below 0.001 it is written as a x 10^b, otherwise as a plain number.
+format_p <- function(p) {
+  if (is.na(p)) return("italic(p) == NA")
+  if (p >= 0.001) return(sprintf("italic(p) == %s", formatC(p, format = "fg", digits = 2)))
+  e <- floor(log10(p))
+  m <- signif(p / 10^e, 2)
+  sprintf("italic(p) == %s %%*%% 10^%d", m, e)
+}
 
-summary_df <- final_df %>%
-  group_by(cancer_class, surrounding_line_consensus) %>%
-  summarise(count = n(), .groups = "drop") %>%
-  group_by(cancer_class) %>%
-  mutate(proportion = count / sum(count))
+p_label <- format_p(ft$p.value)
 
-```
+plot_df <- analysis_df %>%
+  count(cancer_class, line, name = "count")
 
-```{r}
-summary_df_unfiltered <- final_df_unfiltered %>%
-  group_by(cancer_class, surrounding_line_consensus) %>%
-  summarise(count = n(), .groups = "drop") %>%
-  group_by(cancer_class) %>%
-  mutate(proportion = count / sum(count))
-
-```
-
-
-Measure Annotation Agreement:
-```{r}
-library(irr)
-
-# Fleiss' Kappa on surrounding line annotations
-kappa_data <- final_df[, c("nerve_class_1", "nerve_class_2", "nerve_class_3")]
-kappam.fleiss(kappa_data)
-```
-
-```{r}
-library(ggplot2)
-
-ggplot(summary_df, aes(x = cancer_class, y = proportion, fill = surrounding_line_consensus)) +
-  geom_bar(stat = "identity", position = "dodge") +
-  labs(
-    title = "Proportion of Nerves with/without Surrounding Line",
-    x = "Cancer Class",
-    y = "Proportion",
-    fill = "Surrounding Line"
-  ) +
-  theme_minimal()
-
-```
-
-```{r, whidth= 3, height = 10}
-ggplot(summary_df_unfiltered, aes(x = cancer_class, y = count, fill = surrounding_line_consensus)) +
-  geom_bar(stat = "identity", position = "fill") +  # fill = proportion
-  geom_text(aes(label = count),
-            position = position_fill(vjust = 0.5), size = 3, color = "black") +
-  labs(
-    title = "Proportion of Surrounding Line in Invaded vs Uninvaded Nerves",
-    x = "Cancer Class",
-    y = "Proportion",
-    fill = "Surrounding Line"
-  ) +
-  theme_minimal()
-
-```
-
-```{r}
-## Publication-ready plot with corrected labels
-
-library(ggplot2)
-library(dplyr)
-library(scales)
-
-summary_df_plot <- summary_df %>%
-  mutate(
-    cancer_class = factor(
-      cancer_class,
-      levels = c("Non Invaded Nerve", "Invaded Nerve"),
-      labels = c("Non-invaded nerve", "Invaded nerve")
-    ),
-    surrounding_line_consensus = factor(
-      surrounding_line_consensus,
-      levels = c("No Surrounding Line", "Surrounding Line"),
-      labels = c("Absent", "Present")
-    )
-  ) %>%
-  filter(!is.na(cancer_class), !is.na(surrounding_line_consensus))
-
-ggplot(
-  summary_df_plot,
-  aes(
-    x = cancer_class,
-    y = count,
-    fill = surrounding_line_consensus
-  )
-) +
-  geom_bar(
-    stat = "identity",
-    position = "fill",
-    width = 0.7,
-    colour = "black",
-    linewidth = 0.35
-  ) +
-  geom_text(
-    aes(label = count),
-    position = position_fill(vjust = 0.5),
-    size = 5,
-    colour = "black"
-  ) +
-  scale_y_continuous(
-    labels = function(x) x * 100,
-    breaks = seq(0, 1, 0.25),
-    expand = expansion(mult = c(0, 0.02))
-  ) +
-  scale_fill_manual(
-    values = c(
-      "Absent" = "lightblue",
-      "Present" = "orange"
-    )
-  ) +
-  labs(
-    x = NULL,
-    y = "Nerves [%]",
-    fill = "Surrounding\nP75NTR+ line"
-  ) +
+p <- ggplot(plot_df, aes(cancer_class, count, fill = line)) +
+  geom_bar(stat = "identity", position = "fill",
+           width = 0.7, colour = "black", linewidth = 0.35) +
+  geom_text(aes(label = count), position = position_fill(vjust = 0.5),
+            size = 5, colour = "black") +
+  scale_y_continuous(labels = function(x) x * 100,
+                     breaks = seq(0, 1, 0.25),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_manual(values = c("Absent" = "lightblue", "Present" = "orange")) +
+  labs(x = NULL, y = "Nerves [%]", fill = "Surrounding\np75NTR+ line") +
   theme_classic(base_size = 18) +
   theme(
     panel.background = element_rect(fill = "white", colour = NA),
-    plot.background = element_rect(fill = "white", colour = NA),
-    panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
+    plot.background  = element_rect(fill = "white", colour = NA),
+    panel.grid       = element_blank(),
     legend.background = element_rect(fill = "white", colour = NA),
-    legend.key = element_rect(fill = "white", colour = NA),
-    axis.text.x = element_text(size = 17, colour = "black"),
-    axis.text.y = element_text(size = 16, colour = "black"),
+    legend.key        = element_rect(fill = "white", colour = NA),
+    axis.text.x  = element_text(size = 17, colour = "black"),
+    axis.text.y  = element_text(size = 16, colour = "black"),
     axis.title.y = element_text(size = 18, colour = "black", margin = margin(r = 10)),
-    axis.line = element_line(linewidth = 0.8, colour = "black"),
-    axis.ticks = element_line(linewidth = 0.8, colour = "black"),
+    axis.line    = element_line(linewidth = 0.8, colour = "black"),
+    axis.ticks   = element_line(linewidth = 0.8, colour = "black"),
     legend.title = element_text(size = 15, colour = "black"),
-    legend.text = element_text(size = 15, colour = "black"),
+    legend.text  = element_text(size = 15, colour = "black"),
     legend.key.size = unit(0.7, "cm"),
-    plot.margin = margin(8, 8, 8, 8)
-  )
-```
-```{r}
-ggsave("surrounding_p75ntr_line_plot.pdf", width = 4.8, height = 4.2, bg = "white")
-ggsave("surrounding_p75ntr_line_plot.png", width = 4.8, height = 4.2, dpi = 300, bg = "white")
+    plot.margin  = margin(8, 8, 8, 8))
+
+p1 <- p +
+  annotate("segment", x = 1, xend = 2, y = 1.05, yend = 1.05, linewidth = 0.6) +
+  annotate("text", x = 1.5, y = 1.09, label = p_label, parse = TRUE, size = 4.5) +
+  coord_cartesian(ylim = c(0, 1.12), clip = "off")
+
+p1
+
+ggsave(file.path(OUT_DIR, "surrounding_p75ntr_line_plot.pdf"),
+       p1, width = 4.8, height = 4.2, bg = "white")
+ggsave(file.path(OUT_DIR, "surrounding_p75ntr_line_plot.png"),
+       p1, width = 4.8, height = 4.2, dpi = 300, bg = "white")
 ```
 
+```{r legend, results='asis'}
+cat(sprintf(
+  paste0("\n**Figure legend.** Presence of a surrounding p75NTR+ perineurial layer in ",
+         "non-invaded (n = %d) and invaded (n = %d) nerves of one patient. Each nerve was ",
+         "scored independently by three annotators; the reported call is their majority ",
+         "vote (Fleiss' kappa = %.2f). Numbers in the bars are nerve counts. ",
+         "Fisher's exact test, p = %.3g.\n"),
+  sum(tab["Non-invaded nerve", ]), sum(tab["Invaded nerve", ]),
+  kappa_analysed$value, ft$p.value))
+```

@@ -301,13 +301,29 @@ gse_cells_combined <- run_gsea_term2gene(
 # ------------------------------------------------------------
 # MSigDB collection analyses (ENTREZ-based)
 # ------------------------------------------------------------
-run_msigdb_collection <- function(category_name) {
-  log_message("Preparing MSigDB collection: ", category_name)
-  term2gene <- msigdbr(species = "Homo sapiens", category = category_name) %>%
-    dplyr::select(gs_name, entrez_gene)
-
+run_msigdb_collection <- function(collection_name) {
+  log_message("Preparing MSigDB collection: ", collection_name)
+  
+  m0 <- msigdbr(species = "Homo sapiens", collection = collection_name)
+  
+  # msigdbr renamed entrez_gene -> ncbi_gene in v10
+  entrez_col <- dplyr::case_when(
+    "entrez_gene" %in% names(m0) ~ "entrez_gene",
+    "ncbi_gene"   %in% names(m0) ~ "ncbi_gene",
+    TRUE ~ NA_character_
+  )
+  if (is.na(entrez_col)) {
+    stop("msigdbr output has no recognised Entrez column. Columns are:\n",
+         paste(names(m0), collapse = ", "))
+  }
+  
+  term2gene <- m0 %>%
+    dplyr::transmute(gs_name = gs_name, entrez_gene = as.character(.data[[entrez_col]])) %>%
+    dplyr::filter(!is.na(entrez_gene), entrez_gene != "") %>%
+    dplyr::distinct()
+  
   run_gsea_term2gene(
-    paste0("gse_msigdb_", category_name), ranks_entrez, term2gene,
+    paste0("gse_msigdb_", collection_name), ranks_entrez, term2gene,
     gene_id_type = "ENTREZID", make_readable = TRUE
   )
 }

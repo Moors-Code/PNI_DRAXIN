@@ -1,0 +1,319 @@
+```{r setup}
+#========================================================
+# Per-cell-type near-nerve screen, run SEPARATELY per nerve category
+#
+# WHAT THIS PRODUCES
+# --------------------
+# Tables (output/01_plasma_cells_supplement/tables/):
+#   - celltype_significance_by_group.csv
+#       Per cell type x nerve group: sham-corrected enrichment (each real
+#       nerve minus the mean of its OWN relocated replicates).
+#       PRIMARY (patient = replicate): effect = mean of patient means,
+#         patient-level paired t-test (patient_p), n_patients_positive,
+#         consistent_direction; padj = BH of patient_p.
+#       SENSITIVITY: nerve-level lm with patient as fixed block (nerve_p),
+#         nerve_padj = BH of nerve_p.
+#       TESTING FAMILY: each nerve group is a separate family (BH across the
+#         cell types within one nerve group only). The screen is exploratory;
+#         see the note printed with the results.
+#
+# Figures (output/01_plasma_cells_supplement/figures/):
+#   - celltype_standardized_all_groups_one_column.pdf
+#   - celltype_standardized_all_groups_three_columns.pdf
+#
+# REVISION (review):
+#   - Replaced the unpaired Wilcoxon test of all real nerves vs all sham
+#     replicates (sham count inflated 3x, pairing and patient ignored) with
+#     the same paired, patient-blocked test as step1.
+#   - Decay computed by the SAME shared function and SAME cached distance
+#     table as step1 (00_decay_shared.R): near <= 150 um, far 650-1000 um.
+#     A built-in check confirms the plasma row reproduces step1 exactly.
+#   - Group definitions come from the shared file.
+#   - The cache is invalidated automatically when the decay settings, cell
+#     types, upstream bundle, RCTD weights file or shared code change.
+#   - The plasma reproduction check is recomputed on every run (never read
+#     from the cache) and fails loudly on missing IDs or values.
+#
+# DEPENDS ON: 01_plasma_decay_analysis_step1.Rmd having been run (it saves
+# figure_bundle_for_real_vs_relocated.rds in processed/).
+#========================================================
+
+library(SpatialExperiment)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(tidytext)
+
+# ---- 0. Directory structure -------------------------------------------
+# Paths are relative to the project folder (the one containing input/).
+# Run from there, or from scripts/ -- this moves up one level if needed.
+if (basename(getwd()) == "scripts") setwd("..")
+if (!dir.exists("input"))
+  stop("Run this script from the project folder (the one containing input/).")
+
+PROJECT_DIR   <- "."
+INPUT_DIR     <- file.path(PROJECT_DIR, "input")
+PROCESSED_DIR <- file.path(PROJECT_DIR, "processed")
+
+ANALYSIS_NAME <- "01_plasma_cells_supplement"
+TABLES_DIR    <- file.path(PROJECT_DIR, "output", ANALYSIS_NAME, "tables")
+FIGURES_DIR   <- file.path(PROJECT_DIR, "output", ANALYSIS_NAME, "figures")
+dir.create(TABLES_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# ---- 0a. Shared code: zones, groups, decay, pairing, tests -------------
+# 00_decay_shared.R lives next to the scripts; the scripts/ folder is
+# checked first, then the project folder itself.
+SHARED_CANDIDATES <- file.path(c(file.path(PROJECT_DIR, "scripts"), file.path(PROJECT_DIR, "script"), PROJECT_DIR),
+                               "00_decay_shared.R")
+SHARED_PATH <- SHARED_CANDIDATES[file.exists(SHARED_CANDIDATES)][1]
+if (is.na(SHARED_PATH)) stop("00_decay_shared.R not found. Looked in:\n  ",
+                             paste(SHARED_CANDIDATES, collapse = "\n  "))
+source(SHARED_PATH)
+
+# Cache control -- set TRUE to force recomputation even if a valid cache exists
+FORCE_RECOMPUTE_SIGNIFICANCE <- FALSE
+SIGNIFICANCE_CACHE <- file.path(PROCESSED_DIR, "celltype_significance_by_group_paired.rds")
+
+# ---- 1. RCTD weights ---------------------------------------------------
+W_df <- readRDS(file.path(INPUT_DIR, "RCTD_weights.Rds"))
+
+color_mapping <- c(
+  "Acinar" = "gold1", "B_cells" = "maroon", "Lymphocyte(CD4)" = "green4",
+  "Lymphocytes" = "green4", "Myeloid(Macrophages)" = "#6A3D9A",
+  "Endothelial" = "#FF7F00", "Endocrine" = "yellow4", "Stellate" = "khaki2",
+  "CAF" = "skyblue2", "Adipocytes" = "steelblue4", "Lymphocyte(NK)" = "green2",
+  "Lymphocyte(CD8)" = "palegreen2", "Myeloid" = "#CAB2D6", "Schwann" = "#FDBF6F",
+  "Myeloid(C1q_macrophages)" = "#CAB2D6", "Nerve" = "#FDBF6F", "Muscle" = "orchid1",
+  "Ductal_malignant" = "gray70", "Ductal_normal" = "black",
+  "B_cells_(Plasma_cells)" = "brown1"
+)
+major_celltypes  <- intersect(names(color_mapping), colnames(W_df))
+celltypes_to_run <- setdiff(major_celltypes, "Nerve")
+PLASMA_COLUMN    <- "B_cells_(Plasma_cells)"
+cat("Cell types to screen (", length(celltypes_to_run), "):\n", sep = "")
+print(celltypes_to_run)
+
+# ---- 2. Bundle from step1 ----------------------------------------------
+BUNDLE_PATH <- file.path(PROCESSED_DIR, "figure_bundle_for_real_vs_relocated.rds")
+if (!file.exists(BUNDLE_PATH)) stop("Bundle not found: ", BUNDLE_PATH, "\nRun step1 first.")
+bundle <- readRDS(BUNDLE_PATH)
+check_bundle_settings(bundle)   # stops if the bundle predates / differs from 00_decay_shared.R
+
+per_nerve_dist_all <- bundle$per_nerve_dist_all
+per_shape_dist_all <- bundle$per_shape_dist_all
+sham_shapes_df     <- bundle$sham_shapes_df
+nerve_groups       <- bundle$nerve_groups
+cat("Bundle loaded:", nrow(nerve_groups), "nerves in the three groups,",
+    n_distinct(sham_shapes_df$ShamNerveID), "relocated replicates.\n")
+```
+
+```{r screen}
+# ---- 3. Main loop: every cell type x every nerve group ------------------
+# For each cell type: per-nerve decay (real) and per-replicate decay
+# (relocated), pair each nerve with the mean of its own replicates, then
+# within each nerve group:
+#   PRIMARY     (patient = replicate): effect = mean of patient means;
+#               patient_p = patient-level paired t-test, real vs own control;
+#               n_patients_positive / consistent_direction.
+#   SENSITIVITY nerve_p = nerve-level lm with patient as fixed block.
+# BH correction WITHIN each nerve group (each group is its own family):
+#   padj = BH(patient_p), nerve_padj = BH(nerve_p).
+
+# Cache key: anything that can change the results. File fingerprints are
+# size + modification time (cheap, also for large files); the shared code is
+# hashed, so editing the decay function invalidates the cache too.
+file_fingerprint <- function(f) {
+  i <- file.info(f)
+  if (is.na(i$size)) stop("File not found: ", f)
+  paste(i$size, format(as.numeric(i$mtime), digits = 15))
+}
+WEIGHTS_PATH <- file.path(INPUT_DIR, "RCTD_weights.Rds")
+cache_key <- list(settings      = DECAY_SETTINGS,
+                  celltypes     = celltypes_to_run,
+                  bundle_fp     = file_fingerprint(BUNDLE_PATH),
+                  weights_fp    = file_fingerprint(WEIGHTS_PATH),
+                  shared_code   = unname(tools::md5sum(SHARED_PATH)))
+
+cache_ok <- FALSE
+if (file.exists(SIGNIFICANCE_CACHE) && !FORCE_RECOMPUTE_SIGNIFICANCE) {
+  cached <- readRDS(SIGNIFICANCE_CACHE)
+  cache_ok <- is.list(cached) && identical(cached$key, cache_key)
+  if (cache_ok) {
+    cat("Loading cached results from:", SIGNIFICANCE_CACHE, "\n")
+    significance_df <- cached$significance_df
+  } else {
+    cat("Cache exists but an input changed (settings, cell types, bundle, RCTD weights or shared code) -- recomputing.\n")
+  }
+}
+
+if (!cache_ok) {
+  significance_results <- list()
+
+  for (ct in celltypes_to_run) {
+    cat("Processing:", ct, "\n")
+    score_vec <- setNames(W_df[[ct]], W_df$barcode)
+
+    real_ct   <- real_decay_table(per_nerve_dist_all, score_vec, nerve_groups)
+    sham_ct   <- sham_decay_table(per_shape_dist_all, score_vec, sham_shapes_df)
+    paired_ct <- pair_real_with_controls(real_ct, sham_ct)
+    pat_ct    <- summarise_by_patient(paired_ct)
+
+    for (g in group_levels) {
+      sub <- paired_ct %>% filter(Group == g)
+      pat <- pat_ct    %>% filter(Group == g)
+      if (nrow(sub) < 3) {
+        cat("  Skipped", ct, "-", g, "-- fewer than 3 paired nerves\n")
+        next
+      }
+      pt <- patient_paired_t(pat, "decay_magnitude", "sham_decay", paste(ct, short_labels[[g]]))
+      bt <- block_intercept_test(sub, "delta_decay")
+      n_pos <- sum(pat$delta_decay > 0)
+      significance_results[[paste(ct, g)]] <- data.frame(
+        CellType = ct, Group = g,
+        # primary: patient level
+        n_patients = pt$n_patients_paired,
+        mean_real_decay = mean(pat$decay_magnitude),   # mean of patient means
+        mean_sham_decay = mean(pat$sham_decay),
+        net_effect = pt$patient_mean_diff,              # mean of patient means of (real - own control)
+        n_patients_positive = n_pos,
+        consistent_direction = pt$n_patients_paired >= 2 && (n_pos == pt$n_patients_paired || n_pos == 0),
+        patient_t = pt$patient_t, patient_df = pt$patient_df, patient_p = pt$patient_p,
+        patient_note = pt$patient_note,
+        # sensitivity: nerve level, patient as fixed block
+        n_nerves = bt$n_nerves, nerve_estimate = bt$estimate, nerve_se = bt$se,
+        nerve_df = bt$df_resid, nerve_p = bt$p_value
+      )
+    }
+  }
+
+  significance_df <- bind_rows(significance_results) %>%
+    group_by(Group) %>%
+    mutate(padj       = p.adjust(patient_p, method = "BH"),    # primary
+           nerve_padj = p.adjust(nerve_p,   method = "BH")) %>% # sensitivity
+    ungroup() %>%
+    mutate(patient_significant = !is.na(padj)       & padj       < 0.05,   # primary
+           nerve_significant   = !is.na(nerve_padj) & nerve_padj < 0.05) %>% # sensitivity
+    # keep each adjusted p (and its call) next to the p it adjusts
+    dplyr::relocate(padj, patient_significant, .after = patient_p) %>%
+    dplyr::relocate(nerve_padj, nerve_significant, .after = nerve_p) %>%
+    arrange(Group, padj)
+
+  saveRDS(list(key = cache_key, significance_df = significance_df), SIGNIFICANCE_CACHE)
+  cat("Cached results to:", SIGNIFICANCE_CACHE, "\n")
+}
+
+# ---- 4. Plasma reproduction check (recomputed every run, never cached) ----
+# Same shared function on the same tables as step1, so the paired per-nerve
+# values must match step1's exactly: same nerve IDs, no missing values,
+# no differences.
+cat("\n=== Plasma cells: step3 vs step1 ===\n")
+if (!PLASMA_COLUMN %in% celltypes_to_run) {
+  warning("Plasma column not in the screen -- reproduction check not run.")
+} else {
+  plasma_vec    <- setNames(W_df[[PLASMA_COLUMN]], W_df$barcode)
+  paired_plasma <- pair_real_with_controls(
+    real_decay_table(per_nerve_dist_all, plasma_vec, nerve_groups),
+    sham_decay_table(per_shape_dist_all, plasma_vec, sham_shapes_df))
+  step1_ids <- as.character(bundle$paired_nerve$NerveID)
+  step3_ids <- as.character(paired_plasma$NerveID)
+  same_ids  <- setequal(step3_ids, step1_ids) && !anyDuplicated(step3_ids) && !anyDuplicated(step1_ids)
+  cmp <- inner_join(paired_plasma %>% transmute(NerveID = as.character(NerveID), step3 = delta_decay),
+                    bundle$paired_nerve %>% transmute(NerveID = as.character(NerveID), step1 = delta_decay),
+                    by = "NerveID")
+  diffs <- abs(cmp$step3 - cmp$step1)
+  max_abs_diff <- if (length(diffs) && all(is.finite(diffs))) max(diffs) else Inf
+
+  cat("Paired nerves -- step3:", length(step3_ids), "| step1:", length(step1_ids),
+      "| matched:", nrow(cmp), "| same ID sets:", same_ids,
+      "| max |difference| in sham-corrected decay:", signif(max_abs_diff, 3), "\n")
+  if (!same_ids || nrow(cmp) != length(step1_ids) || max_abs_diff > 1e-10)
+    stop("Plasma row does NOT reproduce step1 (IDs differ, values missing, or values differ). ",
+         "Re-run step1, then rerun this script.")
+  cat("OK -- plasma entry reproduces step1 exactly.\n")
+}
+
+# ---- 5. Report ----------------------------------------------------------
+cat("\n=== Per-cell-type results, WITHIN each nerve group ===\n")
+cat("PRIMARY: net_effect (mean of patient means), patient_p (paired t, df = n_patients - 1),\n")
+cat("  padj = BH of patient_p within the nerve group; n_patients_positive / consistent_direction.\n")
+cat("SENSITIVITY: nerve_p (lm, patient as fixed block), nerve_padj = BH of nerve_p within the nerve group.\n")
+cat("TESTING FAMILY: each nerve group separately; the cell-type screen is exploratory.\n")
+cat("With few patients, read effect sizes and patient consistency first, p-values second.\n")
+for (g in group_levels) {
+  cat("\n---", g, "---\n")
+  print(significance_df %>% filter(Group == g) %>%
+          select(CellType, n_patients, net_effect, n_patients_positive, consistent_direction,
+                 patient_p, padj, n_nerves, nerve_p, nerve_padj), digits = 3, row.names = FALSE)
+}
+notes <- significance_df %>% filter(patient_note != "")
+if (nrow(notes) > 0) { cat("\nNOTE -- patient-level test not computed for:\n"); print(notes %>% select(CellType, Group, patient_note)) }
+
+# patient_note is only filled when a patient-level test could not be computed;
+# drop it from the saved table when it is empty for every row
+significance_out <- if (all(significance_df$patient_note == "")) dplyr::select(significance_df, -patient_note) else significance_df
+write.csv(significance_out, file.path(TABLES_DIR, "celltype_significance_by_group.csv"), row.names = FALSE)
+cat("\nSaved:", file.path(TABLES_DIR, "celltype_significance_by_group.csv"), "\n")
+```
+
+```{r figures}
+#========================================================
+# Standardized cell-type specificity screen, all three nerve categories
+#   standardized effect = sham-corrected enrichment / SD of that cell type
+#   across all spots (same standardisation as step1's effect_std)
+#   filled point = same direction in every patient; large = padj < 0.05
+#   (patient-level paired test, BH within nerve category)
+#========================================================
+celltype_overall_sd <- sapply(celltypes_to_run, function(ct) sd(W_df[[ct]], na.rm = TRUE))
+
+facet_order <- c("Non-invaded nerves (Adjacent)", "Non-invaded nerves (Diseased)", "Invaded nerves (Diseased)")
+
+plot_df_summary_all <- significance_df %>%
+  left_join(data.frame(CellType = names(celltype_overall_sd), overall_sd = celltype_overall_sd), by = "CellType") %>%
+  mutate(
+    standardized_effect = net_effect / overall_sd,
+    direction = ifelse(net_effect > 0, "Enriched", "Depleted"),
+    highlight = case_when(
+      CellType == PLASMA_COLUMN ~ "Plasma cells",
+      CellType == "Schwann"     ~ "Schwann (positive control)",
+      TRUE                      ~ "Other"
+    ),
+    Group = factor(Group, levels = facet_order),
+    consistency = ifelse(consistent_direction, "Same direction in all patients", "Not consistent across patients"),
+    # per-facet ordering (a plain factor cannot hold a different order per group)
+    CellType_ordered = reorder_within(CellType, standardized_effect, Group)
+  )
+
+screen_plot <- function(ncol) {
+  ggplot(plot_df_summary_all, aes(x = standardized_effect, y = CellType_ordered, color = highlight)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey60") +
+    geom_point(aes(size = patient_significant, shape = consistency), stroke = 1) +
+    scale_color_manual(values = c("Plasma cells" = "#D55E00", "Schwann (positive control)" = "#009E73", "Other" = "grey50")) +
+    scale_shape_manual(values = c("Same direction in all patients" = 16, "Not consistent across patients" = 1)) +
+    scale_size_manual(values = c(`TRUE` = 5, `FALSE` = 3), guide = "none") +
+    scale_y_reordered() +
+    facet_wrap(~ Group, scales = "free_y", ncol = ncol) +
+    labs(x = "Standardized near-nerve effect (sham-corrected enrichment / cell-type SD)", y = NULL,
+         color = NULL, shape = NULL, title = "Cell-type specificity screen, all nerve categories (exploratory)",
+         caption = paste0("Effect = mean of patient means of (real nerve - own relocated control).\n",
+                          "Filled: same direction in every patient. Large: BH-adjusted patient-level\n",
+                          "paired p < 0.05 within nerve category.")) +
+    guides(color = guide_legend(nrow = 1, order = 1), shape = guide_legend(nrow = 1, order = 2)) +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid.minor = element_blank(), legend.position = "bottom", legend.box = "vertical",
+          plot.caption = element_text(hjust = 0), strip.text = element_text(face = "bold"))
+}
+
+p_summary_all1 <- screen_plot(ncol = 1)
+print(p_summary_all1)
+ggsave(file.path(FIGURES_DIR, "celltype_standardized_all_groups_one_column.pdf"),
+       p_summary_all1, width = 8, height = 14, dpi = 600, device = pdf_device)
+
+p_summary_all <- screen_plot(ncol = 3)
+print(p_summary_all)
+ggsave(file.path(FIGURES_DIR, "celltype_standardized_all_groups_three_columns.pdf"),
+       p_summary_all, width = 30, height = 7.5, dpi = 600, device = pdf_device)
+
+cat("\nSaved:", file.path(FIGURES_DIR, "celltype_standardized_all_groups_one_column.pdf"), "\n")
+cat("Saved:", file.path(FIGURES_DIR, "celltype_standardized_all_groups_three_columns.pdf"), "\n")
+```

@@ -1,0 +1,342 @@
+```{r}
+#===================================================================
+# Export nerve annotation CSV + labeled overview images
+#===================================================================
+# Rather than fully automating pixel-perfect crops (blocked by
+# coordinate-system mismatches across available image sources -- see
+# chat history), this script:
+#   1) Writes one CSV row per nerve with its ID, sample, invasion
+#      status, spot count, and centroid coordinates (in BOTH this
+#      object's native pxl_*_in_fullres units AND the embedded hires
+#      image's pixel units, since the latter is what you'll visually
+#      match against when cropping from a bigger image).
+#   2) Saves one full-tissue overview PNG per sample, with each
+#      nerve's ID printed directly at its location on the H&E +
+#      Area-colored spots -- so you can visually locate it on
+#      whichever higher-resolution image you trust and crop manually.
+#   3) Saves horizontally-mirrored versions of every overview (with
+#      and without NerveID labels), for visually matching against a
+#      raw TIFF that may be stored in a flipped orientation.
+#
+# WHAT THIS PRODUCES
+# --------------------
+# Tables (output/09_pathologist_annotation_export/tables/):
+#   - nerve_annotations.csv
+#       One row per nerve: ID, sample, patient, invasion status, spot
+#       count, and centroid/bounding-box coordinates in both native
+#       full-res pixel units and the embedded hires image's units.
+# Figures (output/09_pathologist_annotation_export/figures/):
+#   - nerve_overview_<sample_id>.png
+#       One per sample: H&E + Area-colored spots, NerveID labeled at
+#       each nerve's location.
+#   figures/flipped/:
+#   - nerve_overview_<sample_id>_mirrored.png
+#       Same, horizontally mirrored, WITH NerveID labels.
+#   - nerve_overview_<sample_id>_mirrored_nolabels.png
+#       Same, horizontally mirrored, WITHOUT labels (cleaner for visual
+#       matching against a raw TIFF).
+#
+# BUGFIX (this pass): the original script reassigned `out_fig_dir`
+# partway through (from "pathologist/figures" to
+# "pathologist/figures/flipped") but never created that second
+# directory -- ggsave() into it would have failed with "cannot open
+# file". Now uses two distinct, both-created variables
+# (FIGURES_DIR / FIGURES_DIR_FLIPPED) instead of reusing one name for
+# two different folders.
+#===================================================================
+
+library(SpatialExperiment)
+library(dplyr)
+library(ggspavis)
+library(ggplot2)
+library(ggrepel)
+
+# ---- 0. Directory structure -------------------------------------------
+# Paths are relative to the project folder (the one containing input/).
+# Run from there, or from scripts/ -- this moves up one level if needed.
+if (basename(getwd()) == "scripts") setwd("..")
+if (!dir.exists("input"))
+  stop("Run this script from the project folder (the one containing input/).")
+
+PROJECT_DIR   <- "."
+INPUT_DIR     <- file.path(PROJECT_DIR, "input")
+
+ANALYSIS_NAME <- "07_pathologist_annotation_export"
+TABLES_DIR    <- file.path(PROJECT_DIR, "output", ANALYSIS_NAME, "tables")
+FIGURES_DIR   <- file.path(PROJECT_DIR, "output", ANALYSIS_NAME, "figures")
+FIGURES_DIR_FLIPPED <- file.path(FIGURES_DIR, "flipped")
+dir.create(TABLES_DIR,          recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR,         recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR_FLIPPED, recursive = TRUE, showWarnings = FALSE)
+
+out_csv <- file.path(TABLES_DIR, "nerve_annotations.csv")
+```
+
+```{r}
+#   Masked by S4Vectors/IRanges/BiocGenerics (Bioconductor):
+first     <- dplyr::first
+rename    <- dplyr::rename
+union     <- dplyr::union
+intersect <- dplyr::intersect
+setdiff   <- dplyr::setdiff
+#   Masked by base R packages (stats) -- classic, unrelated to
+#   Bioconductor, but worth pinning defensively in the same place:
+filter    <- dplyr::filter
+lag       <- dplyr::lag
+#   Not currently conflicting here, but pinned as standard practice
+#   across this project's scripts (see e.g. gene_containment_setup_
+#   cleaned.R), since plyr masks these with incompatible signatures if
+#   it's ever loaded later in the same session:
+count     <- dplyr::count
+summarise <- dplyr::summarise
+summarize <- dplyr::summarize
+mutate    <- dplyr::mutate
+arrange   <- dplyr::arrange
+select    <- dplyr::select
+slice     <- dplyr::slice
+pull      <- dplyr::pull
+distinct  <- dplyr::distinct
+group_by  <- dplyr::group_by
+```
+
+
+
+```{r}
+# Load integrated spatial object
+spe <- readRDS(file.path(INPUT_DIR, "Integrated_NMF.rds"))
+
+# Load accompanying metadata
+colData(spe) <- DataFrame(read.csv(file.path(INPUT_DIR, "DE_SPE_annotaion.csv")))
+
+# Ensure column names match barcodes
+colnames(spe) <- spe$barcode
+```
+
+```{r}
+#-------------------------------------------------------------------
+# 1. Build per-nerve summary table (centroid + metadata)
+#-------------------------------------------------------------------
+
+sc <- as.data.frame(spatialCoords(spe))
+meta_cols <- as.data.frame(colData(spe))[, c("sample_id", "NerveID", "Invaded",
+                                              "patient_id", "context")]
+nerve_df <- cbind(sc, meta_cols) %>% filter(!is.na(NerveID))
+
+sf_table <- as.data.frame(imgData(spe))[, c("sample_id", "scaleFactor")]
+
+nerve_summary <- nerve_df %>%
+  group_by(sample_id, NerveID) %>%
+  summarise(
+    n_spots       = n(),
+    invaded_vals  = paste(sort(unique(Invaded)), collapse = "|"),
+    patient_id    = first(patient_id),
+    context       = first(context),
+    col_centroid_full = mean(pxl_col_in_fullres, na.rm = TRUE),
+    row_centroid_full = mean(pxl_row_in_fullres, na.rm = TRUE),
+    col_min_full  = min(pxl_col_in_fullres, na.rm = TRUE),
+    col_max_full  = max(pxl_col_in_fullres, na.rm = TRUE),
+    row_min_full  = min(pxl_row_in_fullres, na.rm = TRUE),
+    row_max_full  = max(pxl_row_in_fullres, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(sf_table, by = "sample_id") %>%
+  mutate(
+    Invaded_label = case_when(
+      invaded_vals == "Invaded"    ~ "Invaded",
+      invaded_vals == "NonInvaded" ~ "NonInvaded",
+      TRUE ~ paste0("AMBIGUOUS:", invaded_vals)
+    ),
+    # centroid + bbox in the embedded hires-image's own pixel units --
+    # useful for visually matching this location on a bigger image
+    col_centroid_img = col_centroid_full * scaleFactor,
+    row_centroid_img = row_centroid_full * scaleFactor,
+    col_min_img = col_min_full * scaleFactor,
+    col_max_img = col_max_full * scaleFactor,
+    row_min_img = row_min_full * scaleFactor,
+    row_max_img = row_max_full * scaleFactor
+  ) %>%
+  select(-invaded_vals) %>%
+  mutate(
+    UniqueNerveID = paste0(sample_id, "_Nerve", NerveID)   
+  ) %>%
+  relocate(UniqueNerveID, .before = sample_id)
+
+if (any(grepl("AMBIGUOUS", nerve_summary$Invaded_label))) {
+  warning("Some NerveIDs mix Invaded and NonInvaded spots — check before trusting labels:\n",
+          paste(nerve_summary$NerveID[grepl("AMBIGUOUS", nerve_summary$Invaded_label)], collapse = ", "))
+}
+
+write.csv(nerve_summary, out_csv, row.names = FALSE, quote = FALSE)
+message("Wrote ", nrow(nerve_summary), " nerve records to ", out_csv)
+
+#-------------------------------------------------------------------
+# 2. Labeled overview plot per sample (H&E + Area + NerveID labels)
+#-------------------------------------------------------------------
+
+for (s in unique(spe$sample_id)) {
+
+  spe_s <- spe[, spe$sample_id == s & spe$Area != "other"]
+  if (ncol(spe_s) == 0) next   # sample has no annotated Area spots
+
+  p <- plotVisium(
+    spe_s,
+    x_coord = "pxl_col_in_fullres",
+    y_coord = "pxl_row_in_fullres",
+    spots = TRUE,
+    image = TRUE,
+    fill = "Area",
+    y_reverse = TRUE
+  ) +
+    scale_fill_manual(
+      values = c(
+        "InvadedNerve"  = "#1f77b4",
+        "Nerve"         = "#2ca02c",
+        "TumorDistal"   = "#ff7f0e",
+        "TumorProximal" = "#d62728"
+      ),
+      labels = c(
+        "InvadedNerve"  = "Invaded Nerve",
+        "Nerve"         = "Non-invaded Nerve",
+        "TumorDistal"   = "Tumor Distal",
+        "TumorProximal" = "Tumor Proximal"
+      )
+    ) +
+    theme_void() +
+    theme(legend.position = "bottom", legend.direction = "horizontal") +
+    ggtitle(s)
+
+  if (ncol(spe_s) > 0) {
+    built <- ggplot_build(p)
+    pt_layer_idx <- which(sapply(p$layers, function(l) inherits(l$geom, "GeomPoint")))[1]
+    pt_data <- built$data[[pt_layer_idx]]
+
+    meta_s <- as.data.frame(colData(spe_s))
+    stopifnot(nrow(pt_data) == nrow(meta_s))   # must match row-for-row to trust this join
+    pt_data$NerveID <- meta_s$NerveID
+
+    label_df <- pt_data %>%
+      filter(!is.na(NerveID)) %>%
+      group_by(NerveID) %>%
+      summarise(x = mean(x), y = mean(y), .groups = "drop")
+
+    if (nrow(label_df) > 0) {
+      p <- p + geom_label(
+        data = label_df,
+        aes(x = x, y = y, label = NerveID),
+        inherit.aes = FALSE,
+        size = 5, fontface = "bold",
+        color = "black", fill = "white",
+        label.padding = unit(0.2, "lines"),
+        label.r = unit(0.1, "lines"),
+        alpha = 0.9
+      )
+    }
+  }
+
+  out_path <- file.path(FIGURES_DIR, paste0("nerve_overview_", s, ".png"))
+  ggsave(out_path, p, width = 16, height = 16, dpi = 300)
+  message("Saved ", out_path)
+}
+```
+
+```{r}
+#-------------------------------------------------------------------
+# Helper: build an overview plot for one sample, with optional
+# horizontal/vertical flip of the tissue image (points + labels are
+# recomputed to match, and stay upright).
+#-------------------------------------------------------------------
+
+plot_sample_flipped <- function(sample_id_val, flip_horizontal = FALSE, flip_vertical = FALSE,
+                                 show_labels = TRUE) {
+  img <- imgRaster(spe, sample_id = sample_id_val, image_id = "hires")
+  n_row <- dim(img)[1]; n_col <- dim(img)[2]
+  img_disp <- img
+  if (flip_horizontal) img_disp <- img_disp[, n_col:1]
+  if (flip_vertical)   img_disp <- img_disp[n_row:1, ]
+  sf <- imgData(spe)$scaleFactor[imgData(spe)$sample_id == sample_id_val]
+  spe_s <- spe[, spe$sample_id == sample_id_val & spe$Area != "other"]
+  sc_s <- as.data.frame(spatialCoords(spe_s))
+  meta_s <- as.data.frame(colData(spe_s))
+  spots_df <- data.frame(
+    col_img = sc_s$pxl_col_in_fullres * sf,
+    row_img = sc_s$pxl_row_in_fullres * sf,
+    Area = meta_s$Area,
+    NerveID = meta_s$NerveID
+  )
+  spots_df <- spots_df %>%
+    mutate(
+      x_plot = if (flip_horizontal) (n_col - col_img) else col_img,
+      y_plot = if (flip_vertical)   row_img            else (n_row - row_img)
+    )
+  label_df <- spots_df %>%
+    filter(!is.na(NerveID)) %>%
+    group_by(NerveID) %>%
+    summarise(x_plot = mean(x_plot), y_plot = mean(y_plot), .groups = "drop")
+  p <- ggplot() +
+    annotation_raster(img_disp, xmin = 0, xmax = n_col, ymin = 0, ymax = n_row) +
+    geom_point(data = spots_df, aes(x = x_plot, y = y_plot, color = Area), size = 1.2) +
+    scale_color_manual(
+      values = c(
+        "InvadedNerve"  = "#1f77b4",
+        "Nerve"         = "#2ca02c",
+        "TumorDistal"   = "#ff7f0e",
+        "TumorProximal" = "#d62728"
+      )
+    ) +
+    coord_fixed(xlim = c(0, n_col), ylim = c(0, n_row), expand = FALSE) +
+    theme_void() +
+    theme(legend.position = "bottom") +
+    ggtitle(paste0(sample_id_val,
+                   if (flip_horizontal) " [flipped horizontally]" else "",
+                   if (flip_vertical)   " [flipped vertically]"   else ""))
+  if (show_labels && nrow(label_df) > 0) {
+    p <- p + geom_label(
+      data = label_df,
+      aes(x = x_plot, y = y_plot, label = NerveID),
+      inherit.aes = FALSE,
+      size = 5, fontface = "bold",
+      color = "black", fill = "white",
+      label.padding = unit(0.2, "lines"),
+      alpha = 0.9
+    )
+  }
+  p
+}
+```
+
+```{r}
+#-------------------------------------------------------------------
+# Generate the mirrored overview for EVERY sample (WITH labels), so
+# you can visually match each one against its corresponding raw TIFF
+# and confirm whether this orientation actually lines up.
+#-------------------------------------------------------------------
+
+for (s in unique(spe$sample_id)) {
+
+  spe_check <- spe[, spe$sample_id == s & spe$Area != "other"]
+  if (ncol(spe_check) == 0) next   # sample has no annotated Area spots
+
+  p <- plot_sample_flipped(s, flip_horizontal = TRUE, flip_vertical = FALSE)
+
+  out_path <- file.path(FIGURES_DIR_FLIPPED, sprintf("nerve_overview_%s_mirrored.png", s))
+  ggsave(out_path, p, width = 14, height = 14, dpi = 250)
+  message("Saved ", out_path)
+}
+```
+
+```{r}
+#-------------------------------------------------------------------
+# Same mirrored overviews, WITHOUT labels -- cleaner for visual
+# matching against a raw TIFF where the printed NerveID text would
+# just be visual clutter.
+#-------------------------------------------------------------------
+for (s in unique(spe$sample_id)) {
+  spe_check <- spe[, spe$sample_id == s & spe$Area != "other"]
+  if (ncol(spe_check) == 0) next
+
+  p_nolabel <- plot_sample_flipped(s, flip_horizontal = TRUE, flip_vertical = FALSE, show_labels = FALSE)
+  out_path <- file.path(FIGURES_DIR_FLIPPED, sprintf("nerve_overview_%s_mirrored_nolabels.png", s))
+  ggsave(out_path, p_nolabel, width = 14, height = 14, dpi = 250)
+  message("Saved ", out_path)
+}
+```

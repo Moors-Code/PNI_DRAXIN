@@ -1,0 +1,723 @@
+```{r setup}
+# ======================================================================
+# 01_plasma_decay_analysis_step1.Rmd
+#
+# RCTD plasma-cell proportion vs. distance from nerve, three groups,
+# with shape-matched relocation sham comparator and per-nerve decay test.
+#
+# um_per_pixel loaded from the empirically calibrated value
+# (um_per_pixel_CALIBRATED.rds), replacing the original, incorrect hardcoded
+# PIXELS_PER_100UM = 46. See 00_scale_um_pixel_calibration.R.
+#
+# REVISION 1 (pseudoreplication):
+#   - The 3 sham replicates per nerve are averaged into ONE geometry-matched
+#     control per real nerve; each nerve is compared with its OWN control.
+#   - Patient = independent replicate. PRIMARY: patient-level paired tests
+#     (real vs own control; Friedman / paired t across groups), with effect
+#     sizes and patient-level consistency. SENSITIVITY: nerve-level lm with
+#     patient as a fixed block (optimistic: nerves within a patient are
+#     still treated as independent).
+#   - Distance-curve ribbons are SE across PATIENTS.
+#
+# REVISION 2 (second review):
+#   - Far zone BOUNDED at 650-1000 um.
+#   - Curve bins fixed: 6 x 150 um, 0-900 um (no folding of 750-1000 um).
+#   - Decay is computed by ONE shared function (00_decay_shared.R) from the
+#     cached distance table, the same function and table the all-cell-type
+#     screen (step3) uses -- so step3's plasma row reproduces this script.
+#   - Patient-level paired t-test actually computed (two-vector form);
+#     test errors are printed, never swallowed.
+#   - Bundle stores the decay settings; downstream scripts refuse to run on
+#     a bundle built with different settings.
+#
+# Directory layout:
+#   shared code -> scripts/00_decay_shared.R
+#   inputs      -> input/
+#   tables      -> output/<ANALYSIS_NAME>/tables/
+#   figures     -> output/<ANALYSIS_NAME>/figures/
+#   .rds        -> processed/
+# ======================================================================
+
+library(SpatialExperiment)
+library(RANN)
+library(dplyr)
+library(tidyr)
+library(scales)
+library(ggplot2)
+```
+
+```{r config_and_load}
+count     <- dplyr::count
+rename    <- dplyr::rename
+summarise <- dplyr::summarise
+summarize <- dplyr::summarize
+mutate    <- dplyr::mutate
+arrange   <- dplyr::arrange
+filter    <- dplyr::filter
+select    <- dplyr::select
+pull      <- dplyr::pull
+distinct  <- dplyr::distinct
+group_by  <- dplyr::group_by
+
+# ---- 0. Directory structure -------------------------------------------
+# Paths are relative to the project folder (the one containing input/).
+# Run from there, or from scripts/ -- this moves up one level if needed.
+if (basename(getwd()) == "scripts") setwd("..")
+if (!dir.exists("input"))
+  stop("Run this script from the project folder (the one containing input/).")
+
+PROJECT_DIR   <- "."
+ANALYSIS_NAME <- "01_plasma_cells"
+
+INPUT_DIR     <- file.path(PROJECT_DIR, "input")
+PROCESSED_DIR <- file.path(PROJECT_DIR, "processed")
+TABLES_DIR    <- file.path(PROJECT_DIR, "output", ANALYSIS_NAME, "tables")
+FIGURES_DIR   <- file.path(PROJECT_DIR, "output", ANALYSIS_NAME, "figures")
+
+dir.create(INPUT_DIR,     recursive = TRUE, showWarnings = FALSE)
+dir.create(PROCESSED_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(TABLES_DIR,    recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR,   recursive = TRUE, showWarnings = FALSE)
+
+out_dir <- list(tables = TABLES_DIR, figures = FIGURES_DIR, processed = PROCESSED_DIR)
+
+# ---- 0a. Shared code: zones, binning, groups, decay, tests -------------
+SHARED_PATH <- file.path(PROJECT_DIR, "scripts", "00_decay_shared.R")
+if (!file.exists(SHARED_PATH)) stop("Place 00_decay_shared.R in ", PROJECT_DIR)
+source(SHARED_PATH)
+cat("Near zone: <=", NEAR_CUTOFF_UM, "um | far zone:", FAR_MIN_UM, "-", FAR_MAX_UM,
+    "um | curve bins:", paste(head(bin_breaks, -1), bin_breaks[-1], sep = "-", collapse = ", "), "um\n")
+
+# ---- 0b. Load spe + RCTD weights --------------------------------------
+# Place into input/ before running:
+#   Integrated_NMF.rds, DE_SPE_annotaion.csv, RCTD_weights.Rds
+spe <- readRDS(file.path(INPUT_DIR, "Integrated_NMF.rds"))
+colData(spe) <- DataFrame(read.csv(file.path(INPUT_DIR, "DE_SPE_annotaion.csv")))
+colnames(spe) <- spe$barcode
+coords <- spatialCoords(spe)
+
+W_df <- readRDS(file.path(INPUT_DIR, "RCTD_weights.Rds"))
+stopifnot("B_cells_(Plasma_cells)" %in% colnames(W_df))
+
+SCORE_COLUMN   <- "B_cells_(Plasma_cells)"
+SIGNATURE_NAME <- "RCTD_PlasmaCells"
+
+plasma_score <- setNames(W_df[[SCORE_COLUMN]], W_df$barcode)
+cat("Score source:", SCORE_COLUMN, "| spots with a score:", sum(!is.na(plasma_score)), "\n")
+
+# ---- 1. Distance/pixel conversion -------------------------------------
+UM_PER_PIXEL_PATH <- file.path(INPUT_DIR, "um_per_pixel_CALIBRATED.rds")
+if (!file.exists(UM_PER_PIXEL_PATH)) {
+  stop("Calibrated um_per_pixel not found. Run um_per_pixel_calibration.R first.")
+}
+um_per_pixel <- readRDS(UM_PER_PIXEL_PATH)
+cat("Loaded calibrated um_per_pixel:", round(um_per_pixel, 6),
+    "(PIXELS_PER_100UM equivalent:", round(100 / um_per_pixel, 3), ")\n")
+```
+
+```{r real_nerve_distances_and_curves}
+# ---- 2. Nerves and their groups ---------------------------------------
+stopifnot("patient_id" %in% colnames(colData(spe)))
+
+is_nerve <- !is.na(spe$NerveID)
+nerve_info <- unique(data.frame(
+  NerveID    = spe$NerveID[is_nerve],
+  sample_id  = spe$sample_id[is_nerve],
+  patient_id = spe$patient_id[is_nerve],
+  context    = spe$context[is_nerve],
+  Invaded    = spe$Invaded[is_nerve]
+))
+nerve_info <- nerve_info[!is.na(nerve_info$NerveID), ]
+nerve_info$NerveID <- as.character(nerve_info$NerveID)   # character throughout
+cat("Total individual nerves:", nrow(nerve_info), "\n")
+cat("Unique sample_id:", n_distinct(nerve_info$sample_id),
+    "| Unique patient_id:", n_distinct(nerve_info$patient_id), "\n")
+print(table(nerve_info$context, nerve_info$Invaded))
+
+nerve_groups <- nerve_groups_from_info(nerve_info)   # GROUP_DEFS from shared file
+print(table(nerve_groups$Group, nerve_groups$patient_id))
+
+# ---- 3. Per-nerve distance cache (out to DIST_CACHE_MAX_UM) -----------
+# Query = all non-nerve spots in the nerve's own section. This one table
+# feeds the distance curves AND the near/far decay, here and in step3.
+compute_per_nerve_distances <- function(nerve_ids, spe, coords, max_dist_um, um_per_pixel) {
+  max_dist_px <- max_dist_um / um_per_pixel
+  results <- vector("list", length(nerve_ids))
+  for (i in seq_along(nerve_ids)) {
+    nid <- nerve_ids[i]
+    smp <- unique(spe$sample_id[spe$NerveID == nid & !is.na(spe$NerveID)])
+    if (length(smp) != 1) next
+    idx_this_nerve <- which(spe$sample_id == smp & !is.na(spe$NerveID) & spe$NerveID == nid)
+    idx_query      <- which(spe$sample_id == smp & is.na(spe$NerveID))
+    if (length(idx_this_nerve) == 0 || length(idx_query) == 0) next
+    nn <- nn2(coords[idx_this_nerve, , drop = FALSE], coords[idx_query, , drop = FALSE],
+              k = 1, searchtype = "radius", radius = max_dist_px)
+    valid <- nn$nn.dists[, 1] <= max_dist_px & nn$nn.dists[, 1] >= 0
+    if (sum(valid) == 0) next
+    results[[i]] <- data.frame(NerveID = nid, barcode = spe$barcode[idx_query[valid]],
+                               dist_px = nn$nn.dists[valid, 1])
+  }
+  out <- do.call(rbind, results)
+  out$dist_um <- out$dist_px * um_per_pixel
+  out
+}
+
+cat("Computing per-nerve distances (out to", DIST_CACHE_MAX_UM, "um)...\n")
+per_nerve_dist_all <- compute_per_nerve_distances(nerve_info$NerveID, spe, coords, DIST_CACHE_MAX_UM, um_per_pixel)
+per_nerve_dist_all$NerveID <- as.character(per_nerve_dist_all$NerveID)
+per_nerve_dist_all$bin   <- bin_mid(per_nerve_dist_all$dist_um)   # NA beyond CURVE_MAX_UM
+per_nerve_dist_all$score <- plasma_score[per_nerve_dist_all$barcode]
+cat("Total (nerve, spot) pairs:", nrow(per_nerve_dist_all), "\n")
+
+# ---- 4. Per-nerve curves ----------------------------------------------
+# Nerve-level only; group curves are averaged at the PATIENT level in
+# section 8, after pairing with the relocated controls.
+nerve_spot_idx <- which(!is.na(spe$NerveID) & as.character(spe$NerveID) %in% nerve_groups$NerveID)
+anchor_per_nerve <- data.frame(NerveID = as.character(spe$NerveID[nerve_spot_idx]),
+                               score   = plasma_score[spe$barcode[nerve_spot_idx]]) %>%
+  group_by(NerveID) %>%
+  summarise(mean_score = mean(score, na.rm = TRUE), n_spots = n(), .groups = "drop") %>%
+  mutate(bin = 0)
+
+per_nerve_all <- bind_rows(
+  anchor_per_nerve,
+  per_nerve_dist_all %>%
+    filter(NerveID %in% nerve_groups$NerveID, !is.na(bin)) %>%   # curve range only
+    group_by(NerveID, bin) %>%
+    summarise(mean_score = mean(score, na.rm = TRUE), n_spots = n(), .groups = "drop")
+) %>%
+  left_join(nerve_groups %>% select(NerveID, Group), by = "NerveID") %>%
+  mutate(Group = as.character(Group)) %>%
+  arrange(Group, NerveID, bin)
+
+for (g in group_levels) cat(g, "-- nerves:", sum(nerve_groups$Group == g), "\n")
+write.csv(per_nerve_all, file.path(TABLES_DIR, paste0("per_nerve_curves_", SIGNATURE_NAME, ".csv")), row.names = FALSE)
+```
+
+```{r sham_generation}
+# ---- 5. Shape-preserving relocation sham ------------------------------
+set.seed(42)
+N_SHAM_REPLICATES      <- 3     # averaged per nerve downstream -> not extra n
+MAX_PLACEMENT_TRIES    <- 100
+MIN_SNAP_FRAC          <- 0.9
+MIN_RELOCATION_DIST_UM <- 300
+
+compute_spot_spacing <- function(spe, coords, smp) {
+  idx <- which(spe$sample_id == smp)
+  if (length(idx) < 2) return(NA_real_)
+  nn <- nn2(coords[idx, , drop = FALSE], coords[idx, , drop = FALSE], k = 2)
+  median(nn$nn.dists[, 2])
+}
+sample_ids_all <- unique(spe$sample_id)
+spot_spacing_by_sample <- setNames(sapply(sample_ids_all, function(s) compute_spot_spacing(spe, coords, s)), sample_ids_all)
+
+relocate_nerve_shape <- function(nerve_id, replicate_idx, spe, coords, um_per_pixel, spot_spacing_by_sample,
+                                 max_tries = MAX_PLACEMENT_TRIES, min_snap_frac = MIN_SNAP_FRAC,
+                                 min_reloc_dist_um = MIN_RELOCATION_DIST_UM) {
+  smp <- unique(spe$sample_id[spe$NerveID == nerve_id & !is.na(spe$NerveID)])
+  if (length(smp) != 1) return(NULL)
+  nerve_idx <- which(spe$sample_id == smp & !is.na(spe$NerveID) & spe$NerveID == nerve_id)
+  if (length(nerve_idx) == 0) return(NULL)
+  nerve_coords <- coords[nerve_idx, , drop = FALSE]
+  centroid <- colMeans(nerve_coords)
+  rel_coords <- sweep(nerve_coords, 2, centroid, "-")
+  sample_idx <- which(spe$sample_id == smp)
+  sample_coords <- coords[sample_idx, , drop = FALSE]
+  sample_barcodes <- spe$barcode[sample_idx]
+  is_real_nerve_spot <- !is.na(spe$NerveID[sample_idx])
+  spacing <- spot_spacing_by_sample[[smp]]
+  if (is.na(spacing)) return(NULL)
+  snap_tol_px <- 0.6 * spacing
+  min_reloc_dist_px <- min_reloc_dist_um / um_per_pixel
+  for (try_i in seq_len(max_tries)) {
+    candidate_centroid_idx <- sample(seq_along(sample_idx), 1)
+    candidate_centroid <- sample_coords[candidate_centroid_idx, ]
+    dist_from_original <- sqrt(sum((candidate_centroid - centroid)^2))
+    if (dist_from_original < min_reloc_dist_px) next
+    translated <- sweep(rel_coords, 2, candidate_centroid, "+")
+    nn <- nn2(sample_coords, translated, k = 1)
+    snap_dist <- nn$nn.dists[, 1]
+    snap_idx  <- nn$nn.idx[, 1]
+    snapped_ok <- snap_dist <= snap_tol_px
+    if (mean(snapped_ok) < min_snap_frac) next
+    used_idx <- snap_idx[snapped_ok]
+    if (any(duplicated(used_idx))) next
+    if (any(is_real_nerve_spot[used_idx])) next
+    return(data.frame(
+      ShamNerveID = paste0("sham_", nerve_id, "_rep", replicate_idx),
+      source_NerveID = as.character(nerve_id), sample_id = smp,
+      barcode = sample_barcodes[used_idx], stringsAsFactors = FALSE
+    ))
+  }
+  NULL
+}
+
+cat("\nGenerating shape-matched relocation shams (", N_SHAM_REPLICATES, " replicates per nerve)...\n", sep = "")
+sham_shapes <- list()
+for (i in seq_len(nrow(nerve_info))) {
+  nid <- nerve_info$NerveID[i]
+  for (r in seq_len(N_SHAM_REPLICATES)) {
+    sham_shapes[[paste0(nid, "_rep", r)]] <- relocate_nerve_shape(nid, r, spe, coords, um_per_pixel, spot_spacing_by_sample)
+  }
+}
+n_failed <- sum(sapply(sham_shapes, is.null))
+cat("Placement attempts:", length(sham_shapes), "| failed:", n_failed, "\n")
+sham_shapes_df <- bind_rows(sham_shapes) %>%
+  left_join(nerve_info %>% select(NerveID, context, Invaded), by = c("source_NerveID" = "NerveID"))
+
+compute_per_shape_distances <- function(sham_shapes_df, spe, coords, max_dist_um, um_per_pixel) {
+  max_dist_px <- max_dist_um / um_per_pixel
+  shape_ids <- unique(sham_shapes_df$ShamNerveID)
+  results <- vector("list", length(shape_ids))
+  for (i in seq_along(shape_ids)) {
+    sid <- shape_ids[i]
+    shape_rows <- sham_shapes_df[sham_shapes_df$ShamNerveID == sid, ]
+    smp <- shape_rows$sample_id[1]
+    anchor_idx <- which(spe$barcode %in% shape_rows$barcode)
+    idx_query <- which(spe$sample_id == smp & is.na(spe$NerveID) & !(spe$barcode %in% shape_rows$barcode))
+    if (length(anchor_idx) == 0 || length(idx_query) == 0) next
+    nn <- nn2(coords[anchor_idx, , drop = FALSE], coords[idx_query, , drop = FALSE],
+              k = 1, searchtype = "radius", radius = max_dist_px)
+    valid <- nn$nn.dists[, 1] <= max_dist_px & nn$nn.dists[, 1] >= 0
+    if (sum(valid) == 0) next
+    results[[i]] <- data.frame(ShamNerveID = sid, barcode = spe$barcode[idx_query[valid]],
+                               dist_px = nn$nn.dists[valid, 1])
+  }
+  out <- do.call(rbind, results)
+  out$dist_um <- out$dist_px * um_per_pixel
+  out
+}
+
+cat("Computing distances from relocated sham shapes (out to", DIST_CACHE_MAX_UM, "um)...\n")
+per_shape_dist_all <- compute_per_shape_distances(sham_shapes_df, spe, coords, DIST_CACHE_MAX_UM, um_per_pixel)
+per_shape_dist_all$bin   <- bin_mid(per_shape_dist_all$dist_um)   # NA beyond CURVE_MAX_UM
+per_shape_dist_all$score <- plasma_score[per_shape_dist_all$barcode]
+
+# Per-replicate curves; averaged per source nerve in section 8
+shape_map <- distinct(sham_shapes_df, ShamNerveID, source_NerveID) %>%
+  left_join(nerve_groups %>% select(NerveID, Group), by = c("source_NerveID" = "NerveID")) %>%
+  filter(!is.na(Group))
+
+sham_per_shape_all <- bind_rows(
+  sham_shapes_df %>%
+    filter(ShamNerveID %in% shape_map$ShamNerveID) %>%
+    mutate(score = plasma_score[barcode]) %>%
+    group_by(ShamNerveID) %>%
+    summarise(mean_score = mean(score, na.rm = TRUE), n_spots = n(), .groups = "drop") %>%
+    mutate(bin = 0),
+  per_shape_dist_all %>%
+    filter(ShamNerveID %in% shape_map$ShamNerveID, !is.na(bin)) %>%   # curve range only
+    group_by(ShamNerveID, bin) %>%
+    summarise(mean_score = mean(score, na.rm = TRUE), n_spots = n(), .groups = "drop")
+) %>%
+  left_join(shape_map, by = "ShamNerveID") %>%
+  mutate(Group = as.character(Group)) %>%
+  arrange(Group, ShamNerveID, bin)
+
+for (g in group_levels) cat("Sham:", g, "-- relocated shapes:", sum(shape_map$Group == g), "\n")
+
+write.csv(sham_shapes_df,     file.path(TABLES_DIR, paste0("sham_shapes_", SIGNATURE_NAME, ".csv")), row.names = FALSE)
+write.csv(sham_per_shape_all, file.path(TABLES_DIR, paste0("sham_per_shape_curves_", SIGNATURE_NAME, ".csv")), row.names = FALSE)
+```
+
+```{r decay_magnitude}
+# ---- 6. Per-nerve near-vs-far decay magnitude -------------------------
+# Computed by the shared decay_table() from the cached distance tables:
+#   near = <= 150 um, far = 650-1000 um, >= 3 spots in each zone.
+# step3 calls the same function on the same tables for every cell type.
+decay_all      <- real_decay_table(per_nerve_dist_all, plasma_score, nerve_groups)
+sham_decay_all <- sham_decay_table(per_shape_dist_all, plasma_score, sham_shapes_df)   # one row per REPLICATE
+
+write.csv(decay_all,      file.path(TABLES_DIR, paste0("decay_magnitude_real_", SIGNATURE_NAME, ".csv")), row.names = FALSE)
+write.csv(sham_decay_all, file.path(TABLES_DIR, paste0("decay_magnitude_sham_replicates_", SIGNATURE_NAME, ".csv")), row.names = FALSE)
+
+cat("\nReal nerves with usable near+far data, per group x patient:\n")
+print(table(decay_all$Group, decay_all$patient_id))
+```
+
+```{r pairing_and_stats}
+# ---- 7. Pair each real nerve with its own control ---------------------
+sd_all_spots <- sd(plasma_score, na.rm = TRUE)   # for standardised enrichment
+
+paired_nerve <- pair_real_with_controls(decay_all, sham_decay_all)
+
+cat("Real nerves with usable near/far data:", nrow(decay_all), "\n")
+cat("  ...paired with >=1 valid relocated control:", nrow(paired_nerve),
+    "| excluded (report in Methods):", nrow(decay_all) - nrow(paired_nerve), "\n")
+cat("\nPaired nerves per group x patient:\n")
+print(table(paired_nerve$Group, paired_nerve$patient_id))
+cat("\nSuccessful sham replicates per nerve:\n")
+print(table(n_sham_reps = paired_nerve$n_sham_reps))
+write.csv(paired_nerve, file.path(TABLES_DIR, paste0("paired_nerve_real_vs_sham_", SIGNATURE_NAME, ".csv")), row.names = FALSE)
+
+paired_patient <- summarise_by_patient(paired_nerve)
+write.csv(paired_patient, file.path(TABLES_DIR, paste0("paired_patient_level_", SIGNATURE_NAME, ".csv")), row.names = FALSE)
+
+# ---- 7d. Real vs. own control, per group ------------------------------
+# Inferential hierarchy (patient = independent biological replicate):
+#   PRIMARY     patient-level paired t-test, real vs. own control
+#               (n = patients with both, df = n - 1); effect size = mean of
+#               patient means; consistency = patients with a positive effect.
+#   SENSITIVITY nerve-level lm with patient as fixed block (nerve_*). Its
+#               estimate equals the mean of patient means, but its p-value
+#               treats nerves within a patient as independent, so it is
+#               optimistic and is reported as secondary only.
+outcome_cols <- list(delta_decay = c("decay_magnitude", "sham_decay"),
+                     delta_near  = c("near_score",      "sham_near"),
+                     delta_far   = c("far_score",       "sham_far"))
+
+real_vs_sham <- bind_rows(lapply(group_levels, function(g) {
+  sub <- paired_nerve   %>% filter(Group == g)
+  pat <- paired_patient %>% filter(Group == g)
+  bind_rows(lapply(names(outcome_cols), function(outc) {
+    pt <- patient_paired_t(pat, outcome_cols[[outc]][1], outcome_cols[[outc]][2],
+                           paste(short_labels[[g]], outc))
+    bt <- block_intercept_test(sub, outc)
+    data.frame(Group = short_labels[[g]], outcome = outc,
+               # primary: patient level
+               n_patients = pt$n_patients_paired,
+               effect = pt$patient_mean_diff,
+               n_patients_positive = sum(pat[[outc]] > 0, na.rm = TRUE),
+               patient_t = pt$patient_t, patient_df = pt$patient_df, patient_p = pt$patient_p,
+               patient_note = pt$patient_note,
+               # sensitivity: nerve level, patient as fixed block
+               n_nerves = bt$n_nerves, nerve_estimate = bt$estimate, nerve_se = bt$se,
+               nerve_df = bt$df_resid, nerve_p = bt$p_value)
+  }))
+}))
+real_vs_sham$effect_std <- ifelse(real_vs_sham$outcome == "delta_decay",
+                                  real_vs_sham$effect / sd_all_spots, NA_real_)
+
+cat("\n=== Sham-corrected enrichment per group (real - own control) ===\n")
+cat("PRIMARY (patient level): effect = mean of patient means; patient_p = paired t, df = n_patients - 1;\n")
+cat("  n_patients_positive = patients whose mean effect is > 0.\n")
+cat("SENSITIVITY (nerve level): nerve_* = lm with patient as fixed block (optimistic p-value).\n")
+print(real_vs_sham, digits = 3, row.names = FALSE)
+if (any(real_vs_sham$patient_note != "")) {
+  cat("\nNOTE -- patient-level test not computed for:\n")
+  print(real_vs_sham %>% filter(patient_note != "") %>% select(Group, outcome, patient_note), row.names = FALSE)
+}
+write.csv(real_vs_sham, file.path(TABLES_DIR, paste0("real_vs_own_sham_blocked_", SIGNATURE_NAME, ".csv")), row.names = FALSE)
+
+cat("\nPer-patient mean paired differences (descriptive):\n")
+print(paired_patient %>% mutate(Group = short_labels[as.character(Group)]) %>%
+        select(Group, patient_id, n_nerves, delta_decay, delta_near, delta_far), digits = 3)
+
+# ---- 7e. Figures: real nerves, and real vs. own control ---------------
+zone_label <- paste0("Decay = near(<=", NEAR_CUTOFF_UM, "µm) minus far(", FAR_MIN_UM, "-", FAR_MAX_UM, "µm)")
+
+p_decay <- ggplot(decay_all, aes(x = Group, y = decay_magnitude, color = Group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.3) +
+  geom_jitter(aes(shape = factor(patient_id)), width = 0.15, size = 2.5, alpha = 0.8) +
+  scale_color_manual(values = c("Invaded nerves (Diseased)" = "#F8766D",
+                                "Non-invaded nerves (Diseased)" = "#00BA38",
+                                "Non-invaded nerves (Adjacent)" = "#619CFF")) +
+  scale_shape_manual(name = "Patient", values = c(15, 16, 17, 18, 3, 4)) +
+  labs(title = paste0("Per-nerve decay magnitude: ", SCORE_COLUMN),
+       subtitle = paste0("Each point = one nerve, shape = patient. ", zone_label),
+       x = NULL, y = "Decay magnitude (near - far)") +
+  guides(color = "none") +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "bottom", axis.text.x = element_text(angle = 20, hjust = 1))
+print(p_decay)
+ggsave(file.path(FIGURES_DIR, paste0("per_nerve_decay_boxplot_", SIGNATURE_NAME, ".pdf")), p_decay, width = 7, height = 6, dpi = 600)
+
+decay_plot_long <- paired_nerve %>%
+  select(NerveID, Group, patient_id, Real = decay_magnitude, Sham = sham_decay) %>%
+  pivot_longer(c(Real, Sham), names_to = "Source", values_to = "decay_magnitude") %>%
+  mutate(Source = factor(Source, levels = c("Real", "Sham")),
+         GroupBase = factor(short_labels[as.character(Group)], levels = short_labels))
+
+p_decay_paired <- ggplot(decay_plot_long, aes(x = Source, y = decay_magnitude)) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey40", linewidth = 0.4) +
+  geom_line(aes(group = NerveID), color = "grey75", linewidth = 0.3) +
+  geom_boxplot(aes(color = Source), outlier.shape = NA, alpha = 0.25, width = 0.5) +
+  geom_point(aes(color = Source, shape = patient_id), size = 2, alpha = 0.8) +
+  facet_wrap(~ GroupBase, nrow = 1) +
+  scale_color_manual(values = c(Real = "#D55E00", Sham = "grey50"), guide = "none") +
+  scale_shape_manual(name = "Patient", values = c(15, 16, 17, 18, 3, 4, 8, 5)) +
+  labs(title = paste0("Real nerve vs. own geometry-matched control: ", SCORE_COLUMN),
+       subtitle = paste0("Lines join each nerve to the mean of its relocated replicates. ", zone_label),
+       x = NULL, y = "Decay magnitude (near - far)") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom", strip.background = element_blank(), strip.text = element_text(face = "bold"))
+print(p_decay_paired)
+ggsave(file.path(FIGURES_DIR, paste0("decay_paired_real_vs_sham_", SIGNATURE_NAME, ".pdf")),
+       p_decay_paired, width = 9, height = 5.5, dpi = 600)
+
+# ---- 7f. Does enrichment differ across nerve groups? ------------------
+net_effect <- paired_patient %>%
+  transmute(GroupBase  = factor(as.character(Group), levels = group_levels),
+            patient_id = as.character(patient_id),
+            Real = decay_magnitude, Sham = sham_decay, net_effect = delta_decay)
+write.csv(net_effect, file.path(TABLES_DIR, paste0("net_effect_per_patient_", SIGNATURE_NAME, ".csv")), row.names = FALSE)
+
+complete_patients <- net_effect %>% group_by(patient_id) %>%
+  filter(n_distinct(GroupBase) == length(group_levels)) %>% pull(patient_id) %>% unique()
+net_effect_complete <- net_effect %>% filter(patient_id %in% complete_patients)
+cat("\nPatients with all three nerve groups:", length(complete_patients), "\n")
+
+# (a) PRIMARY, patient level: Friedman + pairwise paired t (Holm)
+friedman_res <- NULL
+if (length(complete_patients) >= 2) {
+  friedman_mat <- net_effect_complete %>% select(patient_id, GroupBase, net_effect) %>%
+    pivot_wider(names_from = GroupBase, values_from = net_effect) %>%
+    select(all_of(group_levels)) %>% as.matrix()
+  friedman_res <- tryCatch(friedman.test(friedman_mat), error = function(e) {
+    message("Friedman test FAILED: ", conditionMessage(e)); NULL })
+  if (!is.null(friedman_res)) print(friedman_res)
+  cat("Note: with 3 patients x 3 groups the smallest attainable p (chi-square approx.) is 0.0498.\n")
+}
+
+pairwise_patient <- bind_rows(lapply(combn(group_levels, 2, simplify = FALSE), function(p) {
+  wide <- net_effect_complete %>% filter(GroupBase %in% p) %>%
+    select(GroupBase, patient_id, net_effect) %>%
+    pivot_wider(names_from = GroupBase, values_from = net_effect) %>% na.omit()
+  res <- data.frame(group1 = short_labels[[p[1]]], group2 = short_labels[[p[2]]],
+                    n_patients = nrow(wide), mean_diff = NA_real_, p_value = NA_real_)
+  if (nrow(wide) >= 2) {
+    tt <- tryCatch(t.test(wide[[p[1]]], wide[[p[2]]], paired = TRUE), error = function(e) e)
+    if (inherits(tt, "error")) {
+      message("Pairwise patient t-test FAILED (", res$group1, " vs ", res$group2, "): ", conditionMessage(tt))
+    } else {
+      res$mean_diff <- unname(tt$estimate); res$p_value <- tt$p.value
+    }
+  } else {
+    message("Pairwise patient t-test skipped (", res$group1, " vs ", res$group2, "): fewer than 2 patients")
+  }
+  res
+}))
+pairwise_patient$p_holm <- p.adjust(pairwise_patient$p_value, method = "holm")
+cat("\n=== PRIMARY: pairwise, patient level (paired t, Holm) ===\n")
+print(pairwise_patient, digits = 3, row.names = FALSE)
+
+# (b) SENSITIVITY, nerve level: lm(delta ~ Group + patient), Holm
+pairwise_nerve <- bind_rows(lapply(combn(group_levels, 2, simplify = FALSE), function(p)
+  block_group_test(paired_nerve, p[1], p[2], "delta_decay")))
+pairwise_nerve$p_holm <- p.adjust(pairwise_nerve$p_value, method = "holm")
+cat("\n=== SENSITIVITY: pairwise, nerve level (lm with patient as fixed block, Holm) ===\n")
+print(pairwise_nerve, digits = 3, row.names = FALSE)
+
+group_comparison <- pairwise_patient %>% mutate(role = "primary", level = "patient (paired t)")
+if (!is.null(friedman_res)) {
+  group_comparison <- bind_rows(group_comparison,
+    data.frame(group1 = "all", group2 = "all", n_patients = length(complete_patients),
+               mean_diff = NA_real_, p_value = friedman_res$p.value, p_holm = NA_real_,
+               role = "primary", level = "patient (Friedman)"))
+}
+group_comparison <- bind_rows(group_comparison,
+  pairwise_nerve %>% transmute(group1, group2, n_patients = n_patients_both_groups,
+                               mean_diff = estimate, p_value, p_holm,
+                               role = "sensitivity", level = "nerve (lm + patient block)"))
+write.csv(group_comparison, file.path(TABLES_DIR, paste0("group_comparison_net_effect_", SIGNATURE_NAME, ".csv")), row.names = FALSE)
+```
+
+
+```{r}
+# Per-patient enrichment per nerve category, with statistics
+#   points    = one patient's mean sham-corrected enrichment (real - own control)
+#   bar       = mean of the patient means (the reported effect size)
+#   above     = within-category test: patients with positive enrichment and
+#               patient-level paired t-test p (real vs own control, df = n - 1)
+#   brackets  = between-category pairwise paired t-tests on patient means,
+#               Holm-adjusted (primary analysis); Friedman p in the caption
+if (!exists("pdf_device")) pdf_device <- if (isTRUE(capabilities("cairo"))) grDevices::cairo_pdf else grDevices::pdf
+# Standalone use: if the statistics objects are not in the session, read the
+# tables step1 already saved (needs TABLES_DIR, FIGURES_DIR, SIGNATURE_NAME).
+if (!exists("SIGNATURE_NAME")) SIGNATURE_NAME <- "RCTD_PlasmaCells"
+if (!exists("TABLES_DIR") || !exists("FIGURES_DIR")) {
+  TABLES_DIR  <- file.path("output", "01_plasma_cells", "tables")
+  FIGURES_DIR <- file.path("output", "01_plasma_cells", "figures")
+}
+if (!exists("short_labels")) short_labels <- c("Invaded nerves (Diseased)" = "InvN",
+                                               "Non-invaded nerves (Diseased)" = "NI-TB",
+                                               "Non-invaded nerves (Adjacent)" = "NI-Adj")
+if (!exists("net_effect"))
+  net_effect <- read.csv(file.path(TABLES_DIR, paste0("net_effect_per_patient_", SIGNATURE_NAME, ".csv"))) %>%
+    mutate(patient_id = as.character(patient_id))
+if (!exists("real_vs_sham"))
+  real_vs_sham <- read.csv(file.path(TABLES_DIR, paste0("real_vs_own_sham_blocked_", SIGNATURE_NAME, ".csv")))
+if (!exists("pairwise_patient") || !exists("friedman_res")) {
+  gc_tab <- read.csv(file.path(TABLES_DIR, paste0("group_comparison_net_effect_", SIGNATURE_NAME, ".csv")))
+  pairwise_patient <- gc_tab %>% filter(level == "patient (paired t)")
+  fr <- gc_tab %>% filter(level == "patient (Friedman)")
+  friedman_res <- if (nrow(fr) == 1) list(p.value = fr$p_value) else NULL
+}
+net_effect$patient_id <- factor(net_effect$patient_id)
+
+format_p <- function(p) ifelse(is.na(p), "NA", ifelse(p < 0.001, "< 0.001", formatC(p, digits = 2, format = "g")))
+
+manuscript_order  <- c("Non-invaded nerves (Adjacent)", "Non-invaded nerves (Diseased)", "Invaded nerves (Diseased)")
+manuscript_labels <- c("NI (adjacent)", "NI (tumour-bearing)", "InvN")
+short_in_order    <- unname(short_labels[manuscript_order])          # "NI-Adj", "NI-TB", "InvN"
+
+ranking_plot_df <- net_effect %>%
+  mutate(GroupBase = factor(as.character(GroupBase), levels = manuscript_order, labels = manuscript_labels))
+cat_means <- ranking_plot_df %>% group_by(GroupBase) %>% summarise(m = mean(net_effect), .groups = "drop")
+
+y_all <- c(0, ranking_plot_df$net_effect)
+y_top <- max(y_all, na.rm = TRUE); y_rng <- diff(range(y_all, na.rm = TRUE))
+
+within_lab <- real_vs_sham %>% filter(outcome == "delta_decay") %>%
+  transmute(GroupBase = factor(manuscript_labels[match(Group, short_in_order)], levels = manuscript_labels),
+            label = sprintf("%d/%d patients > 0\np = %s", n_patients_positive, n_patients, format_p(patient_p)),
+            y = y_top + 0.12 * y_rng)
+
+brackets <- pairwise_patient %>%
+  mutate(x1 = match(group1, short_in_order), x2 = match(group2, short_in_order),
+         xa = pmin(x1, x2), xb = pmax(x1, x2), span = xb - xa) %>%
+  arrange(span, xa) %>%
+  mutate(y = y_top + (0.38 + 0.16 * (row_number() - 1)) * y_rng,
+         label = paste0("p = ", format_p(p_holm)))
+
+p_ranking <- ggplot(ranking_plot_df, aes(x = GroupBase, y = net_effect)) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey50") +
+  geom_errorbar(data = cat_means, aes(x = GroupBase, ymin = m, ymax = m), inherit.aes = FALSE,
+                width = 0.4, linewidth = 0.8, color = "grey20") +
+  geom_point(aes(color = patient_id, shape = patient_id), size = 3,
+             position = position_jitter(width = 0.08, height = 0, seed = 1)) +
+  geom_text(data = within_lab, aes(x = GroupBase, y = y, label = label), inherit.aes = FALSE,
+            size = 3, lineheight = 0.9, vjust = 0) +
+  geom_segment(data = brackets, aes(x = xa, xend = xb, y = y, yend = y), inherit.aes = FALSE, linewidth = 0.4) +
+  geom_segment(data = brackets, aes(x = xa, xend = xa, y = y, yend = y - 0.03 * y_rng), inherit.aes = FALSE, linewidth = 0.4) +
+  geom_segment(data = brackets, aes(x = xb, xend = xb, y = y, yend = y - 0.03 * y_rng), inherit.aes = FALSE, linewidth = 0.4) +
+  geom_text(data = brackets, aes(x = (xa + xb) / 2, y = y + 0.015 * y_rng, label = label), inherit.aes = FALSE,
+            size = 3, vjust = 0) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.08))) +
+  labs(title = "Sham-corrected near-nerve enrichment, per patient",
+       x = NULL, y = "Enrichment (patient mean of real - own control)",
+       color = "Patient", shape = "Patient",
+       caption = paste0("Points: patient means; bar: mean of patients.\n",
+                        "Above each category: patients with positive enrichment; paired t-test vs own control.\n",
+                        "Brackets: pairwise paired t-tests between categories, Holm-adjusted",
+                        if (!is.null(friedman_res)) paste0("; Friedman test p = ", format_p(friedman_res$p.value)) else "",
+                        ". n = ", n_distinct(ranking_plot_df$patient_id), " patients.")) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom", plot.caption = element_text(hjust = 0, size = 8))
+print(p_ranking)
+ggsave(file.path(FIGURES_DIR, paste0("per_patient_ranking_", SIGNATURE_NAME, ".pdf")),
+       p_ranking, width = 6.5, height = 6, dpi = 600, device = pdf_device)
+```
+
+```{r patient_level_curves}
+# ---- 8. Distance curves with PATIENT-level uncertainty ----------------
+# nerve curve -> (sham replicates averaged per source nerve) -> patient mean
+# curve -> mean +/- SE across patients. Only nerves with both a real and a
+# control curve are used, so both lines describe the same nerves/patients.
+real_curve_nerve <- per_nerve_all %>%
+  transmute(source = "Real", Group, NerveID = as.character(NerveID), bin, mean_score)
+
+sham_curve_nerve <- sham_per_shape_all %>%
+  group_by(Group, NerveID = as.character(source_NerveID), bin) %>%
+  summarise(mean_score = mean(mean_score, na.rm = TRUE), .groups = "drop") %>%
+  mutate(source = "Sham")
+
+paired_ids <- intersect(real_curve_nerve$NerveID, sham_curve_nerve$NerveID)
+
+patient_curves <- bind_rows(real_curve_nerve, sham_curve_nerve) %>%
+  filter(NerveID %in% paired_ids) %>%
+  left_join(nerve_groups %>% select(NerveID, patient_id), by = "NerveID") %>%
+  group_by(source, Group, patient_id, bin) %>%
+  summarise(mean_score = mean(mean_score, na.rm = TRUE), n_nerves = n(), .groups = "drop")
+
+averaged_patient_level <- patient_curves %>%
+  group_by(source, Group, bin) %>%
+  summarise(mean_across_patients = mean(mean_score, na.rm = TRUE),
+            se         = sd(mean_score, na.rm = TRUE) / sqrt(sum(is.finite(mean_score))),
+            n_patients = sum(is.finite(mean_score)),
+            n_nerves   = sum(n_nerves), .groups = "drop")
+
+write.csv(patient_curves,         file.path(TABLES_DIR, paste0("patient_curves_real_and_sham_", SIGNATURE_NAME, ".csv")), row.names = FALSE)
+write.csv(averaged_patient_level, file.path(TABLES_DIR, paste0("averaged_curves_patient_level_", SIGNATURE_NAME, ".csv")), row.names = FALSE)
+```
+
+```{r validate_and_save_bundle}
+# ---- 9. Validate and save bundle for downstream scripts ---------------
+required_objects <- c("spe", "coords", "plasma_score", "sham_shapes_df", "nerve_info", "nerve_groups",
+                      "decay_all", "sham_decay_all", "paired_nerve", "paired_patient", "real_vs_sham",
+                      "um_per_pixel", "per_nerve_dist_all", "per_shape_dist_all", "out_dir")
+missing_objects <- required_objects[!sapply(required_objects, exists)]
+if (length(missing_objects) > 0) stop("Cannot save bundle -- missing: ", paste(missing_objects, collapse = ", "))
+
+validation_errors <- c()
+if (!"NerveID" %in% colnames(colData(spe)))   validation_errors <- c(validation_errors, "spe is missing NerveID column")
+if (nrow(sham_shapes_df) == 0)                 validation_errors <- c(validation_errors, "sham_shapes_df is empty")
+if (nrow(paired_nerve) == 0)                   validation_errors <- c(validation_errors, "paired_nerve is empty")
+if (!"patient_id" %in% colnames(decay_all))    validation_errors <- c(validation_errors, "decay_all is missing patient_id")
+if (!is.character(decay_all$NerveID))          validation_errors <- c(validation_errors, "decay_all$NerveID is not character")
+if (!is.character(nerve_info$NerveID))         validation_errors <- c(validation_errors, "nerve_info$NerveID is not character")
+if (nrow(per_nerve_dist_all) == 0)             validation_errors <- c(validation_errors, "per_nerve_dist_all is empty")
+if (nrow(per_shape_dist_all) == 0)             validation_errors <- c(validation_errors, "per_shape_dist_all is empty")
+if (max(per_nerve_dist_all$dist_um) > DIST_CACHE_MAX_UM + 1e-6)
+  validation_errors <- c(validation_errors, "per_nerve_dist_all exceeds DIST_CACHE_MAX_UM")
+if (!is.numeric(um_per_pixel) || um_per_pixel <= 0) validation_errors <- c(validation_errors, "um_per_pixel invalid")
+if (length(validation_errors) > 0) stop("Bundle validation FAILED:\n  - ", paste(validation_errors, collapse = "\n  - "))
+
+bundle <- list(
+  decay_settings     = DECAY_SETTINGS,     # checked by downstream scripts
+  spe_meta = data.frame(barcode = spe$barcode, sample_id = spe$sample_id,
+                        NerveID = spe$NerveID, stringsAsFactors = FALSE),
+  coords             = coords,
+  plasma_score       = plasma_score,
+  sham_shapes_df     = sham_shapes_df,
+  nerve_info         = nerve_info,
+  nerve_groups       = nerve_groups,
+  decay_all          = decay_all,
+  sham_decay_all     = sham_decay_all,     # one row per replicate
+  paired_nerve       = paired_nerve,       # one row per real nerve, with own control
+  paired_patient     = paired_patient,
+  real_vs_sham       = real_vs_sham,       # step3 checks its plasma row against this
+  GROUP_DEFS         = GROUP_DEFS,
+  um_per_pixel       = um_per_pixel,
+  per_nerve_dist_all = per_nerve_dist_all,
+  per_shape_dist_all = per_shape_dist_all,
+  out_dir            = out_dir
+)
+saveRDS(bundle, file.path(PROCESSED_DIR, "figure_bundle_for_real_vs_relocated.rds"))
+cat("Saved bundle (with decay settings, paired data and real_vs_sham).\n")
+```
+
+```{r distance_plot}
+# ---- 10. 1-column, 3-row distance plot, ribbons = SE across patients --
+# Can run standalone: reads the CSV written in section 8.
+library(dplyr)
+library(ggplot2)
+
+FIG_WIDTH_IN   <- 4
+FIG_HEIGHT_IN  <- 9
+FIG_DPI        <- 600
+SIGNATURE_NAME <- "RCTD_PlasmaCells"
+
+PROJECT_DIR   <- "."
+ANALYSIS_NAME <- "01_plasma_cells"
+TABLES_DIR    <- file.path(PROJECT_DIR, "output", ANALYSIS_NAME, "tables")
+FIGURES_DIR   <- file.path(PROJECT_DIR, "output", ANALYSIS_NAME, "figures")
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+plot_df <- read.csv(file.path(TABLES_DIR, paste0("averaged_curves_patient_level_", SIGNATURE_NAME, ".csv"))) %>%
+  mutate(Group  = factor(Group, levels = c("Invaded nerves (Diseased)",
+                                           "Non-invaded nerves (Diseased)",
+                                           "Non-invaded nerves (Adjacent)")),
+         source = factor(source, levels = c("Real", "Sham")))
+
+n_lab <- plot_df %>% group_by(Group) %>% summarise(n = max(n_patients), .groups = "drop")
+strip_labels <- setNames(paste0(n_lab$Group, " (n = ", n_lab$n, " patients)"), n_lab$Group)
+
+pal <- c(Real = "#1B4F8C", Sham = "grey50")
+p_bw <- ggplot(plot_df, aes(x = bin, y = mean_across_patients, color = source, fill = source, group = source)) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "grey70", linewidth = 0.3) +
+  geom_ribbon(aes(ymin = mean_across_patients - se, ymax = mean_across_patients + se), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1.0) +
+  geom_point(size = 1.6, alpha = 0.9) +
+  scale_color_manual(values = pal, labels = c(Real = "Real", Sham = "Geometry-matched control"), name = NULL) +
+  scale_fill_manual(values = pal,  labels = c(Real = "Real", Sham = "Geometry-matched control"), name = NULL) +
+  facet_wrap(~ Group, ncol = 1, labeller = as_labeller(strip_labels)) +
+  labs(x = "Distance from nerve (µm, binned)", y = "Mean proportion (± SE across patients)") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom", panel.grid = element_blank(),
+        strip.background = element_blank(), strip.text = element_text(face = "bold", size = 9))
+
+print(p_bw)
+ggsave(file.path(FIGURES_DIR, paste0("distance_curve_with_sham_BW_", SIGNATURE_NAME, ".pdf")),
+       p_bw, width = FIG_WIDTH_IN, height = FIG_HEIGHT_IN, dpi = FIG_DPI)
+```

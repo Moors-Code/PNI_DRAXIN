@@ -1,0 +1,932 @@
+# Plotting of Deconvolution data -- immune & macrophage composition
+
+#===================================================================
+# MERGE NOTE (this pass): this script combines two earlier versions.
+# One version had simple violin plots + mixed-effects (lmer) modelling
+# of immune/macrophage signal by nerve category. A later version
+# replaced those violin plots with a more thorough spot-level vs
+# nerve-level comparison (same visual language, aggregated two ways),
+# but in doing so DROPPED the lmer statistical modelling entirely --
+# this looks like an oversight from refactoring the plots, not a
+# deliberate decision to remove the statistics, so both are kept here:
+# the newer spot/nerve-level plots AND the lmer models. The two
+# versions also both contained an IDENTICAL "common tail" (per-nerve
+# RCTD reshaping, individual-nerve plot, heatmap, NMF composition by
+# category) -- kept once here, not duplicated.
+#
+# THIS SCRIPT ONLY GENERATES FIGURES/STATISTICAL SUMMARIES -- it reads
+# already-computed RCTD_weights.Rds, NMFcomp.csv, and the frozen nerve
+# identification columns; it never recomputes any of those. Safe to
+# re-run as often as needed.
+#
+# WHAT THIS SCRIPT PRODUCES
+# --------------------------
+# Figures (output/06_deconvolution/figures/):
+#   - exploratory_violin_adaptive_immune.pdf
+#       Adaptive immune (T/NK) + plasma cell proportions, single violin
+#       per nerve category (original, simple version).
+#   - exploratory_violin_myeloid_NMF.pdf
+#       Macrophage-associated NMF program scores, same simple style.
+#   - exploratory_immune_composition_spot_level.pdf / exploratory_immune_composition_nerve_level.pdf
+#       Same immune signals, shown both at spot level and aggregated to
+#       one point per nerve (newer, more thorough version).
+#   - exploratory_macrophage_nmf_spot_level.pdf / exploratory_macrophage_nmf_nerve_level.pdf
+#       Same for macrophage NMF programs.
+#   - exploratory_combined_immune_macrophage_nerve_level.pdf
+#       All 4 nerve-level panels (immune + macrophage) together.
+#   - FigureS6G_individual_nerve_deconvolution_3cat.pdf
+#       Full RCTD cell-type composition per individual nerve.
+#   - exploratory_nerves_mean_composition_by_cat3.pdf
+#       Mean RCTD composition per nerve category (3-category scheme).
+#   - FigureS6F_heatmap_deconvolution_cat3_nerves.pdf
+#       Enrichment z-score heatmap, cell type x 3-category scheme.
+#   - exploratory_nerves_mean_composition_NMF_by_cat3.pdf
+#       Mean NMF-program composition per nerve category.
+#
+# Anything named "exploratory_" is not in the manuscript.
+#
+# Tables (output/06_deconvolution/tables/):
+#   - lmer_immune_models_summary.txt
+#       Mixed-effects model summaries for plasma-cell and adaptive-
+#       T/NK proportions by nerve category (patient + NerveID random
+#       effects).
+#   - lmer_macrophage_nmf_models_summary.txt
+#       Same, for the macrophage and C1q-macrophage NMF programs.
+#===================================================================
+
+```{r}
+#=================================
+#1. Load Libraries and input data
+#================================
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(SpatialExperiment)
+library(SummarizedExperiment)
+library(pheatmap)
+library(lme4)
+
+# ---- 0. Directory structure -------------------------------------------
+# Paths are relative to the project folder (the one containing input/).
+# Run from there, or from scripts/ -- this moves up one level if needed.
+if (basename(getwd()) == "scripts") setwd("..")
+if (!dir.exists("input"))
+  stop("Run this script from the project folder (the one containing input/).")
+
+PROJECT_DIR   <- "."
+INPUT_DIR     <- file.path(PROJECT_DIR, "input")
+
+ANALYSIS_NAME <- "06_deconvolution"
+TABLES_DIR    <- file.path(PROJECT_DIR, "output", ANALYSIS_NAME, "tables")
+FIGURES_DIR   <- file.path(PROJECT_DIR, "output", ANALYSIS_NAME, "figures")
+dir.create(TABLES_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
+
+c25 <- c(
+  "dodgerblue2", "#E31A1C", "green4", "#6A3D9A", "#FF7F00",
+  "black", "gold1", "skyblue2", "#FB9A99", "palegreen2",
+  "#CAB2D6", "#FDBF6F", "gray70", "khaki2",
+  "maroon", "orchid1", "deeppink1", "blue1", "steelblue4",
+  "darkturquoise", "green1", "yellow4", "yellow3",
+  "darkorange4", "brown"
+)
+
+# ---- Frozen inputs: never recomputed here ------------------------------
+spe <- readRDS(file.path(INPUT_DIR, "Integrated_NMF.rds"))
+colData(spe) <- DataFrame(read.csv(file.path(INPUT_DIR, "DE_SPE_annotaion.csv")))
+colnames(spe) <- spe$barcode
+
+W_df <- readRDS(file.path(INPUT_DIR, "RCTD_weights.Rds"))
+weights_df_copy <- W_df
+```
+
+```{r}
+#==========================================
+# 2. Identify nerve spots and define groups
+#==========================================
+
+nerve_mask <- colData(spe)$is.nerve == TRUE
+
+nerve_meta_df <- data.frame(
+  barcode     = as.character(spe$barcode[nerve_mask]),
+  patient_id  = as.factor(colData(spe)$patient_id[nerve_mask]),
+  NerveID     = as.factor(colData(spe)$NerveID[nerve_mask]),
+  Invaded     = as.character(colData(spe)$Invaded[nerve_mask]),
+  type_raw    = as.character(colData(spe)$type[nerve_mask])
+)
+
+nerve_meta_df$types_grouped <- ifelse(
+  nerve_meta_df$type_raw == "noPNI",
+  "Adjacent",
+  "Diseased"
+)
+
+nerve_meta_df$nerve_category <- ifelse(
+  nerve_meta_df$Invaded == "NonInvaded",
+  paste0("NonInvaded_", nerve_meta_df$types_grouped),
+  nerve_meta_df$Invaded
+)
+
+nerve_meta_df <- nerve_meta_df[!is.na(nerve_meta_df$nerve_category), ]
+
+analysis_df <- nerve_meta_df %>%
+  left_join(weights_df_copy, by = "barcode")
+```
+
+## Part A -- simple violin plots + mixed-effects modelling (original version)
+
+```{r}
+#===============================================
+# 3. Compute immune composition summary metrics
+#===============================================
+
+immune_df <- analysis_df %>%
+  mutate(
+    Adaptive_T_NK =
+      coalesce(`Lymphocyte(CD4)`, 0) +
+      coalesce(`Lymphocyte(CD8)`, 0) +
+      coalesce(`Lymphocyte(NK)`, 0)
+  ) %>%
+  select(
+    barcode,
+    patient_id,
+    NerveID,
+    nerve_category,
+    `B_cells_(Plasma_cells)`,
+    Adaptive_T_NK
+  )
+```
+
+```{r}
+#=====================================================
+# 4. Plot adaptive immune and plasma cell proportions
+#=====================================================
+
+immune_long <- immune_df %>%
+  mutate(
+    nerve_category = factor(
+      nerve_category,
+      levels = c("NonInvaded_Adjacent", "NonInvaded_Diseased", "Invaded")
+    )
+  ) %>%
+  pivot_longer(
+    cols = c(
+      `B_cells_(Plasma_cells)`,
+      Adaptive_T_NK
+    ),
+    names_to = "CellType",
+    values_to = "Proportion"
+  )
+
+immune_long$patient_id <- factor(immune_long$patient_id, levels = c("54703","6249","70865"))
+
+p_violin <- ggplot(immune_long, aes(x = nerve_category, y = Proportion)) +
+  geom_violin(
+    trim = TRUE, scale = "width",
+    fill = "grey80", alpha = 0.8, color = NA
+  ) +
+  geom_boxplot(
+    width = 0.18, outlier.shape = NA,
+    fill = "grey80", color = "grey30", alpha = 0.8
+  ) +
+  geom_point(
+    aes(color = patient_id),
+    position = position_jitter(width = 0.15, height = 0, seed = 1),
+    size = 0.7, alpha = 0.6
+  ) +
+  facet_wrap(~ CellType, scales = "free_y", ncol = 2) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    legend.position = "right"
+  ) +
+  labs(x = NULL, y = "RCTD proportion", color = "Patient")
+
+p_violin
+ggsave(file.path(FIGURES_DIR, "exploratory_violin_adaptive_immune.pdf"), p_violin, width = 6, height = 3, units = "in", dpi = 600)
+```
+
+```{r}
+#=============================================
+# 5. Mixed-effects modelling of immune signals
+#=============================================
+
+logit_transform <- function(p, eps = 1e-4) {
+  p <- pmax(eps, pmin(1 - eps, p))
+  log(p / (1 - p))
+}
+
+run_lmer_model <- function(celltype_name) {
+
+  tmp <- immune_df %>%
+    filter(!is.na(nerve_category)) %>%
+    mutate(
+      prop_logit = logit_transform(.data[[celltype_name]])
+    )
+
+  fit <- lmer(
+    prop_logit ~ nerve_category +
+      (1 | patient_id) +
+      (1 | NerveID),
+    data = tmp
+  )
+
+  summary(fit)
+}
+
+res_plasma <- run_lmer_model("B_cells_(Plasma_cells)")
+res_lymph  <- run_lmer_model("Adaptive_T_NK")
+print(res_plasma)
+print(res_lymph)
+
+# Persist the model summaries, not just console output
+sink(file.path(TABLES_DIR, "lmer_immune_models_summary.txt"))
+cat("=== Plasma cells (B_cells_(Plasma_cells)) ~ nerve_category + (1|patient_id) + (1|NerveID) ===\n")
+print(res_plasma)
+cat("\n=== Adaptive T/NK ~ nerve_category + (1|patient_id) + (1|NerveID) ===\n")
+print(res_lymph)
+sink()
+```
+
+```{r}
+#====================================
+# 6. Load NMF program score matrix
+#====================================
+
+# NOTE: reads NMFcomp.csv from the 02_NMF_visualization output tables,
+# not from input/ -- this is a per-analysis intermediate, not a
+# project-wide input.
+NMF_VIZ_TABLES_DIR <- file.path(PROJECT_DIR, "output", "02_NMF_visualization", "tables")
+compk30_df <- read.csv(file.path(NMF_VIZ_TABLES_DIR, "NMFcomp.csv"), check.names = FALSE)
+
+head(colnames(compk30_df))
+```
+
+```{r}
+#==============================================
+# 7. Extract macrophage-related NMF programs
+#==============================================
+
+needed <- c("barcode",
+            "Myeloid(Macrophages)",
+            "Myeloid(C1q_macrophages)")
+
+missing <- setdiff(needed, colnames(compk30_df))
+if (length(missing) > 0) stop("Missing columns: ", paste(missing, collapse = ", "))
+
+compk30_subset <- compk30_df[, needed]
+
+nmf_analysis_df <- nerve_meta_df %>%
+  left_join(compk30_subset, by = "barcode")
+```
+
+```{r}
+#=================================================
+# 8. Plot macrophage-associated NMF program scores
+#=================================================
+
+nmf_long <- nmf_analysis_df %>%
+  mutate(
+    nerve_category = factor(
+      nerve_category,
+      levels = c("NonInvaded_Adjacent", "NonInvaded_Diseased", "Invaded")
+    )
+  ) %>%
+  pivot_longer(
+    cols = c("Myeloid(Macrophages)", "Myeloid(C1q_macrophages)"),
+    names_to = "Program",
+    values_to = "Score"
+  )
+
+nmf_long$patient_id <- factor(nmf_long$patient_id, levels = c("54703","6249","70865"))
+
+p_nmf_violin <- ggplot(nmf_long, aes(x = nerve_category, y = Score)) +
+  geom_violin(
+    trim = TRUE, scale = "width",
+    fill = "grey80", alpha = 0.8, color = NA
+  ) +
+  geom_boxplot(
+    width = 0.18, outlier.shape = NA,
+    fill = "grey80", color = "grey30", alpha = 0.8
+  ) +
+  geom_point(
+    aes(color = patient_id),
+    position = position_jitter(width = 0.15, height = 0, seed = 1),
+    size = 0.7, alpha = 0.6
+  ) +
+  facet_wrap(~ Program, scales = "free_y", ncol = 2) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    legend.position = "right"
+  ) +
+  labs(x = NULL, y = "NMF program score", color = "Patient")
+
+p_nmf_violin
+ggsave(file.path(FIGURES_DIR, "exploratory_violin_myeloid_NMF.pdf"), p_nmf_violin, width = 6, height = 3, units = "in", dpi = 600)
+```
+
+```{r}
+#====================================================
+# 9. Mixed-effects modelling of NMF program activity
+#====================================================
+
+run_lmer_nmf <- function(program_name) {
+
+  tmp <- nmf_analysis_df %>%
+    dplyr::select(patient_id, NerveID, nerve_category, all_of(program_name)) %>%
+    dplyr::rename(score = all_of(program_name)) %>%
+    dplyr::filter(!is.na(score), !is.na(nerve_category))
+
+  fit <- lmer(
+    score ~ nerve_category +
+      (1 | patient_id) +
+      (1 | NerveID),
+    data = tmp
+  )
+
+  return(fit)
+}
+
+fit_myeloid <- run_lmer_nmf("Myeloid(Macrophages)")
+fit_c1q     <- run_lmer_nmf("Myeloid(C1q_macrophages)")
+
+print(summary(fit_myeloid))
+print(summary(fit_c1q))
+
+sink(file.path(TABLES_DIR, "lmer_macrophage_nmf_models_summary.txt"))
+cat("=== Macrophage NMF program ~ nerve_category + (1|patient_id) + (1|NerveID) ===\n")
+print(summary(fit_myeloid))
+cat("\n=== C1q-macrophage NMF program ~ nerve_category + (1|patient_id) + (1|NerveID) ===\n")
+print(summary(fit_c1q))
+sink()
+```
+
+## Part B -- spot-level vs nerve-level comparison plots (newer version)
+
+```{r}
+#=====================================================
+# 10. Compute immune composition metrics per spot
+#=====================================================
+
+immune_spot_df <- analysis_df %>%
+  mutate(
+    Adaptive_T_NK =
+      coalesce(`Lymphocyte(CD4)`, 0) +
+      coalesce(`Lymphocyte(CD8)`, 0) +
+      coalesce(`Lymphocyte(NK)`, 0),
+    Plasma_B = coalesce(`B_cells_(Plasma_cells)`, 0)
+  ) %>%
+  select(
+    barcode,
+    patient_id,
+    NerveID,
+    nerve_category,
+    Plasma_B,
+    Adaptive_T_NK
+  )
+```
+
+```{r}
+#=====================================================
+# 11. Set plotting order and labels
+#=====================================================
+
+nerve_order <- c("NonInvaded_Adjacent", "NonInvaded_Diseased", "Invaded")
+patient_order <- c("54703", "6249", "70865")
+
+celltype_order <- c("Adaptive_T_NK", "Plasma_B")
+celltype_labels <- c(
+  "Adaptive_T_NK" = "Adaptive T/NK cells",
+  "Plasma_B"      = "B/plasma cells"
+)
+
+patient_cols <- c(
+  "54703" = "#d95f02",
+  "6249"  = "#1b9e77",
+  "70865" = "#7570b3"
+)
+```
+
+```{r}
+#=====================================================
+# 12. Prepare spot-level long table
+#=====================================================
+
+immune_spot_long <- immune_spot_df %>%
+  mutate(
+    nerve_category = factor(nerve_category, levels = nerve_order),
+    patient_id = factor(patient_id, levels = patient_order)
+  ) %>%
+  pivot_longer(
+    cols = c(Adaptive_T_NK, Plasma_B),
+    names_to = "CellType",
+    values_to = "Proportion"
+  ) %>%
+  mutate(
+    CellType = factor(CellType, levels = celltype_order),
+    CellTypeLabel = factor(celltype_labels[as.character(CellType)],
+                           levels = unname(celltype_labels[celltype_order]))
+  )
+```
+
+```{r}
+#=====================================================
+# 13. Aggregate from spot level to nerve level
+#=====================================================
+
+immune_nerve_long <- immune_spot_long %>%
+  group_by(NerveID, patient_id, nerve_category, CellType, CellTypeLabel) %>%
+  summarise(
+    MeanProportion = mean(Proportion, na.rm = TRUE),
+    n_spots = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    nerve_category = factor(nerve_category, levels = nerve_order),
+    patient_id = factor(patient_id, levels = patient_order)
+  )
+```
+
+```{r}
+#=====================================================
+# 14. Spot-level and nerve-level immune plots
+#=====================================================
+
+facet_ncol   <- 2
+facet_scales <- "free_y"
+base_size    <- 11
+panel_aspect <- 0.5
+
+p_immune_spot <- ggplot(
+  immune_spot_long,
+  aes(x = nerve_category, y = Proportion)
+) +
+  geom_violin(fill = "grey85", color = NA, alpha = 0.6, trim = FALSE) +
+  geom_boxplot(width = 0.25, outlier.shape = NA, fill = "white", color = "grey30", linewidth = 0.4) +
+  geom_jitter(aes(color = patient_id), width = 0.10, size = 0.9, alpha = 0.95) +
+  facet_wrap(~ CellTypeLabel, scales = facet_scales, ncol = facet_ncol) +
+  scale_color_manual(values = patient_cols, drop = FALSE) +
+  theme_classic(base_size = base_size) +
+  theme(
+    aspect.ratio = panel_aspect,
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = base_size * 0.85),
+    legend.position = "right",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.4),
+    panel.spacing = unit(6, "pt")
+  ) +
+  ylab("RCTD proportion per spot") +
+  xlab("Nerve category") +
+  labs(color = "Patient ID")
+
+p_immune_spot
+
+p_immune_nerve <- ggplot(
+  immune_nerve_long,
+  aes(x = nerve_category, y = MeanProportion)
+) +
+  geom_violin(fill = "grey85", color = NA, alpha = 0.6, trim = FALSE) +
+  geom_boxplot(width = 0.25, outlier.shape = NA, fill = "white", color = "grey30", linewidth = 0.4) +
+  geom_jitter(aes(color = patient_id), width = 0.10, size = 0.9, alpha = 0.95) +
+  facet_wrap(~ CellTypeLabel, scales = facet_scales, ncol = facet_ncol) +
+  scale_color_manual(values = patient_cols, drop = FALSE) +
+  theme_classic(base_size = base_size) +
+  theme(
+    aspect.ratio = panel_aspect,
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = base_size * 0.85),
+    legend.position = "right",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.4),
+    panel.spacing = unit(6, "pt")
+  ) +
+  ylab("Mean RCTD proportion per nerve") +
+  xlab("Nerve category") +
+  labs(color = "Patient ID")
+
+p_immune_nerve
+
+ggsave(file.path(FIGURES_DIR, "exploratory_immune_composition_spot_level.pdf"), p_immune_spot, width = 7, height = 4.5, units = "in", dpi = 600, useDingbats = FALSE)
+ggsave(file.path(FIGURES_DIR, "exploratory_immune_composition_nerve_level.pdf"), p_immune_nerve, width = 7, height = 4.5, units = "in", dpi = 600, useDingbats = FALSE)
+```
+
+```{r}
+#=====================================================
+# 15. Set plotting order/labels for macrophage NMF
+#=====================================================
+
+program_order <- c("Myeloid(Macrophages)", "Myeloid(C1q_macrophages)")
+program_labels <- c(
+  "Myeloid(Macrophages)"      = "Macrophage program",
+  "Myeloid(C1q_macrophages)"  = "C1q macrophage program"
+)
+```
+
+```{r}
+#=====================================================
+# 16. Prepare spot-level + nerve-level macrophage NMF, plot, save
+#=====================================================
+
+nmf_spot_long <- nmf_analysis_df %>%
+  mutate(
+    nerve_category = factor(nerve_category, levels = nerve_order),
+    patient_id = factor(patient_id, levels = patient_order)
+  ) %>%
+  pivot_longer(
+    cols = all_of(program_order),
+    names_to = "Program",
+    values_to = "Score"
+  ) %>%
+  mutate(
+    Program = factor(Program, levels = program_order),
+    ProgramLabel = factor(
+      program_labels[as.character(Program)],
+      levels = unname(program_labels[program_order])
+    )
+  )
+
+nmf_nerve_long <- nmf_spot_long %>%
+  group_by(NerveID, patient_id, nerve_category, Program, ProgramLabel) %>%
+  summarise(
+    MeanScore = mean(Score, na.rm = TRUE),
+    n_spots = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    nerve_category = factor(nerve_category, levels = nerve_order),
+    patient_id = factor(patient_id, levels = patient_order)
+  )
+
+p_nmf_spot <- ggplot(nmf_spot_long, aes(x = nerve_category, y = Score)) +
+  geom_violin(fill = "grey85", color = NA, alpha = 0.6, trim = FALSE) +
+  geom_boxplot(width = 0.25, outlier.shape = NA, fill = "white", color = "grey30", linewidth = 0.4) +
+  geom_jitter(aes(color = patient_id), width = 0.10, size = 0.9, alpha = 0.95) +
+  facet_wrap(~ ProgramLabel, scales = facet_scales, ncol = facet_ncol) +
+  scale_color_manual(values = patient_cols, drop = FALSE) +
+  theme_classic(base_size = base_size) +
+  theme(
+    aspect.ratio = panel_aspect,
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = base_size * 0.85),
+    legend.position = "right",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.4),
+    panel.spacing = unit(6, "pt")
+  ) +
+  ylab("NMF program score per spot") +
+  xlab("Nerve category") +
+  labs(color = "Patient ID")
+
+p_nmf_spot
+
+p_nmf_nerve <- ggplot(nmf_nerve_long, aes(x = nerve_category, y = MeanScore)) +
+  geom_violin(fill = "grey85", color = NA, alpha = 0.6, trim = FALSE) +
+  geom_boxplot(width = 0.25, outlier.shape = NA, fill = "white", color = "grey30", linewidth = 0.4) +
+  geom_jitter(aes(color = patient_id), width = 0.10, size = 0.9, alpha = 0.95) +
+  facet_wrap(~ ProgramLabel, scales = facet_scales, ncol = facet_ncol) +
+  scale_color_manual(values = patient_cols, drop = FALSE) +
+  theme_classic(base_size = base_size) +
+  theme(
+    aspect.ratio = panel_aspect,
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = base_size * 0.85),
+    legend.position = "right",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.4),
+    panel.spacing = unit(6, "pt")
+  ) +
+  ylab("Mean NMF program score per nerve") +
+  xlab("Nerve category") +
+  labs(color = "Patient ID")
+
+p_nmf_nerve
+
+ggsave(file.path(FIGURES_DIR, "exploratory_macrophage_nmf_spot_level.pdf"), p_nmf_spot, width = 7, height = 4.5, units = "in", dpi = 600, useDingbats = FALSE)
+ggsave(file.path(FIGURES_DIR, "exploratory_macrophage_nmf_nerve_level.pdf"), p_nmf_nerve, width = 7, height = 4.5, units = "in", dpi = 600, useDingbats = FALSE)
+```
+
+```{r}
+#=====================================================
+# 17. Combined nerve-level plot: immune + macrophage
+#=====================================================
+
+combined_nerve_long <- bind_rows(
+  immune_nerve_long %>%
+    transmute(NerveID, patient_id, nerve_category, Feature = as.character(CellTypeLabel), Value = MeanProportion),
+  nmf_nerve_long %>%
+    transmute(NerveID, patient_id, nerve_category, Feature = as.character(ProgramLabel), Value = MeanScore)
+) %>%
+  mutate(
+    nerve_category = factor(nerve_category, levels = nerve_order),
+    patient_id = factor(patient_id, levels = patient_order),
+    Feature = factor(
+      Feature,
+      levels = c("Adaptive T/NK cells", "B/plasma cells", "Macrophage program", "C1q macrophage program")
+    )
+  )
+
+p_combined_nerve <- ggplot(combined_nerve_long, aes(x = nerve_category, y = Value)) +
+  geom_violin(fill = "grey85", color = NA, alpha = 0.6, trim = FALSE) +
+  geom_boxplot(width = 0.25, outlier.shape = NA, fill = "white", color = "grey30", linewidth = 0.4) +
+  geom_jitter(aes(color = patient_id), width = 0.10, size = 0.9, alpha = 0.95) +
+  facet_wrap(~ Feature, scales = "free_y", ncol = 2) +
+  scale_color_manual(values = patient_cols, drop = FALSE) +
+  theme_classic(base_size = base_size) +
+  theme(
+    aspect.ratio = panel_aspect,
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = base_size * 0.85),
+    legend.position = "right",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.4),
+    panel.spacing = unit(6, "pt")
+  ) +
+  ylab("Mean value per nerve") +
+  xlab("Nerve category") +
+  labs(color = "Patient ID")
+
+p_combined_nerve
+ggsave(file.path(FIGURES_DIR, "exploratory_combined_immune_macrophage_nerve_level.pdf"), p_combined_nerve, width = 4, height = 7, units = "in", dpi = 600, useDingbats = FALSE)
+```
+
+## Part C -- common tail: full RCTD/NMF composition by 3-category scheme (identical in both earlier versions, kept once)
+
+```{r}
+#==============================================
+# 18. Reshape RCTD weights to spot-level format
+#==============================================
+
+rctd_cols <- c(
+  "Acinar", "B_cells", "CAF", "Lymphocyte(CD4)", "Lymphocyte(CD8)",
+  "Ductal_malignant", "Ductal_normal", "Endocrine", "Endothelial",
+  "Myeloid", "Lymphocyte(NK)", "B_cells_(Plasma_cells)", "Schwann", "Stellate"
+)
+
+dfp_spot <- analysis_df %>%
+  dplyr::select(barcode, patient_id, NerveID, nerve_category, dplyr::all_of(rctd_cols)) %>%
+  tidyr::pivot_longer(cols = dplyr::all_of(rctd_cols), names_to = "CellType", values_to = "pct") %>%
+  dplyr::mutate(
+    barcode = as.character(barcode),
+    NerveID = as.character(NerveID),
+    patient_id = factor(as.character(patient_id), levels = c("54703", "6249", "70865")),
+    nerve_category = factor(as.character(nerve_category), levels = c("NonInvaded_Adjacent", "NonInvaded_Diseased", "Invaded"))
+  ) %>%
+  dplyr::filter(!is.na(nerve_category), !is.na(NerveID))
+```
+
+```{r}
+#=========================================
+# 19. Compute per-nerve mean composition
+#=========================================
+
+dfp <- dfp_spot %>%
+  dplyr::group_by(NerveID, patient_id, nerve_category, CellType) %>%
+  dplyr::summarise(pct = mean(pct, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::mutate(ID = as.character(NerveID))
+
+id_levels <- dfp %>%
+  dplyr::distinct(nerve_category, patient_id, ID) %>%
+  dplyr::arrange(nerve_category, patient_id, ID) %>%
+  dplyr::pull(ID) %>%
+  unique()
+
+dfp$ID <- factor(dfp$ID, levels = id_levels)
+
+dfp$nerve_category_plot <- as.character(dfp$nerve_category)
+dfp$nerve_category_plot[dfp$nerve_category_plot == "NonInvaded_Adjacent"] <- "Adjacent"
+dfp$nerve_category_plot[dfp$nerve_category_plot == "NonInvaded_Diseased"] <- "NonInvaded\nDiseased"
+dfp$nerve_category_plot[dfp$nerve_category_plot == "Invaded"] <- "Invaded"
+dfp$nerve_category_plot <- factor(dfp$nerve_category_plot, levels = c("Adjacent", "NonInvaded\nDiseased", "Invaded"))
+```
+
+```{r}
+#=================================
+# 20. Define cell type colours
+#=================================
+
+color_maping <- c( "Acinar" = "gold1",
+                   "B_cells" = "maroon",
+                   "Lymphocyte(CD4)" = "green4",
+                   "Lymphocytes" = "green4",
+                   "Myeloid(Macrophages)" = "#6A3D9A",
+                   "Endothelial" = "#FF7F00",
+                   "Endocrine" = "yellow4",
+                   "Stellate" = "khaki2",
+                   "CAF" = "skyblue2",
+                   "Adipocytes" = "steelblue4",
+                   "Lymphocyte(NK)" = "green2",
+                   "Lymphocyte(CD8)" = "palegreen2",
+                   "Myeloid" = "#CAB2D6",
+                   "Schwann" = "#FDBF6F",
+                   "Myeloid(C1q_macrophages)" = "#CAB2D6",
+                   "Nerve" = "#FDBF6F",
+                   "Muscle" = "orchid1",
+                   "Ductal_malignant" = "gray70",
+                   "Ductal_normal" = "black",
+                   "B_cells_(Plasma_cells)"  = "brown1")
+```
+
+```{r}
+#==============================================
+# 21. Plot cell composition of individual nerves
+#==============================================
+
+CTRL <- list(
+  base_size = 5, strip_size = 15, x_text_size = 6, x_angle = 45, x_hjust = 1,
+  panel_spacing = 0.6, plot_margin = c(8, 8, 18, 8), show_every_n_id = 2
+)
+
+id_breaks <- levels(dfp$ID)[seq(1, length(levels(dfp$ID)), by = CTRL$show_every_n_id)]
+
+p1 <- ggplot(dfp, aes(x = ID, y = pct, fill = CellType)) +
+  geom_bar(stat = "identity", width = 0.5, color = NA) +
+  scale_fill_manual(values = color_maping, drop = FALSE) +
+  labs(x = "Nerve ID", y = "Composition (%)") +
+  facet_grid(. ~ nerve_category_plot, scales = "free_x", space = "free_x") +
+  scale_x_discrete(breaks = id_breaks) +
+  theme_minimal(base_size = CTRL$base_size) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(size = CTRL$strip_size, lineheight = 0.9),
+    axis.text.x = element_text(size = CTRL$x_text_size, angle = CTRL$x_angle, hjust = CTRL$x_hjust),
+    axis.title.x = element_text(size = CTRL$base_size),
+    axis.title.y = element_text(size = CTRL$base_size),
+    panel.spacing.x = unit(CTRL$panel_spacing, "lines"),
+    plot.margin = margin(CTRL$plot_margin[1], CTRL$plot_margin[2], CTRL$plot_margin[3], CTRL$plot_margin[4], "pt"),
+    legend.position = "bottom"
+  ) +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE))
+
+p1
+ggsave(file.path(FIGURES_DIR, "FigureS6G_individual_nerve_deconvolution_3cat.pdf"), p1, width = 10, height = 5, dpi = 1200)
+```
+
+```{r}
+#=============================================
+# 22. Plot mean composition by nerve category
+#=============================================
+
+CTRL2 <- list(
+  base_size = 5, axis_y_size = 10, axis_x_size = 10, legend_text = 8,
+  legend_key = 0.32, legend_ncol = 6, plot_margin = c(8, 8, 8, 8)
+)
+
+avg_cat <- dfp %>%
+  dplyr::group_by(nerve_category, CellType) %>%
+  dplyr::summarise(pct = mean(pct, na.rm = TRUE), .groups = "drop")
+
+avg_cat$nerve_category_plot <- as.character(avg_cat$nerve_category)
+avg_cat$nerve_category_plot[avg_cat$nerve_category_plot == "NonInvaded_Adjacent"] <- "Adjacent"
+avg_cat$nerve_category_plot[avg_cat$nerve_category_plot == "NonInvaded_Diseased"] <- "NonInvaded\nDiseased"
+avg_cat$nerve_category_plot[avg_cat$nerve_category_plot == "Invaded"] <- "Invaded"
+avg_cat$nerve_category_plot <- factor(avg_cat$nerve_category_plot, levels = c("Adjacent", "NonInvaded\nDiseased", "Invaded"))
+
+p_cat <- ggplot(avg_cat, aes(y = nerve_category_plot, x = pct, fill = CellType)) +
+  geom_bar(stat = "identity", width = 0.6, color = NA) +
+  scale_y_discrete(expand = expansion(mult = c(0.1, 0.1))) +
+  scale_fill_manual(values = color_maping, drop = FALSE) +
+  labs(x = "Mean cell composition (%)", fill = "Cell type") +
+  theme_minimal(base_size = CTRL2$base_size) +
+  theme(
+    axis.text.y = element_text(size = CTRL2$axis_y_size),
+    axis.text.x = element_text(size = CTRL2$axis_x_size),
+    axis.title.x = element_text(size = 8, face = "bold"),
+    legend.position = "bottom",
+    legend.text = element_text(size = CTRL2$legend_text),
+    legend.key.size = unit(CTRL2$legend_key, "cm"),
+    plot.margin = margin(CTRL2$plot_margin[1], CTRL2$plot_margin[2], CTRL2$plot_margin[3], CTRL2$plot_margin[4], "pt"),
+    panel.grid.major.y = element_blank()
+  ) +
+  guides(fill = guide_legend(ncol = CTRL2$legend_ncol, byrow = TRUE))
+
+p_cat
+ggsave(file.path(FIGURES_DIR, "exploratory_nerves_mean_composition_by_cat3.pdf"), p_cat, width = 7, height = 4, dpi = 1200)
+```
+
+```{r}
+#====================================================
+# 23. Compute heatmap of cell type enrichment scores
+#====================================================
+
+categories <- dfp_spot %>%
+  dplyr::distinct(barcode, nerve_category) %>%
+  dplyr::rename(category = nerve_category) %>%
+  dplyr::mutate(
+    barcode = as.character(barcode),
+    category = factor(as.character(category), levels = c("NonInvaded_Adjacent", "NonInvaded_Diseased", "Invaded"))
+  ) %>%
+  dplyr::filter(!is.na(category))
+
+cats <- levels(droplevels(categories$category))
+
+wide <- dfp_spot %>%
+  dplyr::select(barcode, CellType, pct) %>%
+  tidyr::pivot_wider(names_from = CellType, values_from = pct, values_fill = 0)
+
+W_mat <- as.data.frame(wide)
+rownames(W_mat) <- W_mat$barcode
+W_mat$barcode <- NULL
+
+keep_bcs <- intersect(rownames(W_mat), categories$barcode)
+W_mat <- W_mat[keep_bcs, , drop = FALSE]
+categories <- categories %>% dplyr::filter(barcode %in% keep_bcs)
+
+enrichment_z <- function(vec, group, target_cat) {
+  bcs_in <- group$barcode[group$category == target_cat]
+  x_in <- vec[bcs_in]
+  mu_in <- mean(x_in, na.rm = TRUE)
+  mu_all <- mean(vec, na.rm = TRUE)
+  s <- stats::sd(vec, na.rm = TRUE)
+  if (is.na(s) || s == 0) return(NA_real_)
+  (mu_in - mu_all) / s
+}
+
+cell_types <- colnames(W_mat)
+
+z_mat <- sapply(cell_types, function(ct) {
+  v <- setNames(W_mat[, ct], rownames(W_mat))
+  sapply(cats, function(ca) enrichment_z(v, categories, ca))
+})
+
+rownames(z_mat) <- c("Adjacent", "NonInvaded\nDiseased", "Invaded")
+
+p_hm <- pheatmap(
+  z_mat,
+  cluster_rows = TRUE, cluster_cols = TRUE, scale = "none",
+  color = colorRampPalette(c(c25[1], "white", c25[2]))(100),
+  fontsize_row = 11, fontsize_col = 8, angle_col = 45, border_color = NA,
+  filename = file.path(FIGURES_DIR, "FigureS6F_heatmap_deconvolution_cat3_nerves.pdf"),
+  width = 12, height = 6
+)
+
+p_hm
+```
+
+```{r}
+#==============================================
+# 24. Summarize NMF programs by nerve category
+#==============================================
+
+nmf_cols <- c(
+  "CAF", "Ductal_malignant", "B_cells", "Endocrine", "Acinar", "Ductal_normal",
+  "Myeloid(Macrophages)", "Myeloid(C1q_macrophages)", "Lymphocytes",
+  "Adipocytes", "Muscle", "Endothelial", "Nerve"
+)
+
+compk30_df$barcode <- as.character(compk30_df$barcode)
+
+nmf_joined <- nerve_meta_df %>%
+  dplyr::select(barcode, patient_id, NerveID, nerve_category) %>%
+  dplyr::mutate(
+    barcode = as.character(barcode),
+    NerveID = as.character(NerveID),
+    patient_id = factor(as.character(patient_id), levels = c("54703", "6249", "70865")),
+    nerve_category = factor(as.character(nerve_category), levels = c("NonInvaded_Adjacent", "NonInvaded_Diseased", "Invaded"))
+  ) %>%
+  dplyr::left_join(compk30_df %>% dplyr::select(barcode, dplyr::all_of(nmf_cols)), by = "barcode")
+
+nmf_long2 <- nmf_joined %>%
+  tidyr::pivot_longer(cols = dplyr::all_of(nmf_cols), names_to = "CellType", values_to = "val") %>%
+  dplyr::mutate(val = as.numeric(val)) %>%
+  dplyr::filter(!is.na(nerve_category)) %>%
+  dplyr::group_by(barcode) %>%
+  dplyr::mutate(pct = 100 * val / sum(val, na.rm = TRUE)) %>%
+  dplyr::ungroup()
+
+avg_cat_nmf <- nmf_long2 %>%
+  dplyr::group_by(nerve_category, CellType) %>%
+  dplyr::summarise(pct = mean(pct, na.rm = TRUE), .groups = "drop")
+
+avg_cat_nmf$nerve_category_plot <- as.character(avg_cat_nmf$nerve_category)
+avg_cat_nmf$nerve_category_plot[avg_cat_nmf$nerve_category_plot == "NonInvaded_Adjacent"] <- "Adjacent"
+avg_cat_nmf$nerve_category_plot[avg_cat_nmf$nerve_category_plot == "NonInvaded_Diseased"] <- "NonInvaded\nDiseased"
+avg_cat_nmf$nerve_category_plot[avg_cat_nmf$nerve_category_plot == "Invaded"] <- "Invaded"
+avg_cat_nmf$nerve_category_plot <- factor(avg_cat_nmf$nerve_category_plot, levels = c("Adjacent", "NonInvaded\nDiseased", "Invaded"))
+
+celltypes_present <- avg_cat_nmf %>%
+  dplyr::filter(!is.na(pct), pct > 0) %>%
+  dplyr::distinct(CellType) %>%
+  dplyr::pull(CellType)
+
+avg_cat_nmf <- avg_cat_nmf %>% dplyr::filter(CellType %in% celltypes_present)
+
+pal_present <- color_maping[intersect(names(color_maping), celltypes_present)]
+avg_cat_nmf$CellType <- factor(avg_cat_nmf$CellType, levels = names(pal_present))
+
+p_cat1 <- ggplot(avg_cat_nmf, aes(y = nerve_category_plot, x = pct, fill = CellType)) +
+  geom_bar(stat = "identity", width = 0.6, color = NA) +
+  scale_y_discrete(expand = expansion(mult = c(0.1, 0.1))) +
+  scale_fill_manual(values = pal_present, drop = TRUE) +
+  labs(y = "Nerve category", x = "Mean cell composition (%)", fill = "Cell type") +
+  theme_minimal(base_size = 5) +
+  theme(
+    axis.text.y = element_text(size = 10),
+    axis.text.x = element_text(size = 10),
+    axis.title.x = element_text(size = 12, face = "bold"),
+    legend.position = "bottom",
+    legend.text = element_text(size = 8),
+    legend.key.size = unit(0.32, "cm"),
+    panel.grid.major.y = element_blank()
+  ) +
+  guides(fill = guide_legend(ncol = 5, byrow = TRUE))
+
+p_cat1
+ggsave(file.path(FIGURES_DIR, "exploratory_nerves_mean_composition_NMF_by_cat3.pdf"), p_cat1, width = 7, height = 4, dpi = 1200)
+```
