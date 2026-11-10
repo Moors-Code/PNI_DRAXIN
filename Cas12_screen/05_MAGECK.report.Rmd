@@ -25,7 +25,7 @@ comparison_name is the prefix of your output file, defined by the "-n" parameter
 ```{r}
 # define the comparison_name here; for example,
 # comparison_name='demo'
-comparison_name='FILTERING_T0_PLUS_CONTROL_PAIRED_TOTAL'
+comparison_name='T0_PLUS_CONTROL_PAIRED_TOTAL'
 ```
 
 FDR cutoff is used to draw a boundary line in RRA or p value plots. Set it to -1 to disable the boundary line.

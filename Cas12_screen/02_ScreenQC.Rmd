@@ -577,6 +577,7 @@ head(essential)
       height = 8
     )
 ```
+
 ```{r}
 # =========================================================
 # Optional: Wilcoxon tests for essential vs non-essential
